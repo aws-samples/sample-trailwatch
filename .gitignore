@@ -1,0 +1,32 @@
+# Secrets & runtime data — NEVER commit
+config.json
+data/
+*.db
+*.duckdb
+
+# Credentials
+.aws/
+.env
+.env.*
+
+# Build artifacts
+dist/
+analyzer
+cmd/analyzer/dist/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+*.csv
+CSR_Fix_Instructions*
