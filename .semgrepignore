@@ -1,0 +1,2 @@
+# Ignore gitleaks fingerprint file — contains SHA hashes that trigger false-positive token detection
+.gitleaksignore
