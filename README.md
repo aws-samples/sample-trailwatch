@@ -15,6 +15,8 @@ sudo ./deploy.sh
 
 Open `http://<ec2-ip>:7070` in your browser.
 
+> ⚠️ **Important Security Notice**: This application has **no built-in authentication**. Access control relies entirely on network restrictions (AWS Security Groups). Deploy only in restricted network environments or behind an authenticating reverse proxy (e.g., ALB with Cognito, nginx with OAuth2 Proxy). Never expose port 7070 to the public internet.
+
 ## What It Does
 
 1. **Downloads** CloudTrail logs from your S3 bucket (single account or Control Tower org trail)
@@ -73,6 +75,8 @@ Configure your preferred LLM provider in Settings → AI Provider:
 - **OpenAI / Compatible** — supports Azure OpenAI, corporate proxies
 - **Ollama (local)** — auto-installs, fully offline, no API key needed
 
+> ⚠️ **Data Privacy Notice**: When AI queries are enabled, CloudTrail log metadata (event names, IP addresses, IAM identities, timestamps) is sent to the configured LLM provider for natural language processing. Verify this aligns with your organization's data classification policies before enabling. For maximum privacy, use **Ollama** (fully local, no data leaves the instance).
+
 ## Prerequisites
 
 - **EC2 Instance**: Amazon Linux 2023 (t3.medium+ recommended)
@@ -127,14 +131,18 @@ For GB-scale datasets, indexing can provide 50-100x speedup.
 
 ## Disclaimer
 
-This project is provided as a sample implementation for educational and security investigation purposes. It is not intended for production use without additional security review. Users are responsible for:
+This project is provided as a sample implementation for educational and security investigation purposes. It is not intended for production use without additional security review.
 
-- Securing access to the EC2 instance running this tool
-- Protecting CloudTrail log data downloaded to the instance
-- Managing and rotating any credentials configured in the application
-- Complying with their organization's data handling policies
+**By deploying this tool, you acknowledge:**
 
-Use at your own risk. Perform your own security assessment before deploying in any environment with sensitive data.
+- **Cost Responsibility** — Deploying this solution may incur AWS charges (EC2 instance, S3 data transfer, Bedrock API calls). You are responsible for all costs associated with your use of AWS services. Review [AWS Pricing](https://aws.amazon.com/pricing/) and monitor usage via AWS Cost Explorer.
+- **Shared Responsibility** — Security and compliance of this tool is a [shared responsibility](https://aws.amazon.com/compliance/shared-responsibility-model/) between AWS and you. AWS is responsible for the security *of* the cloud; you are responsible for security *in* the cloud, including:
+  - Securing access to the EC2 instance running this tool
+  - Protecting CloudTrail log data downloaded to the instance
+  - Managing and rotating any credentials configured in the application
+  - Restricting network access via Security Groups
+  - Complying with your organization's data handling and classification policies
+- **No Warranty** — This software is provided "as is" without warranty of any kind. Perform your own security assessment before deploying in any environment with sensitive data.
 
 ## Security Considerations
 
@@ -155,6 +163,9 @@ Use at your own risk. Perform your own security assessment before deploying in a
 ### Credential Handling
 - Recommended: Use IMDS v2 (EC2 instance role) -- no credentials on disk.
 - Session credentials expire in 1-12 hours, stored in `config.json`.
+
+> ⚠️ **Warning**: When using Session Credentials or Static Keys, credentials are stored in `config.json` on the local filesystem. Ensure this file has restricted permissions (`chmod 600`) and is never committed to version control. Prefer IMDS v2 (EC2 instance role) to avoid storing credentials on disk entirely.
+
 - Never use root account credentials.
 
 ### LLM Provider Security
