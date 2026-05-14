@@ -25,6 +25,8 @@ Open `http://<ec2-ip>:7070` in your browser.
 
 ## Architecture
 
+*Figure 1: Application architecture — browser connects to the Go API, which queries indexed CloudTrail data via DuckDB and optionally routes natural language queries to an LLM provider.*
+
 ```
 Browser (:7070)  →  Go API Server  →  DuckDB (indexed)  →  Local CloudTrail JSON
                           ↓
@@ -121,7 +123,7 @@ Logs are auto-indexed into a DuckDB database after sync:
 | 1,400 files (5MB) | 63ms | 52ms |
 | Before indexing | ~2,000ms | ~1,200ms |
 
-For GB-scale datasets, indexing provides 50-100x speedup.
+For GB-scale datasets, indexing can provide 50-100x speedup.
 
 ## Disclaimer
 
@@ -159,7 +161,7 @@ Use at your own risk. Perform your own security assessment before deploying in a
 - **Bedrock**: Uses IAM role, no additional credentials.
 - **Ollama**: Fully offline, no data leaves instance.
 - **Anthropic/OpenAI**: API keys stored in `config.json` -- treat as secrets.
-- CloudTrail data is sent to the configured LLM for queries. Ensure alignment with data classification policies.
+- CloudTrail data is sent to the configured LLM for queries. Verify alignment with data classification policies.
 
 ### Deployment
 - Deploy on private subnets or with restricted Security Groups.
@@ -174,6 +176,28 @@ Use at your own risk. Perform your own security assessment before deploying in a
 | Session Credentials | Temporary creds from SSO portal |
 | SSO Profile | Named AWS CLI SSO profile |
 | Static Keys | Long-lived IAM user keys (not recommended) |
+
+## Cleanup
+
+To remove all resources deployed by this tool:
+
+```bash
+# Stop the application
+sudo systemctl stop cloudtrail-analyzer   # if deployed as a service
+# or kill the process directly
+pkill -f cloudtrail-analyzer
+
+# Remove downloaded CloudTrail data and databases
+rm -rf data/
+
+# Remove the application binary and config
+rm -f analyzer config.json
+
+# If deployed on EC2 — terminate the instance via AWS Console or CLI:
+aws ec2 terminate-instances --instance-ids <instance-id>
+```
+
+> **Note:** Terminating the EC2 instance removes all local data. If you configured additional AWS resources (Security Groups, IAM roles), remove those separately via the AWS Console or CLI.
 
 ## Contributing
 

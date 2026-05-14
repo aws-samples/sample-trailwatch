@@ -28,5 +28,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+CLAUDE.md
 *.csv
 CSR_Fix_Instructions*
