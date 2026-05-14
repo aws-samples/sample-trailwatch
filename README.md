@@ -25,8 +25,6 @@ Open `http://<ec2-ip>:7070` in your browser.
 
 ## Architecture
 
-*Figure 1: Application architecture — browser connects to the Go API, which queries indexed CloudTrail data via DuckDB and optionally routes natural language queries to an LLM provider.*
-
 ```
 Browser (:7070)  →  Go API Server  →  DuckDB (indexed)  →  Local CloudTrail JSON
                           ↓
@@ -36,6 +34,8 @@ Browser (:7070)  →  Go API Server  →  DuckDB (indexed)  →  Local CloudTrai
                     ├── OpenAI / Compatible
                     └── Ollama (local, offline)
 ```
+
+*Figure 1: Application architecture — browser connects to the Go API, which queries indexed CloudTrail data via DuckDB and optionally routes natural language queries to an LLM provider.*
 
 ## Features
 
