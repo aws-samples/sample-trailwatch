@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -49,12 +50,15 @@ func (s *Service) LoadAWSConfig(ctx context.Context, region string) (aws.Config,
 func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	switch s.cfg.Auth.Method {
 	case "session_credentials":
+		// Session/STS tokens are kept in process env vars only (not in
+		// config.json), so read them from there. Mirrors the contract set in
+		// settings.Handler.ApplySessionCredentials.
 		return awsconfig.LoadDefaultConfig(ctx,
 			awsconfig.WithRegion(region),
 			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				s.cfg.Auth.AccessKeyID,
-				s.cfg.Auth.SecretAccessKey,
-				s.cfg.Auth.SessionToken,
+				os.Getenv("AWS_ACCESS_KEY_ID"),
+				os.Getenv("AWS_SECRET_ACCESS_KEY"),
+				os.Getenv("AWS_SESSION_TOKEN"),
 			)),
 		)
 	case "imds":
@@ -493,17 +497,21 @@ func (s *Service) tryIMDS(ctx context.Context) CredentialAttempt {
 	}
 }
 
-// trySessionCredentials validates session credentials from the config struct.
+// trySessionCredentials validates session credentials from the process
+// environment. Session/STS tokens are intentionally not persisted to
+// config.json (they are short-lived and writing them to disk extends their
+// lifetime past their useful window), so the source of truth is the env vars
+// that ApplySessionCredentials sets.
 func (s *Service) trySessionCredentials(ctx context.Context) CredentialAttempt {
-	accessKey := s.cfg.Auth.AccessKeyID
-	secretKey := s.cfg.Auth.SecretAccessKey
-	token := s.cfg.Auth.SessionToken
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	token := os.Getenv("AWS_SESSION_TOKEN")
 
 	if accessKey == "" || secretKey == "" || token == "" {
 		return CredentialAttempt{
 			Source:  "session_credentials",
 			Success: false,
-			Reason:  "Session credentials incomplete — access_key_id, secret_access_key, and session_token are all required",
+			Reason:  "Session credentials not applied to environment yet — paste fresh STS credentials via the Credentials view (they are kept in-process only, lost on restart)",
 		}
 	}
 

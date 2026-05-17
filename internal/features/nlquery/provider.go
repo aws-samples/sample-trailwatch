@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -114,8 +115,11 @@ func (p *BedrockProvider) loadConfig(ctx context.Context) (aws.Config, error) {
 
 	switch p.cfg.Auth.Method {
 	case "session_credentials":
+		// Session/STS tokens live in process env vars (not config.json).
 		opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			p.cfg.Auth.AccessKeyID, p.cfg.Auth.SecretAccessKey, p.cfg.Auth.SessionToken,
+			os.Getenv("AWS_ACCESS_KEY_ID"),
+			os.Getenv("AWS_SECRET_ACCESS_KEY"),
+			os.Getenv("AWS_SESSION_TOKEN"),
 		)))
 	case "sso":
 		if p.cfg.Auth.SSOProfile != "" {
