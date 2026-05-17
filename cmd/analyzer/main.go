@@ -13,6 +13,7 @@ import (
 
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/database"
+	"cloudtrail-analyzer/internal/features/accounts"
 	"cloudtrail-analyzer/internal/features/nlquery"
 	"cloudtrail-analyzer/internal/features/processor"
 	"cloudtrail-analyzer/internal/features/prompts"
@@ -119,6 +120,31 @@ func main() {
 	// Register /api/settings routes
 	settingsHandler := settings.NewHandler(cfg, config.SaveConfig)
 	r.Mount("/api/settings", settingsHandler.Routes())
+
+	// Account-name resolver: maps 12-digit account IDs to friendly names from
+	// AWS Organizations + user-supplied overrides. Bedrock region is reused as
+	// the AWS region for the Organizations endpoint (Organizations is global
+	// but the SDK still needs a region to sign).
+	orgRegion := cfg.Bedrock.Region
+	if orgRegion == "" {
+		orgRegion = "us-east-1"
+	}
+	accountResolver := accounts.NewResolver(db.Conn, settingsHandler.Service().LoadAWSConfig, orgRegion)
+	r.Mount("/api/accounts", accounts.NewHandler(accountResolver).Routes())
+
+	// Best-effort eager refresh: try AWS Organizations on boot but never block
+	// startup or fail it if the principal lacks the permission. Lazy fallback
+	// covers the case where this fails.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := accountResolver.RefreshOrganizations(ctx, true); err != nil {
+			slog.Info("organizations refresh skipped at startup; manual mappings only",
+				"component", "cloudtrail-analyzer",
+				"reason", err.Error(),
+			)
+		}
+	}()
 
 	// Register /api/sessions routes
 	sessionsHandler := sessions.NewHandler(db.Conn, cfg)

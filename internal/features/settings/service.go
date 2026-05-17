@@ -38,6 +38,13 @@ func NewService(cfg *config.Config, saveFn func(*config.Config) error) *Service 
 // AWS Config
 // ---------------------------------------------------------------------------
 
+// LoadAWSConfig is an exported wrapper around loadAWSConfig so peers
+// (e.g., the accounts package) can build clients using whichever auth method
+// the user has configured without duplicating the credential-chain logic.
+func (s *Service) LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	return s.loadAWSConfig(ctx, region)
+}
+
 // loadAWSConfig builds an AWS config using ONLY the selected auth method.
 func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	switch s.cfg.Auth.Method {

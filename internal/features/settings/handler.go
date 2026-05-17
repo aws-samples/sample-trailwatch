@@ -27,6 +27,12 @@ func NewHandler(cfg *config.Config, saveFn func(*config.Config) error) *Handler 
 	}
 }
 
+// Service returns the underlying settings service. Other packages use this to
+// reuse the shared AWS-config loader without duplicating credential logic.
+func (h *Handler) Service() *Service {
+	return h.service
+}
+
 // Routes returns a Chi router with all settings routes mounted.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
