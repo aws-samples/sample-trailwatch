@@ -2,7 +2,6 @@ package sessions
 
 import (
 	"database/sql"
-	"encoding/json"
 	"net/http"
 
 	"cloudtrail-analyzer/internal/config"
@@ -51,10 +50,7 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 // CreateSession creates a new sync session.
 func (h *Handler) CreateSession(w http.ResponseWriter, r *http.Request) {
 	var req CreateSessionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -98,8 +94,10 @@ func (h *Handler) CreateSession(w http.ResponseWriter, r *http.Request) {
 // GetSession returns a session by ID.
 func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if id == "" {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id is required", nil)
+	if !render.IsValidUUID(id) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
 		return
 	}
 
@@ -117,8 +115,10 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 // DeleteSession deletes a session and its local files.
 func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if id == "" {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id is required", nil)
+	if !render.IsValidUUID(id) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
 		return
 	}
 

@@ -1,7 +1,6 @@
 package settings
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -42,6 +41,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Post("/detect-structure", h.DetectStructure)
 	r.Post("/discover-regions", h.DiscoverRegions)
 	r.Post("/verify-logs", h.VerifyLogs)
+	r.Post("/bedrock-models", h.ListBedrockModels)
 
 	return r
 }
@@ -115,10 +115,7 @@ type redactedAuthConfig struct {
 // UpdateSettings updates the application configuration and persists it.
 func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req UpdateConfigRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -205,9 +202,16 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LLMModel != "" {
 		h.cfg.LLM.Model = req.LLMModel
+		// Sync to Bedrock config when provider is bedrock
+		if h.cfg.LLM.Provider == "bedrock" {
+			h.cfg.Bedrock.ModelID = req.LLMModel
+		}
 	}
 	if req.LLMEndpoint != "" {
 		h.cfg.LLM.Endpoint = req.LLMEndpoint
+	}
+	if req.BedrockRegion != "" {
+		h.cfg.Bedrock.Region = req.BedrockRegion
 	}
 
 	// Persist configuration
@@ -225,10 +229,7 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 // ValidateBucket tests S3 bucket accessibility via HeadBucket.
 func (h *Handler) ValidateBucket(w http.ResponseWriter, r *http.Request) {
 	var req ValidateBucketRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -293,12 +294,14 @@ func (h *Handler) ValidateCredentials(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, status)
 }
 
-// ApplySessionCredentials sets temporary SSO session credentials as environment variables.
-// These are NOT persisted to config.json (security — session tokens are temporary).
+// ApplySessionCredentials sets temporary STS session credentials as environment
+// variables for the running process only. They are intentionally NOT persisted
+// to config.json — session tokens are short-lived and writing them to disk
+// extends their lifetime past their useful window and complicates revocation.
+// Users re-apply via the Credentials view after a restart.
 func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request) {
 	var req SessionCredentialsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", nil)
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 	if req.AccessKeyID == "" || req.SecretAccessKey == "" || req.SessionToken == "" {
@@ -306,35 +309,33 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Set environment variables for the running process
 	os.Setenv("AWS_ACCESS_KEY_ID", req.AccessKeyID)
 	os.Setenv("AWS_SECRET_ACCESS_KEY", req.SecretAccessKey)
 	os.Setenv("AWS_SESSION_TOKEN", req.SessionToken)
 
-	// Update config and persist (so credentials survive app restart within session window)
+	// Mark the active method in config but do NOT store the credential values.
 	h.cfg.Auth.Method = "session_credentials"
-	h.cfg.Auth.AccessKeyID = req.AccessKeyID
-	h.cfg.Auth.SecretAccessKey = req.SecretAccessKey
-	h.cfg.Auth.SessionToken = req.SessionToken
+	h.cfg.Auth.AccessKeyID = ""
+	h.cfg.Auth.SecretAccessKey = ""
+	h.cfg.Auth.SessionToken = ""
 
 	if err := h.saveFn(h.cfg); err != nil {
-		slog.Warn("failed to persist session credentials",
+		slog.Warn("failed to persist auth method",
 			"component", "cloudtrail-analyzer",
 			"error", err.Error(),
 		)
 	}
 
-	slog.Info("session credentials applied via UI",
+	slog.Info("session credentials applied via UI (env-only, not persisted)",
 		"component", "cloudtrail-analyzer",
 		"access_key_prefix", req.AccessKeyID[:4]+"...",
 	)
 
-	// Validate the credentials work
 	status, _ := h.service.ResolveCredentials(r.Context(), h.cfg)
 
 	render.JSON(w, http.StatusOK, map[string]interface{}{
 		"applied":    true,
-		"message":    "Session credentials applied to environment",
+		"message":    "Session credentials applied to environment (not written to disk)",
 		"validation": status,
 	})
 }
@@ -355,10 +356,7 @@ func (h *Handler) GetCallerIdentity(w http.ResponseWriter, r *http.Request) {
 // DetectStructure detects the S3 bucket structure (single account vs Control Tower).
 func (h *Handler) DetectStructure(w http.ResponseWriter, r *http.Request) {
 	var req DetectStructureRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -390,10 +388,7 @@ func (h *Handler) DetectStructure(w http.ResponseWriter, r *http.Request) {
 // DiscoverRegions discovers available CloudTrail regions for a given account.
 func (h *Handler) DiscoverRegions(w http.ResponseWriter, r *http.Request) {
 	var req DiscoverRegionsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 
@@ -429,13 +424,35 @@ func (h *Handler) DiscoverRegions(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, result)
 }
 
+// ListBedrockModels returns available Bedrock foundation models for a given region.
+func (h *Handler) ListBedrockModels(w http.ResponseWriter, r *http.Request) {
+	var req ListBedrockModelsRequest
+	if !render.DecodeStrictJSON(w, r, &req) {
+		return
+	}
+
+	if req.Region == "" {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "region is required", map[string]string{
+			"field": "region",
+		})
+		return
+	}
+
+	result, err := h.service.ListBedrockModels(r.Context(), req.Region)
+	if err != nil {
+		render.Error(w, http.StatusInternalServerError, "BEDROCK_ERROR", "Failed to list Bedrock models", map[string]string{
+			"reason": err.Error(),
+		})
+		return
+	}
+
+	render.JSON(w, http.StatusOK, result)
+}
+
 // VerifyLogs checks if CloudTrail log files exist for the specified parameters.
 func (h *Handler) VerifyLogs(w http.ResponseWriter, r *http.Request) {
 	var req VerifyLogsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid request body", map[string]string{
-			"reason": err.Error(),
-		})
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 

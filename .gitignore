@@ -11,7 +11,7 @@ data/
 
 # Build artifacts
 dist/
-analyzer
+/analyzer
 cmd/analyzer/dist/
 
 # Frontend

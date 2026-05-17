@@ -1,7 +1,6 @@
 package nlquery
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -25,8 +24,7 @@ type InvestigateRequest struct {
 
 func (h *InvestigateHandler) RunScenario(w http.ResponseWriter, r *http.Request) {
 	var req InvestigateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		render.Error(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body")
+	if !render.DecodeStrictJSON(w, r, &req) {
 		return
 	}
 	if req.ScenarioID == "" {

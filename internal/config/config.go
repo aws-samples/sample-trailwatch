@@ -18,7 +18,11 @@ const (
 
 // Config holds all application configuration.
 type Config struct {
-	Port                   int           `json:"port" envconfig:"PORT"`
+	Port int `json:"port" envconfig:"PORT"`
+	// Host is the bind address. Defaults to 127.0.0.1 (loopback only) so a
+	// single-user local tool isn't reachable from the LAN. Set to "0.0.0.0"
+	// to expose the API on all interfaces.
+	Host                   string        `json:"host" envconfig:"HOST"`
 	DataDir                string        `json:"data_dir" envconfig:"DATA_DIR"`
 	LogLevel               string        `json:"log_level" envconfig:"LOG_LEVEL"`
 	QueryTimeoutSeconds    int           `json:"query_timeout_seconds" envconfig:"QUERY_TIMEOUT_SECONDS"`
@@ -73,11 +77,12 @@ type LLMConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Port:                   7070,
+		Host:                   "127.0.0.1",
 		DataDir:                "./data",
 		LogLevel:               "info",
 		QueryTimeoutSeconds:    60,
 		MonitorIntervalSeconds: 5,
-		MaxDownloadConcurrency: 4,
+		MaxDownloadConcurrency: 16,
 		S3: S3Config{
 			Bucket:    "",
 			Region:    "",
@@ -131,6 +136,11 @@ func LoadConfig() (*Config, error) {
 	// Apply environment variable overrides
 	if err := envconfig.Process(envPrefix, &cfg); err != nil {
 		return nil, fmt.Errorf("processing environment variables: %w", err)
+	}
+
+	// Backfill Host on configs created before the field existed.
+	if cfg.Host == "" {
+		cfg.Host = "127.0.0.1"
 	}
 
 	// Validate final configuration

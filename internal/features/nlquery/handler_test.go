@@ -2,6 +2,7 @@ package nlquery
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,21 @@ import (
 	"cloudtrail-analyzer/internal/config"
 
 	"github.com/go-chi/chi/v5"
+	_ "modernc.org/sqlite"
 )
+
+func testDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`CREATE TABLE IF NOT EXISTS indexed_files (file_path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, mod_time TEXT NOT NULL, batch_id TEXT NOT NULL, indexed_at TEXT NOT NULL DEFAULT (datetime('now')))`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS index_state (id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL DEFAULT 'idle', total_bytes INTEGER NOT NULL DEFAULT 0, processed_bytes INTEGER NOT NULL DEFAULT 0, total_files INTEGER NOT NULL DEFAULT 0, processed_files INTEGER NOT NULL DEFAULT 0, last_batch_id TEXT, started_at TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')))`)
+	db.Exec(`INSERT OR IGNORE INTO index_state (id, status) VALUES (1, 'idle')`)
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
 func testConfig() *config.Config {
 	return &config.Config{
@@ -36,7 +51,7 @@ func testConfig() *config.Config {
 
 func TestExecute_EmptyPrompt(t *testing.T) {
 	cfg := testConfig()
-	h := NewHandler(cfg)
+	h := NewHandler(cfg, testDB(t))
 
 	body := `{"prompt":""}`
 	req := httptest.NewRequest("POST", "/execute", bytes.NewBufferString(body))
@@ -58,7 +73,7 @@ func TestExecute_EmptyPrompt(t *testing.T) {
 
 func TestExecute_InvalidJSON(t *testing.T) {
 	cfg := testConfig()
-	h := NewHandler(cfg)
+	h := NewHandler(cfg, testDB(t))
 
 	req := httptest.NewRequest("POST", "/execute", bytes.NewBufferString("not json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -73,7 +88,7 @@ func TestExecute_InvalidJSON(t *testing.T) {
 
 func TestExecute_MissingPromptField(t *testing.T) {
 	cfg := testConfig()
-	h := NewHandler(cfg)
+	h := NewHandler(cfg, testDB(t))
 
 	body := `{"prompt_id":"test"}`
 	req := httptest.NewRequest("POST", "/execute", bytes.NewBufferString(body))
@@ -89,7 +104,7 @@ func TestExecute_MissingPromptField(t *testing.T) {
 
 func TestRoutes_MountsExecute(t *testing.T) {
 	cfg := testConfig()
-	h := NewHandler(cfg)
+	h := NewHandler(cfg, testDB(t))
 	r := h.Routes()
 
 	// Verify the route exists by calling it

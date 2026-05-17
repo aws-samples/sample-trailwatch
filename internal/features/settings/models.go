@@ -22,10 +22,11 @@ type UpdateConfigRequest struct {
 	StartDate string `json:"start_date,omitempty"`
 	EndDate   string `json:"end_date,omitempty"`
 	// LLM provider
-	LLMProvider string `json:"llm_provider,omitempty"`
-	LLMAPIKey   string `json:"llm_api_key,omitempty"`
-	LLMModel    string `json:"llm_model,omitempty"`
-	LLMEndpoint string `json:"llm_endpoint,omitempty"`
+	LLMProvider   string `json:"llm_provider,omitempty"`
+	LLMAPIKey     string `json:"llm_api_key,omitempty"`
+	LLMModel      string `json:"llm_model,omitempty"`
+	LLMEndpoint   string `json:"llm_endpoint,omitempty"`
+	BedrockRegion string `json:"bedrock_region,omitempty"`
 }
 
 // ValidateBucketRequest represents a request to validate S3 bucket accessibility.
@@ -121,4 +122,26 @@ type VerifyLogsResponse struct {
 	FileCount  int    `json:"file_count"`
 	SampleDate string `json:"sample_date"`
 	Message    string `json:"message"`
+}
+
+// BedrockModel represents a single model available in Bedrock.
+type BedrockModel struct {
+	ModelID      string `json:"model_id"`
+	ModelName    string `json:"model_name"`
+	Provider     string `json:"provider"`
+	InputModes   []string `json:"input_modes"`
+	OutputModes  []string `json:"output_modes"`
+	IsCRIS       bool   `json:"is_cris"`
+	CRISNote     string `json:"cris_note,omitempty"`
+}
+
+// ListBedrockModelsRequest represents a request to list models in a region.
+type ListBedrockModelsRequest struct {
+	Region string `json:"region"`
+}
+
+// ListBedrockModelsResponse represents the list of available Bedrock models.
+type ListBedrockModelsResponse struct {
+	Region string         `json:"region"`
+	Models []BedrockModel `json:"models"`
 }

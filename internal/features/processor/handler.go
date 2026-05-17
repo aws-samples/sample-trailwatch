@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -26,12 +25,19 @@ func NewHandler(db *sql.DB, cfg *config.Config) *Handler {
 	}
 }
 
+// Service returns the underlying processor service for callback wiring.
+func (h *Handler) Service() *Service {
+	return h.service
+}
+
 // StartProcess starts the download pipeline for a session.
 // POST /api/sessions/{id}/process
 func (h *Handler) StartProcess(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "id")
-	if sessionID == "" {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id is required", nil)
+	if !render.IsValidUUID(sessionID) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
 		return
 	}
 
@@ -71,8 +77,10 @@ func (h *Handler) StartProcess(w http.ResponseWriter, r *http.Request) {
 // POST /api/sessions/{id}/cancel
 func (h *Handler) CancelProcess(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "id")
-	if sessionID == "" {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id is required", nil)
+	if !render.IsValidUUID(sessionID) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
 		return
 	}
 
@@ -87,26 +95,74 @@ func (h *Handler) CancelProcess(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetProgress returns the latest progress snapshot as JSON (REST polling fallback).
+// GET /api/sessions/{id}/progress/snapshot
+func (h *Handler) GetProgress(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "id")
+	if !render.IsValidUUID(sessionID) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
+		return
+	}
+
+	snap, exists := h.service.GetProgressSnapshot(sessionID)
+	if !exists {
+		render.JSON(w, http.StatusOK, map[string]interface{}{
+			"session_id": sessionID,
+			"phase":      "idle",
+			"percentage": 0,
+		})
+		return
+	}
+
+	render.JSON(w, http.StatusOK, snap)
+}
+
 // StreamProgress streams processing progress via Server-Sent Events.
 // GET /api/sessions/{id}/progress
 func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "id")
-	if sessionID == "" {
-		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id is required", nil)
+	if !render.IsValidUUID(sessionID) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "session id must be a UUID", map[string]string{
+			"field": "id",
+		})
+		return
+	}
+
+	// Check for active pipeline FIRST — return JSON for idle sessions
+	progressCh, exists := h.service.GetProgressChannel(sessionID)
+	if !exists {
+		render.JSON(w, http.StatusOK, map[string]interface{}{
+			"session_id": sessionID,
+			"phase":      "idle",
+			"message":    "No active pipeline — session may have completed or not started",
+		})
 		return
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Streaming not supported", nil)
-		return
-	}
-
-	// Get the progress channel for this session
-	progressCh, exists := h.service.GetProgressChannel(sessionID)
-	if !exists {
-		render.Error(w, http.StatusNotFound, "NOT_FOUND",
-			fmt.Sprintf("No active pipeline for session %s", sessionID), nil)
+		// Flusher not available (e.g., behind a proxy) — return a single JSON snapshot
+		// by draining the latest event from the channel without blocking
+		select {
+		case p, open := <-progressCh:
+			if open {
+				render.JSON(w, http.StatusOK, p)
+			} else {
+				render.JSON(w, http.StatusOK, map[string]interface{}{
+					"session_id": sessionID,
+					"phase":      "done",
+					"message":    "Pipeline completed",
+				})
+			}
+		default:
+			render.JSON(w, http.StatusOK, map[string]interface{}{
+				"session_id": sessionID,
+				"phase":      "processing",
+				"message":    "Pipeline active, no new events",
+			})
+		}
 		return
 	}
 

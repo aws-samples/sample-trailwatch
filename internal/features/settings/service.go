@@ -14,6 +14,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
@@ -586,6 +587,94 @@ func (s *Service) tryStatic(ctx context.Context, cfg *config.Config) CredentialA
 		Success: true,
 		Reason:  "Static credentials configured and valid",
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Bedrock Model Discovery
+// ---------------------------------------------------------------------------
+
+// ListBedrockModels calls the Bedrock ListFoundationModels API to discover available
+// models in the specified region. Models with a cross-region inference profile prefix
+// (e.g., "us.", "eu.", "ap.") are flagged as CRIS.
+func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBedrockModelsResponse, error) {
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	awsCfg, err := s.loadAWSConfig(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("loading AWS config for region %s: %w", region, err)
+	}
+
+	client := bedrock.NewFromConfig(awsCfg)
+
+	output, err := client.ListFoundationModels(ctx, &bedrock.ListFoundationModelsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("listing Bedrock models in %s: %w", region, err)
+	}
+
+	var models []BedrockModel
+	for _, m := range output.ModelSummaries {
+		modelID := aws.ToString(m.ModelId)
+		modelName := aws.ToString(m.ModelName)
+		providerName := aws.ToString(m.ProviderName)
+
+		// Only include text-generating models useful for SQL generation
+		hasTextOutput := false
+		var outputModes []string
+		for _, mode := range m.OutputModalities {
+			outputModes = append(outputModes, string(mode))
+			if string(mode) == "TEXT" {
+				hasTextOutput = true
+			}
+		}
+		if !hasTextOutput {
+			continue
+		}
+
+		var inputModes []string
+		for _, mode := range m.InputModalities {
+			inputModes = append(inputModes, string(mode))
+		}
+
+		// Detect CRIS: models with region prefix like "us.", "eu.", "ap."
+		isCRIS := false
+		crisNote := ""
+		if len(modelID) > 3 && modelID[2] == '.' {
+			prefix := modelID[:2]
+			crisRegions := map[string]string{
+				"us": "US regions (us-east-1, us-west-2)",
+				"eu": "EU regions (eu-west-1, eu-central-1)",
+				"ap": "AP regions (ap-southeast-1, ap-northeast-1)",
+			}
+			if regionDesc, ok := crisRegions[prefix]; ok {
+				isCRIS = true
+				crisNote = fmt.Sprintf("Cross-Region Inference: requests may be routed to %s for processing", regionDesc)
+			}
+		}
+
+		models = append(models, BedrockModel{
+			ModelID:     modelID,
+			ModelName:   modelName,
+			Provider:    providerName,
+			InputModes:  inputModes,
+			OutputModes: outputModes,
+			IsCRIS:      isCRIS,
+			CRISNote:    crisNote,
+		})
+	}
+
+	slog.Info("listed Bedrock models",
+		"component", "cloudtrail-analyzer",
+		"region", region,
+		"total_returned", len(output.ModelSummaries),
+		"text_models", len(models),
+	)
+
+	return &ListBedrockModelsResponse{
+		Region: region,
+		Models: models,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
