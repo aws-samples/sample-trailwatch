@@ -296,6 +296,7 @@ function formatRelativeTime(iso: string): string {
 }
 
 function IndexProgressCard() {
+  const { t } = useTranslation()
   const { status, refresh } = useIndexStatus()
   const { data: progress, done, active, connect } = useIndexProgress()
 
@@ -330,16 +331,16 @@ function IndexProgressCard() {
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <Database className="w-4 h-4 text-[#0972d3]" />
-          <h3 className="text-sm font-medium text-gray-900 dark:text-white">DuckDB Index</h3>
+          <h3 className="text-sm font-medium text-gray-900 dark:text-white">{t('data.sync.duckdbIndex')}</h3>
         </div>
         {status?.indexed && !isBuilding && !isPaused && (
           <span className="text-[10px] text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30 px-2 py-0.5 rounded font-medium">
-            Indexed
+            {t('data.sync.indexed')}
           </span>
         )}
         {isPaused && (
           <span className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 px-2 py-0.5 rounded font-medium">
-            Paused
+            {t('data.sync.paused')}
           </span>
         )}
       </div>
@@ -401,7 +402,7 @@ function IndexProgressCard() {
 
       {isError && (
         <div className="flex items-center justify-between">
-          <span className="text-[11px] text-red-600 dark:text-red-400">Indexing failed</span>
+          <span className="text-[11px] text-red-600 dark:text-red-400">{t('data.sync.indexingFailed')}</span>
           <button type="button" onClick={handleBuild}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
             <RotateCw className="w-3 h-3" /> Retry
@@ -413,6 +414,7 @@ function IndexProgressCard() {
 }
 
 function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?: ProgressSnapshot }) {
+  const { t } = useTranslation()
   const pct = snapshot?.percentage || 0
   const filesCompleted = snapshot?.files_completed || 0
   const totalFiles = snapshot?.total_files || session.total_files || 0
@@ -464,7 +466,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
           <div className="flex items-center gap-1.5">
             <HardDrive className="w-3 h-3 text-gray-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-gray-500">Files</div>
+              <div className="text-[10px] text-gray-500">{t('data.sync.statFiles')}</div>
               <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
                 {filesCompleted.toLocaleString()}/{totalFiles.toLocaleString()}
               </div>
@@ -473,7 +475,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
           <div className="flex items-center gap-1.5">
             <Zap className="w-3 h-3 text-gray-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-gray-500">Speed</div>
+              <div className="text-[10px] text-gray-500">{t('data.sync.statSpeed')}</div>
               <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
                 {speed > 0 ? `${formatBytes(speed)}/s` : '--'}
               </div>
@@ -482,7 +484,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
           <div className="flex items-center gap-1.5">
             <Clock className="w-3 h-3 text-gray-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-gray-500">ETA</div>
+              <div className="text-[10px] text-gray-500">{t('data.sync.statETA')}</div>
               <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
                 {formatETA(eta)}
               </div>
@@ -491,7 +493,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
           <div className="flex items-center gap-1.5">
             <RefreshCw className="w-3 h-3 text-gray-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-gray-500">Workers</div>
+              <div className="text-[10px] text-gray-500">{t('data.sync.statWorkers')}</div>
               <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
                 {concurrency > 0 ? concurrency : '--'} • {filesPerSec > 0 ? `${filesPerSec.toFixed(1)} f/s` : '--'}
               </div>
@@ -501,7 +503,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
       ) : (
         <div className="flex items-center gap-2">
           <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
-          <span className="text-[11px] text-gray-500">Listing S3 objects for {session.start_date} → {session.end_date}...</span>
+          <span className="text-[11px] text-gray-500">{t('data.sync.listingObjects', { startDate: session.start_date, endDate: session.end_date })}</span>
         </div>
       )}
 

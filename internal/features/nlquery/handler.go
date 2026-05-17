@@ -134,11 +134,17 @@ func (h *Handler) StreamIndexProgress(w http.ResponseWriter, r *http.Request) {
 			}
 
 			data, _ := json.Marshal(progress)
-			fmt.Fprintf(w, "event: progress\ndata: %s\n\n", data)
+			// SSE stream — text/event-stream content type, parsed by the browser
+			// as event data, not as HTML. The XSS-via-html/template suggestion
+			// from semgrep does not apply here; suppressed inline with
+			// justification per CSR rules.
+			w.Write([]byte("event: progress\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write(data)                                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("\n\n"))                       //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 			flusher.Flush()
 
 			if state.Status == "idle" || state.Status == "error" || state.Status == "paused" {
-				fmt.Fprintf(w, "event: done\ndata: {}\n\n")
+				w.Write([]byte("event: done\ndata: {}\n\n"))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 				flusher.Flush()
 				return
 			}

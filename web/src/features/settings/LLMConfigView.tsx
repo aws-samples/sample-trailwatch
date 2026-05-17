@@ -201,7 +201,7 @@ export function LLMConfigView() {
             {/* Region selector */}
             <div>
               <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
-                Bedrock Region (API calls go here)
+                {t('settings.llm.bedrockRegion')}
               </label>
               <select
                 value={bedrockRegion}
@@ -218,7 +218,7 @@ export function LLMConfigView() {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <label className="text-xs font-medium text-gray-600 dark:text-gray-400">
-                  Model
+                  {t('settings.llm.model')}
                 </label>
                 <button
                   onClick={() => fetchModels(bedrockRegion)}
@@ -226,24 +226,26 @@ export function LLMConfigView() {
                   className="inline-flex items-center gap-1 text-[10px] text-purple-600 hover:text-purple-800 disabled:opacity-50"
                 >
                   <RefreshCw className={`w-3 h-3 ${modelsLoading ? 'animate-spin' : ''}`} />
-                  Refresh
+                  {t('settings.llm.refresh')}
                 </button>
               </div>
 
               {modelsLoading && (
                 <div className="flex items-center gap-2 py-4 justify-center">
                   <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
-                  <span className="text-xs text-gray-500">Loading models from {bedrockRegion}...</span>
+                  <span className="text-xs text-gray-500">{t('settings.llm.loadingModels', { region: bedrockRegion })}</span>
                 </div>
               )}
 
               {modelsError && (
                 <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
                   <p className="text-xs text-red-700 dark:text-red-300">
-                    Failed to load models: {modelsError}
+                    {t('settings.llm.loadModelsFailed')} {modelsError}
                   </p>
                   <p className="text-[10px] text-red-500 mt-1">
-                    Ensure your credentials have <code className="bg-red-100 dark:bg-red-900 px-1 rounded">bedrock:ListFoundationModels</code> permission.
+                    {t('settings.llm.bedrockListPermissionPrefix')}{' '}
+                    <code className="bg-red-100 dark:bg-red-900 px-1 rounded">bedrock:ListFoundationModels</code>{' '}
+                    {t('settings.llm.bedrockListPermissionSuffix')}
                   </p>
                 </div>
               )}
@@ -256,7 +258,7 @@ export function LLMConfigView() {
                       <div className="flex items-center gap-1.5 mb-1.5">
                         <Shield className="w-3 h-3 text-green-600" />
                         <span className="text-[10px] font-semibold uppercase text-green-700 dark:text-green-400">
-                          Available in {bedrockRegion}
+                          {t('settings.llm.availableInRegion', { region: bedrockRegion })}
                         </span>
                       </div>
                       <div className="max-h-48 overflow-y-auto rounded border border-gray-200 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-800">
@@ -296,16 +298,16 @@ export function LLMConfigView() {
                       <div className="flex items-center gap-1.5 mb-1.5">
                         <AlertTriangle className="w-3 h-3 text-amber-500" />
                         <span className="text-[10px] font-semibold uppercase text-amber-700 dark:text-amber-400">
-                          Cross-Region Inference (CRIS)
+                          {t('settings.llm.crisLabel')}
                         </span>
                       </div>
 
                       {/* CRIS warning banner */}
                       <div className="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mb-2">
                         <p className="text-[11px] text-amber-800 dark:text-amber-200 leading-relaxed">
-                          CRIS models route requests to other AWS regions for processing. Your CloudTrail query data
-                          may leave <strong>{bedrockRegion}</strong> during inference. This may conflict with data
-                          residency or regulatory requirements.
+                          {t('settings.llm.crisExplainPrefix')}{' '}
+                          <strong>{bedrockRegion}</strong>{' '}
+                          {t('settings.llm.crisExplainSuffix')}
                         </p>
                         <label className="flex items-center gap-2 mt-2 cursor-pointer">
                           <input
@@ -315,7 +317,7 @@ export function LLMConfigView() {
                             className="w-3.5 h-3.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
                           />
                           <span className="text-[11px] font-medium text-amber-800 dark:text-amber-200">
-                            I understand that CRIS routes data cross-region
+                            {t('settings.llm.crisAck')}
                           </span>
                         </label>
                       </div>
@@ -344,7 +346,7 @@ export function LLMConfigView() {
                                   {m.model_name}
                                 </span>
                                 <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 shrink-0">
-                                  CRIS
+                                  {t('settings.llm.crisBadge')}
                                 </span>
                               </div>
                               <div className="text-[10px] text-gray-400 font-mono truncate">
@@ -362,9 +364,10 @@ export function LLMConfigView() {
                   {selectedModelId && (
                     <div className="p-2 rounded bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800">
                       <p className="text-[10px] text-purple-700 dark:text-purple-300">
-                        Selected: <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">{selectedModelId}</code>
+                        {t('settings.llm.selectedLabel')}{' '}
+                        <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">{selectedModelId}</code>
                         {crisModels.some(m => m.model_id === selectedModelId) && (
-                          <span className="ml-1 text-amber-600 font-semibold">(CRIS)</span>
+                          <span className="ml-1 text-amber-600 font-semibold">({t('settings.llm.crisBadge')})</span>
                         )}
                       </p>
                     </div>
@@ -375,7 +378,7 @@ export function LLMConfigView() {
               {!modelsLoading && !modelsError && bedrockModels.length === 0 && (
                 <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
                   <p className="text-xs text-gray-500 dark:text-gray-400">
-                    No models found. Click Refresh after configuring valid AWS credentials.
+                    {t('settings.llm.noModelsFound')}
                   </p>
                 </div>
               )}
