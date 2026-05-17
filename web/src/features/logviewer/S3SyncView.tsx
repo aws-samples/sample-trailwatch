@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { CloudDownload, Loader2, Play, AlertCircle, RefreshCw } from 'lucide-react'
+import { CloudDownload, Loader2, Play, AlertCircle, RefreshCw, Database, Square, RotateCw, Zap, Clock, HardDrive } from 'lucide-react'
 import { useSettings } from '../settings/hooks'
+import { useIndexStatus, useIndexProgress } from './hooks'
 import { endpoints } from '../../config/api'
-import type { Session, ProcessingProgress } from '../../types/session'
+import { readApiError } from '../../comm/apiError'
+import type { Session, ProgressSnapshot } from '../../types/session'
 
 export function S3SyncView() {
   const { t } = useTranslation()
@@ -13,10 +15,11 @@ export function S3SyncView() {
   const [endDate, setEndDate] = useState('')
   const [sessions, setSessions] = useState<Session[]>([])
   const [sessionsLoading, setSessionsLoading] = useState(true)
+  const [sessionsError, setSessionsError] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState<string | null>(null)
-  const [liveProgress, setLiveProgress] = useState<Record<string, ProcessingProgress>>({})
-  const eventSourcesRef = useRef<Record<string, EventSource>>({})
+  const [liveProgress, setLiveProgress] = useState<Record<string, ProgressSnapshot>>({})
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const bucket = settings?.s3?.bucket || ''
   const bucketRegion = settings?.s3?.region || ''
@@ -33,61 +36,54 @@ export function S3SyncView() {
 
   const fetchSessions = useCallback(async () => {
     try {
+      setSessionsError(null)
       const res = await fetch('/api/sessions')
-      if (res.ok) {
-        const data = await res.json()
-        if (Array.isArray(data)) setSessions(data.slice(0, 20))
+      if (!res.ok) {
+        setSessionsError(await readApiError(res, 'Failed to load sessions'))
+        return
       }
-    } catch { /* silent */ }
-    finally { setSessionsLoading(false) }
+      const data = await res.json()
+      if (Array.isArray(data)) setSessions(data.slice(0, 30))
+    } catch (e: any) {
+      setSessionsError(e?.message || 'Failed to load sessions')
+    } finally {
+      setSessionsLoading(false)
+    }
   }, [])
 
   useEffect(() => { fetchSessions() }, [fetchSessions])
 
-  // Poll for active sessions
-  useEffect(() => {
-    const hasActive = sessions.some(s =>
-      s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying'
-    )
-    if (!hasActive) return
-    const interval = setInterval(fetchSessions, 3000)
-    return () => clearInterval(interval)
-  }, [sessions, fetchSessions])
-
-  // Connect SSE for active sessions
+  // Poll progress snapshots for active sessions every 2 seconds
   useEffect(() => {
     const activeSessions = sessions.filter(s =>
       s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying'
     )
-
-    activeSessions.forEach(session => {
-      if (eventSourcesRef.current[session.id]) return
-      const es = new EventSource(endpoints.sessionProgress(session.id))
-      eventSourcesRef.current[session.id] = es
-
-      es.addEventListener('progress', (e) => {
-        try {
-          const progress: ProcessingProgress = JSON.parse((e as MessageEvent).data)
-          setLiveProgress(prev => ({ ...prev, [session.id]: progress }))
-        } catch { /* ignore */ }
-      })
-
-      es.addEventListener('done', () => {
-        es.close()
-        delete eventSourcesRef.current[session.id]
-        fetchSessions()
-      })
-
-      es.onerror = () => {
-        es.close()
-        delete eventSourcesRef.current[session.id]
-      }
-    })
-
-    return () => {
-      Object.values(eventSourcesRef.current).forEach(es => es.close())
-      eventSourcesRef.current = {}
+    if (activeSessions.length === 0) {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+      return
     }
+
+    const pollProgress = async () => {
+      const updates: Record<string, ProgressSnapshot> = {}
+      await Promise.all(activeSessions.map(async (session) => {
+        try {
+          const res = await fetch(endpoints.sessionProgressSnapshot(session.id))
+          if (res.ok) {
+            const snap = await res.json()
+            if (snap.phase && snap.phase !== 'idle') {
+              updates[session.id] = snap
+            }
+          }
+        } catch { /* silent */ }
+      }))
+      if (Object.keys(updates).length > 0) {
+        setLiveProgress(prev => ({ ...prev, ...updates }))
+      }
+    }
+
+    pollProgress()
+    pollRef.current = setInterval(() => { pollProgress(); fetchSessions() }, 2000)
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessions, fetchSessions])
 
   // Start sync for all selected accounts
@@ -212,20 +208,29 @@ export function S3SyncView() {
           {sessions.filter(s => s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying').length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-gray-900 dark:text-white mb-3">{t('data.sync.activeDownloads')}</h3>
-              <div className="space-y-2">
+              <div className="space-y-3">
                 {sessions.filter(s => s.state === 'downloading' || s.state === 'extracting' || s.state === 'verifying').map(session => (
-                  <ActiveSessionCard key={session.id} session={session} progress={liveProgress[session.id]} />
+                  <ActiveSessionCard key={session.id} session={session} snapshot={liveProgress[session.id]} />
                 ))}
               </div>
             </div>
           )}
+
+          {/* Index Progress */}
+          <IndexProgressCard />
 
           {/* Completed Syncs */}
           <div>
             <h3 className="text-sm font-medium text-gray-900 dark:text-white mb-3">{t('data.sync.syncHistory')}</h3>
             {sessionsLoading && <div className="flex items-center gap-2 text-sm text-gray-500"><Loader2 className="w-3 h-3 animate-spin" /> Loading...</div>}
 
-            {!sessionsLoading && sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').length === 0 && (
+            {sessionsError && (
+              <div className="p-3 rounded-md border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 mb-3">
+                <p className="text-xs text-red-700 dark:text-red-300">{sessionsError}</p>
+              </div>
+            )}
+
+            {!sessionsLoading && !sessionsError && sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').length === 0 && (
               <p className="text-sm text-gray-500 dark:text-gray-400">{t('data.sync.noCompleted')}</p>
             )}
 
@@ -237,6 +242,8 @@ export function S3SyncView() {
                       <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.account')}</th>
                       <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.dateRange')}</th>
                       <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.files')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.sizeOnDisk')}</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.lastUpdated')}</th>
                       <th className="text-left px-3 py-2 font-medium text-gray-500">{t('data.sync.status')}</th>
                     </tr>
                   </thead>
@@ -246,6 +253,8 @@ export function S3SyncView() {
                         <td className="px-3 py-2 font-mono text-gray-900 dark:text-white">{session.account_id}</td>
                         <td className="px-3 py-2 text-gray-600 dark:text-gray-400">{session.start_date} → {session.end_date}</td>
                         <td className="px-3 py-2 text-gray-600 dark:text-gray-400">{session.total_files}</td>
+                        <td className="px-3 py-2 text-gray-600 dark:text-gray-400 tabular-nums">{session.disk_usage_bytes > 0 ? formatBytes(session.disk_usage_bytes) : '—'}</td>
+                        <td className="px-3 py-2 text-gray-600 dark:text-gray-400">{formatRelativeTime(session.updated_at)}</td>
                         <td className="px-3 py-2">
                           <StatusChip state={session.state} />
                         </td>
@@ -262,38 +271,249 @@ export function S3SyncView() {
   )
 }
 
-function ActiveSessionCard({ session, progress }: { session: Session, progress?: ProcessingProgress }) {
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
+}
+
+function formatRelativeTime(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  const t = d.getTime()
+  // Reject invalid dates and Go's zero time (0001-01-01T00:00:00Z)
+  if (Number.isNaN(t) || d.getUTCFullYear() < 1971) return '—'
+  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (secs < 60) return `${secs}s ago`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  if (days < 30) return `${days}d ago`
+  return d.toLocaleDateString()
+}
+
+function IndexProgressCard() {
+  const { status, refresh } = useIndexStatus()
+  const { data: progress, done, active, connect } = useIndexProgress()
+
+  const handleBuild = async () => {
+    await fetch(endpoints.indexBuild, { method: 'POST' })
+    connect()
+    refresh()
+  }
+
+  const handleCancel = async () => {
+    await fetch(endpoints.indexCancel, { method: 'POST' })
+    refresh()
+  }
+
+  useEffect(() => {
+    if (done) refresh()
+  }, [done, refresh])
+
+  useEffect(() => {
+    if (status?.index_status === 'building' && !active) {
+      connect()
+    }
+  }, [status, active, connect])
+
   const pct = progress?.percentage || 0
-  const filesCompleted = progress?.files_completed || 0
-  const totalFiles = progress?.total_files || session.total_files || 0
-  const phase = progress?.phase || session.state
-  const message = progress?.message || `${phase}...`
+  const isBuilding = status?.index_status === 'building' || active
+  const isPaused = status?.index_status === 'paused'
+  const isError = status?.index_status === 'error'
 
   return (
-    <div className="p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/10">
-      <div className="flex items-center justify-between mb-2">
+    <div className="p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+      <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-          <span className="text-sm font-mono font-medium text-gray-900 dark:text-white">{session.account_id}</span>
-          <span className="text-[10px] text-gray-500 bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded">{session.log_region}</span>
+          <Database className="w-4 h-4 text-[#0972d3]" />
+          <h3 className="text-sm font-medium text-gray-900 dark:text-white">DuckDB Index</h3>
         </div>
-        <span className="text-xs font-medium text-blue-600">{pct}%</span>
+        {status?.indexed && !isBuilding && !isPaused && (
+          <span className="text-[10px] text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30 px-2 py-0.5 rounded font-medium">
+            Indexed
+          </span>
+        )}
+        {isPaused && (
+          <span className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 px-2 py-0.5 rounded font-medium">
+            Paused
+          </span>
+        )}
+      </div>
+
+      {isBuilding && progress && (
+        <>
+          <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-2">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-500"
+              style={{ width: `${Math.max(pct, 2)}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-[11px] text-gray-600 dark:text-gray-400">
+              {formatBytes(progress.processed_bytes)} / {formatBytes(progress.total_bytes)}
+            </span>
+            <span className="text-[11px] text-gray-500">
+              {progress.processed_files}/{progress.total_files} files • {pct.toFixed(0)}%
+            </span>
+          </div>
+          <button type="button" onClick={handleCancel}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+            <Square className="w-3 h-3" /> Cancel
+          </button>
+        </>
+      )}
+
+      {isBuilding && !progress && (
+        <div className="flex items-center gap-2 text-sm text-gray-500">
+          <Loader2 className="w-3 h-3 animate-spin" /> Starting index build...
+        </div>
+      )}
+
+      {!isBuilding && !isPaused && !isError && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-gray-500 dark:text-gray-400">
+            {status?.indexed
+              ? `${status.total_files_indexed} files (${formatBytes(status.total_bytes_indexed || 0)}) — ${status.age_seconds && status.age_seconds < 60 ? '<1 min ago' : `${Math.round((status.age_seconds || 0) / 60)} min ago`}`
+              : 'Not indexed yet'}
+          </span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <RotateCw className="w-3 h-3" /> {status?.indexed ? 'Re-index' : 'Build Index'}
+          </button>
+        </div>
+      )}
+
+      {isPaused && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-gray-500 dark:text-gray-400">
+            {status?.total_files_indexed} of {progress?.total_files || '?'} files indexed
+          </span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors">
+            <Play className="w-3 h-3" /> Resume
+          </button>
+        </div>
+      )}
+
+      {isError && (
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-red-600 dark:text-red-400">Indexing failed</span>
+          <button type="button" onClick={handleBuild}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <RotateCw className="w-3 h-3" /> Retry
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?: ProgressSnapshot }) {
+  const pct = snapshot?.percentage || 0
+  const filesCompleted = snapshot?.files_completed || 0
+  const totalFiles = snapshot?.total_files || session.total_files || 0
+  const phase = snapshot?.phase || session.state
+  const speed = snapshot?.speed_bytes_per_sec || 0
+  const filesPerSec = snapshot?.files_per_sec || 0
+  const eta = snapshot?.eta_seconds || 0
+  const concurrency = snapshot?.concurrency || 0
+
+  const formatETA = (secs: number) => {
+    if (secs <= 0) return '--'
+    if (secs < 60) return `${secs}s`
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`
+    return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+  }
+
+  const hasData = totalFiles > 0
+
+  return (
+    <div className="p-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-900/10">
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+          </div>
+          <span className="text-sm font-mono font-semibold text-gray-900 dark:text-white">{session.account_id}</span>
+          <span className="text-[10px] text-gray-500 bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded">{session.log_region}</span>
+          <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded capitalize">
+            {phase}
+          </span>
+        </div>
+        <span className="text-lg font-bold text-blue-600 dark:text-blue-400 tabular-nums">
+          {pct.toFixed(1)}%
+        </span>
       </div>
 
       {/* Progress bar */}
-      <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-2">
+      <div className="w-full h-2.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden mb-3">
         <div
-          className="h-full bg-blue-500 rounded-full transition-all duration-500"
-          style={{ width: `${Math.max(pct, 2)}%` }}
+          className="h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full transition-all duration-1000 ease-out"
+          style={{ width: `${Math.max(pct, 1)}%` }}
         />
       </div>
 
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] text-gray-600 dark:text-gray-400">{message}</span>
-        <span className="text-[11px] text-gray-500">
-          {filesCompleted}/{totalFiles} files • {session.start_date} → {session.end_date}
-        </span>
-      </div>
+      {/* Stats row */}
+      {hasData ? (
+        <div className="grid grid-cols-4 gap-3">
+          <div className="flex items-center gap-1.5">
+            <HardDrive className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-500">Files</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {filesCompleted.toLocaleString()}/{totalFiles.toLocaleString()}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-500">Speed</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {speed > 0 ? `${formatBytes(speed)}/s` : '--'}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Clock className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-500">ETA</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {formatETA(eta)}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <RefreshCw className="w-3 h-3 text-gray-400 shrink-0" />
+            <div>
+              <div className="text-[10px] text-gray-500">Workers</div>
+              <div className="text-xs font-medium text-gray-900 dark:text-white tabular-nums">
+                {concurrency > 0 ? concurrency : '--'} • {filesPerSec > 0 ? `${filesPerSec.toFixed(1)} f/s` : '--'}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+          <span className="text-[11px] text-gray-500">Listing S3 objects for {session.start_date} → {session.end_date}...</span>
+        </div>
+      )}
+
+      {/* Date range footer */}
+      {hasData && (
+        <div className="mt-2 pt-2 border-t border-blue-100 dark:border-blue-800/50 flex items-center justify-between">
+          <span className="text-[10px] text-gray-500">{session.start_date} → {session.end_date}</span>
+          <span className="text-[10px] text-gray-500">
+            {formatBytes(snapshot?.bytes_transferred || 0)} / {formatBytes(snapshot?.total_bytes || 0)}
+          </span>
+        </div>
+      )}
     </div>
   )
 }

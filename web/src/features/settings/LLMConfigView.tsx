@@ -1,16 +1,41 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Brain, CheckCircle2, Loader2 } from 'lucide-react'
+import { Brain, CheckCircle2, Loader2, AlertTriangle, RefreshCw, Shield } from 'lucide-react'
 import { useSettings } from './hooks'
 import { endpoints } from '../../config/api'
 
 type Provider = 'bedrock' | 'anthropic' | 'openai' | 'ollama'
+
+interface BedrockModel {
+  model_id: string
+  model_name: string
+  provider: string
+  input_modes: string[]
+  output_modes: string[]
+  is_cris: boolean
+  cris_note?: string
+}
 
 const PROVIDERS: { value: Provider; label: string; description: string }[] = [
   { value: 'bedrock', label: 'AWS Bedrock', description: 'Uses your configured AWS credentials. No additional API key needed.' },
   { value: 'anthropic', label: 'Anthropic API', description: 'Direct API access via api.anthropic.com. Requires an API key.' },
   { value: 'openai', label: 'OpenAI / Compatible', description: 'OpenAI, Azure OpenAI, or any OpenAI-compatible endpoint. Requires API key.' },
   { value: 'ollama', label: 'Ollama (Local)', description: 'Runs locally on your machine. Auto-installs and pulls codellama:7b. No API key needed.' },
+]
+
+const BEDROCK_REGIONS = [
+  { value: 'ap-south-1', label: 'Asia Pacific (Mumbai)' },
+  { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)' },
+  { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)' },
+  { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)' },
+  { value: 'ap-northeast-2', label: 'Asia Pacific (Seoul)' },
+  { value: 'us-east-1', label: 'US East (N. Virginia)' },
+  { value: 'us-west-2', label: 'US West (Oregon)' },
+  { value: 'eu-west-1', label: 'Europe (Ireland)' },
+  { value: 'eu-west-2', label: 'Europe (London)' },
+  { value: 'eu-central-1', label: 'Europe (Frankfurt)' },
+  { value: 'ca-central-1', label: 'Canada (Central)' },
+  { value: 'sa-east-1', label: 'South America (Sao Paulo)' },
 ]
 
 export function LLMConfigView() {
@@ -21,16 +46,56 @@ export function LLMConfigView() {
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [bedrockRegion, setBedrockRegion] = useState('ap-south-1')
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+
+  // Bedrock model discovery
+  const [bedrockModels, setBedrockModels] = useState<BedrockModel[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState('')
+  const [crisAcknowledged, setCrisAcknowledged] = useState(false)
+  const [selectedModelId, setSelectedModelId] = useState('')
 
   useEffect(() => {
     if (settings) {
       setProvider((settings as any).llm?.provider || 'bedrock')
       setModel((settings as any).llm?.model || '')
       setEndpoint((settings as any).llm?.endpoint || '')
+      setBedrockRegion((settings as any).bedrock?.region || 'ap-south-1')
+      setSelectedModelId((settings as any).bedrock?.model_id || '')
     }
   }, [settings])
+
+  const fetchModels = useCallback(async (region: string) => {
+    setModelsLoading(true)
+    setModelsError('')
+    try {
+      const res = await fetch(endpoints.bedrockModels, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ region }),
+      })
+      if (!res.ok) {
+        const err = await res.json()
+        throw new Error(err.message || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setBedrockModels(data.models || [])
+    } catch (err: any) {
+      setModelsError(err.message || 'Failed to fetch models')
+      setBedrockModels([])
+    } finally {
+      setModelsLoading(false)
+    }
+  }, [])
+
+  // Fetch models when Bedrock is selected and region changes
+  useEffect(() => {
+    if (provider === 'bedrock' && bedrockRegion) {
+      fetchModels(bedrockRegion)
+    }
+  }, [provider, bedrockRegion, fetchModels])
 
   const defaultModel = (p: Provider) => {
     switch (p) {
@@ -47,8 +112,13 @@ export function LLMConfigView() {
     try {
       const body: Record<string, string> = { llm_provider: provider }
       if (apiKey) body.llm_api_key = apiKey
-      if (model) body.llm_model = model
-      else body.llm_model = defaultModel(provider)
+      if (provider === 'bedrock') {
+        body.llm_model = selectedModelId || defaultModel('bedrock')
+        body.bedrock_region = bedrockRegion
+      } else {
+        if (model) body.llm_model = model
+        else body.llm_model = defaultModel(provider)
+      }
       if (endpoint) body.llm_endpoint = endpoint
 
       const res = await fetch(endpoints.settings, {
@@ -64,7 +134,7 @@ export function LLMConfigView() {
     } finally {
       setSaving(false)
     }
-  }, [provider, apiKey, model, endpoint, refetch])
+  }, [provider, apiKey, model, endpoint, bedrockRegion, selectedModelId, refetch])
 
   if (settingsLoading) {
     return (
@@ -75,6 +145,10 @@ export function LLMConfigView() {
   }
 
   const activeProvider = (settings as any)?.llm?.provider || 'bedrock'
+
+  // Split models into in-region and CRIS
+  const inRegionModels = bedrockModels.filter(m => !m.is_cris)
+  const crisModels = bedrockModels.filter(m => m.is_cris)
 
   return (
     <div className="h-full overflow-y-auto">
@@ -121,7 +195,195 @@ export function LLMConfigView() {
           ))}
         </div>
 
-        {/* Provider-specific config */}
+        {/* Bedrock config — region + model picker */}
+        {provider === 'bedrock' && (
+          <div className="pl-7 space-y-4">
+            {/* Region selector */}
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                Bedrock Region (API calls go here)
+              </label>
+              <select
+                value={bedrockRegion}
+                onChange={e => { setBedrockRegion(e.target.value); setSelectedModelId('') }}
+                className="w-full px-3 py-2 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
+              >
+                {BEDROCK_REGIONS.map(r => (
+                  <option key={r.value} value={r.value}>{r.label} ({r.value})</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Model list */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">
+                  Model
+                </label>
+                <button
+                  onClick={() => fetchModels(bedrockRegion)}
+                  disabled={modelsLoading}
+                  className="inline-flex items-center gap-1 text-[10px] text-purple-600 hover:text-purple-800 disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3 h-3 ${modelsLoading ? 'animate-spin' : ''}`} />
+                  Refresh
+                </button>
+              </div>
+
+              {modelsLoading && (
+                <div className="flex items-center gap-2 py-4 justify-center">
+                  <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
+                  <span className="text-xs text-gray-500">Loading models from {bedrockRegion}...</span>
+                </div>
+              )}
+
+              {modelsError && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+                  <p className="text-xs text-red-700 dark:text-red-300">
+                    Failed to load models: {modelsError}
+                  </p>
+                  <p className="text-[10px] text-red-500 mt-1">
+                    Ensure your credentials have <code className="bg-red-100 dark:bg-red-900 px-1 rounded">bedrock:ListFoundationModels</code> permission.
+                  </p>
+                </div>
+              )}
+
+              {!modelsLoading && !modelsError && bedrockModels.length > 0 && (
+                <div className="space-y-3">
+                  {/* In-region models */}
+                  {inRegionModels.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <Shield className="w-3 h-3 text-green-600" />
+                        <span className="text-[10px] font-semibold uppercase text-green-700 dark:text-green-400">
+                          Available in {bedrockRegion}
+                        </span>
+                      </div>
+                      <div className="max-h-48 overflow-y-auto rounded border border-gray-200 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-800">
+                        {inRegionModels.map(m => (
+                          <label
+                            key={m.model_id}
+                            className={`flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 ${
+                              selectedModelId === m.model_id ? 'bg-purple-50 dark:bg-purple-900/20' : ''
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="bedrock-model"
+                              value={m.model_id}
+                              checked={selectedModelId === m.model_id}
+                              onChange={() => setSelectedModelId(m.model_id)}
+                              className="w-3.5 h-3.5 text-purple-600"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-xs font-medium text-gray-900 dark:text-white truncate">
+                                {m.model_name}
+                              </div>
+                              <div className="text-[10px] text-gray-400 font-mono truncate">
+                                {m.model_id}
+                              </div>
+                            </div>
+                            <span className="text-[10px] text-gray-400 shrink-0">{m.provider}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* CRIS models */}
+                  {crisModels.length > 0 && (
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <AlertTriangle className="w-3 h-3 text-amber-500" />
+                        <span className="text-[10px] font-semibold uppercase text-amber-700 dark:text-amber-400">
+                          Cross-Region Inference (CRIS)
+                        </span>
+                      </div>
+
+                      {/* CRIS warning banner */}
+                      <div className="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mb-2">
+                        <p className="text-[11px] text-amber-800 dark:text-amber-200 leading-relaxed">
+                          CRIS models route requests to other AWS regions for processing. Your CloudTrail query data
+                          may leave <strong>{bedrockRegion}</strong> during inference. This may conflict with data
+                          residency or regulatory requirements.
+                        </p>
+                        <label className="flex items-center gap-2 mt-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={crisAcknowledged}
+                            onChange={e => { setCrisAcknowledged(e.target.checked); if (!e.target.checked) setSelectedModelId(prev => crisModels.some(m => m.model_id === prev) ? '' : prev) }}
+                            className="w-3.5 h-3.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                          />
+                          <span className="text-[11px] font-medium text-amber-800 dark:text-amber-200">
+                            I understand that CRIS routes data cross-region
+                          </span>
+                        </label>
+                      </div>
+
+                      {/* CRIS model list — grayed out unless acknowledged */}
+                      <div className={`max-h-48 overflow-y-auto rounded border border-gray-200 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-800 ${!crisAcknowledged ? 'opacity-40 pointer-events-none' : ''}`}>
+                        {crisModels.map(m => (
+                          <label
+                            key={m.model_id}
+                            className={`flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 ${
+                              selectedModelId === m.model_id ? 'bg-purple-50 dark:bg-purple-900/20' : ''
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="bedrock-model"
+                              value={m.model_id}
+                              checked={selectedModelId === m.model_id}
+                              onChange={() => setSelectedModelId(m.model_id)}
+                              disabled={!crisAcknowledged}
+                              className="w-3.5 h-3.5 text-purple-600"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-medium text-gray-900 dark:text-white truncate">
+                                  {m.model_name}
+                                </span>
+                                <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 shrink-0">
+                                  CRIS
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-gray-400 font-mono truncate">
+                                {m.model_id}
+                              </div>
+                            </div>
+                            <span className="text-[10px] text-gray-400 shrink-0">{m.provider}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Selected model display */}
+                  {selectedModelId && (
+                    <div className="p-2 rounded bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800">
+                      <p className="text-[10px] text-purple-700 dark:text-purple-300">
+                        Selected: <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">{selectedModelId}</code>
+                        {crisModels.some(m => m.model_id === selectedModelId) && (
+                          <span className="ml-1 text-amber-600 font-semibold">(CRIS)</span>
+                        )}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!modelsLoading && !modelsError && bedrockModels.length === 0 && (
+                <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    No models found. Click Refresh after configuring valid AWS credentials.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Provider-specific config: Anthropic / OpenAI */}
         {(provider === 'anthropic' || provider === 'openai') && (
           <div className="space-y-3 pl-7">
             <div>
@@ -193,16 +455,6 @@ export function LLMConfigView() {
                 placeholder="http://localhost:11434"
                 className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
               />
-            </div>
-          </div>
-        )}
-
-        {provider === 'bedrock' && (
-          <div className="pl-7">
-            <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
-              <p className="text-xs text-gray-600 dark:text-gray-400">
-                {t('settings.llm.bedrockNote')} <code className="font-mono bg-gray-100 dark:bg-gray-700 px-1 rounded">{(settings as any)?.bedrock?.model_id || 'us.anthropic.claude-sonnet-4-20250514-v1:0'}</code>
-              </p>
             </div>
           </div>
         )}

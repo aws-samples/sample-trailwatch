@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
-  FolderOpen,
   CloudDownload,
   BookOpen,
   Database,
@@ -26,7 +25,6 @@ const insightsItems: NavItem[] = [
 ]
 
 const dataItems: NavItem[] = [
-  { id: 'log-viewer', label: 'Log Viewer', icon: <FolderOpen className="w-4 h-4" /> },
   { id: 's3-sync', label: 'S3 Sync', icon: <CloudDownload className="w-4 h-4" /> },
 ]
 

@@ -2,10 +2,12 @@ package nlquery
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,10 +16,15 @@ import (
 
 type Service struct {
 	cfg *config.Config
+	db  *sql.DB
 }
 
 func NewService(cfg *config.Config) *Service {
 	return &Service{cfg: cfg}
+}
+
+func NewServiceWithDB(cfg *config.Config, db *sql.DB) *Service {
+	return &Service{cfg: cfg, db: db}
 }
 
 func (s *Service) Execute(ctx context.Context, prompt string) (*ExecuteResponse, error) {
@@ -121,24 +128,42 @@ func extractSQL(text string) string {
 }
 
 func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]interface{}, error) {
+	// Defense-in-depth: every query routed through the read path is validated
+	// before reaching DuckDB. Blocks LLM hallucinations and prompt-injection
+	// payloads from invoking filesystem readers (read_csv_auto, read_parquet),
+	// extension loaders (INSTALL/LOAD), and DDL/DML even when DuckDB is in
+	// -readonly mode.
+	if err := ValidateReadSQL(sql); err != nil {
+		slog.Warn("rejected unsafe SQL",
+			"component", "cloudtrail-analyzer",
+			"reason", err.Error(),
+			"sql", sql,
+		)
+		return nil, nil, err
+	}
+
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.QueryTimeoutSeconds)*time.Second)
 	defer cancel()
 
 	// Use indexed DuckDB file if available, otherwise :memory:
 	dbTarget := ":memory:"
-	indexer := NewIndexer(s.cfg)
-	if indexer.IsIndexed() {
-		dbTarget = indexer.IndexPath()
-		// Rewrite SQL to use the events table instead of read_json
+	readOnly := false
+	indexPath := BuildIndexedDataSource(s.cfg)
+	if indexPath != "" {
+		dbTarget = filepath.Join(s.cfg.DataDir, indexDBName)
 		sql = rewriteForIndex(sql)
+		readOnly = true
 	}
 
-	// Run DuckDB with CSV output for easy parsing
-	cmd := exec.CommandContext(timeoutCtx, "duckdb", "-csv", "-noheader", dbTarget, sql)
+	// Single DuckDB process with -csv (includes headers as first row)
+	args := []string{}
+	if readOnly {
+		args = append(args, "-readonly")
+	}
+	args = append(args, "-csv", dbTarget, sql)
 
-	// First get headers
-	headerCmd := exec.CommandContext(timeoutCtx, "duckdb", "-csv", dbTarget, sql)
-	headerOut, err := headerCmd.Output()
+	cmd := exec.CommandContext(timeoutCtx, "duckdb", args...)
+	output, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, nil, fmt.Errorf("DuckDB error: %s", string(exitErr.Stderr))
@@ -146,14 +171,12 @@ func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]
 		return nil, nil, fmt.Errorf("running DuckDB: %w", err)
 	}
 
-	_ = cmd // we'll use headerCmd output which includes headers
-
-	output := string(headerOut)
-	if strings.TrimSpace(output) == "" {
+	outputStr := string(output)
+	if strings.TrimSpace(outputStr) == "" {
 		return []string{}, [][]interface{}{}, nil
 	}
 
-	reader := csv.NewReader(strings.NewReader(output))
+	reader := csv.NewReader(strings.NewReader(outputStr))
 	records, err := reader.ReadAll()
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing DuckDB CSV output: %w", err)
@@ -210,6 +233,13 @@ WHERE <your_conditions>;
 - Account: %s
 - Region: %s
 
+## Variant fields are JSON, not STRUCT
+The fields requestParameters, responseElements, additionalEventData, serviceEventDetails, addendum, resources, and tlsDetails are stored as JSON strings in the indexed table. Do NOT use dot access on them. To read inside, use:
+- json_extract_string(r.requestParameters, '$.roleArn')
+- json_extract_string(r.responseElements, '$.credentials.accessKeyId')
+- For arrays: json_extract(r.resources, '$[0].ARN')
+All other fields including userIdentity remain STRUCT and use dot access as before.
+
 ## DuckDB-Specific Syntax Constraints (CRITICAL)
 - NEVER use LIMIT inside aggregate functions (e.g. array_agg(...LIMIT N) is invalid)
 - To get "top N" within a group, use a subquery or window function with ROW_NUMBER(), then aggregate
@@ -243,5 +273,21 @@ func (s *Service) buildDataPath() string {
 
 	return fmt.Sprintf("%s/s3/%s/AWSLogs/%s/CloudTrail/%s/",
 		s.cfg.DataDir, s.cfg.S3.Bucket, s.cfg.S3.AccountID, region)
+}
+
+// buildIndexDataPath returns a broader path for indexing that covers all accounts.
+// In control_tower mode, scans all accounts under the org; in single mode, same as buildDataPath.
+func (s *Service) buildIndexDataPath() string {
+	if s.cfg.S3.Bucket == "" {
+		return ""
+	}
+
+	if s.cfg.S3.Mode == "control_tower" && s.cfg.S3.OrgID != "" {
+		return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/",
+			s.cfg.DataDir, s.cfg.S3.Bucket,
+			s.cfg.S3.OrgID, s.cfg.S3.OrgID)
+	}
+
+	return s.buildDataPath()
 }
 

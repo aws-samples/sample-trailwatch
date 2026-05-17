@@ -38,3 +38,36 @@ export interface ProcessingProgress {
   estimated_eta_seconds: number
   message: string
 }
+
+export interface ProgressSnapshot extends ProcessingProgress {
+  started_at: string
+  last_updated_at: string
+  speed_bytes_per_sec: number
+  files_per_sec: number
+  eta_seconds: number
+  concurrency: number
+}
+
+export type IndexStatus = 'idle' | 'building' | 'paused' | 'error'
+
+export interface IndexProgress {
+  status: string
+  total_bytes: number
+  processed_bytes: number
+  total_files: number
+  processed_files: number
+  percentage: number
+  current_batch: number
+  total_batches: number
+  message: string
+}
+
+export interface IndexStatusResponse {
+  indexed: boolean
+  age_seconds?: number
+  size_bytes?: number
+  index_status?: IndexStatus
+  total_files_indexed?: number
+  total_bytes_indexed?: number
+  started_at?: string
+}

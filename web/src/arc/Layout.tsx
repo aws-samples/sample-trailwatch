@@ -4,6 +4,7 @@ import { Sidebar } from './Sidebar'
 
 export interface NavigationContext {
   promptId?: string
+  scenarioId?: string
 }
 
 interface LayoutProps {
@@ -13,7 +14,6 @@ interface LayoutProps {
 const VIEW_TITLES: Record<string, string> = {
   'dashboard': 'Security Dashboard',
   'pre-built-queries': 'Investigate',
-  'log-viewer': 'Log Viewer',
   's3-sync': 'S3 Sync',
   's3-config': 'S3 Configuration',
   'credentials': 'AWS Credentials',
@@ -21,11 +21,21 @@ const VIEW_TITLES: Record<string, string> = {
   'system': 'System Status',
 }
 
+const ACTIVE_VIEW_KEY = 'cloudtrail-analyzer-active-view'
+const DEFAULT_VIEW = 'dashboard'
+
+// readInitialView returns a known view id, falling back to dashboard. Guards
+// against stale localStorage values from removed views (e.g., the old Log
+// Viewer) which would otherwise render an empty fallback page.
+function readInitialView(): string {
+  const stored = localStorage.getItem(ACTIVE_VIEW_KEY)
+  if (stored && stored in VIEW_TITLES) return stored
+  return DEFAULT_VIEW
+}
+
 export function Layout({ children }: LayoutProps) {
   const { t } = useTranslation()
-  const [activeView, setActiveView] = useState<string>(
-    () => localStorage.getItem('cloudtrail-analyzer-active-view') || 'dashboard'
-  )
+  const [activeView, setActiveView] = useState<string>(readInitialView)
   const [navContext, setNavContext] = useState<NavigationContext>({})
   const [account, setAccount] = useState<string>('')
 
@@ -39,7 +49,7 @@ export function Layout({ children }: LayoutProps) {
   const handleNavigate = useCallback((viewId: string, ctx?: NavigationContext) => {
     setActiveView(viewId)
     setNavContext(ctx || {})
-    localStorage.setItem('cloudtrail-analyzer-active-view', viewId)
+    localStorage.setItem(ACTIVE_VIEW_KEY, viewId)
   }, [])
 
   return (

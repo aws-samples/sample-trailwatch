@@ -6,6 +6,7 @@ import {
 } from 'recharts'
 import { RefreshCw, ExternalLink, ShieldAlert, AlertTriangle, Info, Loader2 } from 'lucide-react'
 import { endpoints } from '../../config/api'
+import { readApiError } from '../../comm/apiError'
 import type { NavigationContext } from '../../arc/Layout'
 
 interface QueryPanel {
@@ -48,6 +49,10 @@ interface FindingDef {
   severity: Severity
   category: string
   promptId: string
+  // scenarioId, if set, points at a real /api/investigate/scenarios id and
+  // enables the "Open in Query view" link with deep-linking. Findings without
+  // a clean Investigate counterpart leave this unset and hide the link.
+  scenarioId?: string
 }
 
 const SEVERITY_STYLES: Record<Severity, { bg: string, border: string, text: string, badge: string, icon: any }> = {
@@ -60,24 +65,24 @@ const SEVERITY_STYLES: Record<Severity, { bg: string, border: string, text: stri
 const COLORS = ['#3b82f6', '#8b5cf6', '#06b6d4', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#6366f1']
 
 const FINDINGS: FindingDef[] = [
-  { id: 'root-account-usage', title: 'Root Account Usage', description: 'API calls by AWS root account', severity: 'CRITICAL', category: 'Malicious Activity', promptId: 'root-account-usage' },
-  { id: 'cloudtrail-changes', title: 'CloudTrail Tampering', description: 'StopLogging, DeleteTrail, audit config changes', severity: 'CRITICAL', category: 'Operational Changes', promptId: 'cloudtrail-changes' },
-  { id: 'unauthorized-api-calls', title: 'Unauthorized API Calls', description: 'AccessDenied / UnauthorizedOperation errors', severity: 'HIGH', category: 'Malicious Activity', promptId: 'unauthorized-api-calls' },
-  { id: 'failed-console-logins', title: 'Failed Console Logins', description: 'Failed sign-in attempts with source IPs', severity: 'HIGH', category: 'Access Key Discovery', promptId: 'failed-console-logins' },
-  { id: 'iam-policy-changes', title: 'IAM Policy Changes', description: 'Policy attachments and permission modifications', severity: 'HIGH', category: 'Privilege Escalation', promptId: 'iam-policy-changes' },
-  { id: 'suspicious-cross-account', title: 'Cross-Account Activity', description: 'API calls from foreign account principals', severity: 'HIGH', category: 'Malicious Activity', promptId: 'suspicious-cross-account' },
+  { id: 'root-account-usage', title: 'Root Account Usage', description: 'API calls by AWS root account', severity: 'CRITICAL', category: 'Malicious Activity', promptId: 'root-account-usage', scenarioId: 'gd-root-usage' },
+  { id: 'cloudtrail-changes', title: 'CloudTrail Tampering', description: 'StopLogging, DeleteTrail, audit config changes', severity: 'CRITICAL', category: 'Operational Changes', promptId: 'cloudtrail-changes', scenarioId: 'gd-logging-disabled' },
+  { id: 'unauthorized-api-calls', title: 'Unauthorized API Calls', description: 'AccessDenied / UnauthorizedOperation errors', severity: 'HIGH', category: 'Malicious Activity', promptId: 'unauthorized-api-calls', scenarioId: 'access-denied-all' },
+  { id: 'failed-console-logins', title: 'Failed Console Logins', description: 'Failed sign-in attempts with source IPs', severity: 'HIGH', category: 'Access Key Discovery', promptId: 'failed-console-logins', scenarioId: 'console-logins-failed' },
+  { id: 'iam-policy-changes', title: 'IAM Policy Changes', description: 'Policy attachments and permission modifications', severity: 'HIGH', category: 'Privilege Escalation', promptId: 'iam-policy-changes', scenarioId: 'iam-write-ops' },
+  { id: 'suspicious-cross-account', title: 'Cross-Account Activity', description: 'API calls from foreign account principals', severity: 'HIGH', category: 'Malicious Activity', promptId: 'suspicious-cross-account', scenarioId: 'cross-account-all' },
   { id: 'container-serverless-data-exfil', title: 'Data Exfiltration Signals', description: 'GetObject, GetSecretValue, CopySnapshot from compute roles', severity: 'HIGH', category: 'Container & Serverless', promptId: 'container-serverless-data-exfil' },
   { id: 'permission-boundary-changes', title: 'Permission Boundary Changes', description: 'Boundary removal enables privilege escalation', severity: 'HIGH', category: 'Privilege Escalation', promptId: 'permission-boundary-changes' },
   { id: 'security-group-changes', title: 'Security Group Changes', description: 'Ingress/egress rule modifications', severity: 'MEDIUM', category: 'Network Security', promptId: 'security-group-changes' },
-  { id: 'role-assumption-patterns', title: 'Role Assumptions', description: 'AssumeRole calls and role chaining', severity: 'MEDIUM', category: 'Privilege Escalation', promptId: 'role-assumption-patterns' },
-  { id: 'access-key-creation', title: 'Access Key Lifecycle', description: 'Key creation and deletion events', severity: 'MEDIUM', category: 'Access Key Discovery', promptId: 'access-key-creation' },
+  { id: 'role-assumption-patterns', title: 'Role Assumptions', description: 'AssumeRole calls and role chaining', severity: 'MEDIUM', category: 'Privilege Escalation', promptId: 'role-assumption-patterns', scenarioId: 'cross-account-role-assumptions' },
+  { id: 'access-key-creation', title: 'Access Key Lifecycle', description: 'Key creation and deletion events', severity: 'MEDIUM', category: 'Access Key Discovery', promptId: 'access-key-creation', scenarioId: 'gd-access-key-created-persistence' },
   { id: 'ec2-instance-sensitive-calls', title: 'EC2 Sensitive Calls', description: 'Instances calling IAM, STS, KMS, SecretsManager', severity: 'MEDIUM', category: 'EC2 Instance Activity', promptId: 'ec2-instance-sensitive-calls' },
   { id: 'uba-activity-by-hour', title: 'Off-Hours Activity', description: 'Human user activity 00:00–06:00 UTC', severity: 'MEDIUM', category: 'User Behavior Analytics', promptId: 'uba-activity-by-hour' },
   { id: 'uba-high-error-rate', title: 'High Error Rate Users', description: 'Identities with >20% failure rate', severity: 'MEDIUM', category: 'User Behavior Analytics', promptId: 'uba-high-error-rate' },
   { id: 'lambda-sensitive-operations', title: 'Lambda Sensitive Ops', description: 'Lambda calling IAM, KMS, SecretsManager', severity: 'MEDIUM', category: 'Container & Serverless', promptId: 'lambda-sensitive-operations' },
   { id: 'uba-human-user-write-ops', title: 'Human Write Operations', description: 'All mutating actions by human users', severity: 'LOW', category: 'User Behavior Analytics', promptId: 'uba-human-user-write-ops' },
   { id: 'vpc-changes', title: 'VPC Infrastructure Changes', description: 'VPC, subnet, IGW, peering changes', severity: 'LOW', category: 'Network Security', promptId: 'vpc-changes' },
-  { id: 'resource-creation-deletion', title: 'Resource Lifecycle', description: 'EC2, RDS, Lambda, S3 creation/deletion', severity: 'LOW', category: 'Operational Changes', promptId: 'resource-creation-deletion' },
+  { id: 'resource-creation-deletion', title: 'Resource Lifecycle', description: 'EC2, RDS, Lambda, S3 creation/deletion', severity: 'LOW', category: 'Operational Changes', promptId: 'resource-creation-deletion', scenarioId: 'gd-destructive-actions' },
 ]
 
 interface DashboardViewProps {
@@ -109,10 +114,12 @@ export function DashboardView({ navigate }: DashboardViewProps) {
         }
       }
       const res = await fetch(endpoints.dashboard)
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || `HTTP ${res.status}`)
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Failed to load dashboard'))
+      }
       setData(await res.json())
     } catch (e: any) {
-      setError(e.message)
+      setError(e?.message || 'Failed to load dashboard')
     } finally {
       setLoading(false)
     }
@@ -122,11 +129,16 @@ export function DashboardView({ navigate }: DashboardViewProps) {
     try {
       setFindingsLoading(true)
       const res = await fetch(endpoints.dashboardFindings)
-      if (!res.ok) return
+      if (!res.ok) {
+        console.warn('dashboard findings request failed', res.status, await readApiError(res, 'findings'))
+        return
+      }
       const results: FindingSummary[] = await res.json()
       const map: Record<string, FindingSummary> = {}
       results.forEach(r => { map[r.id] = r })
       setFindingSummaries(map)
+    } catch (e) {
+      console.warn('dashboard findings fetch error', e)
     } finally {
       setFindingsLoading(false)
     }
@@ -137,8 +149,14 @@ export function DashboardView({ navigate }: DashboardViewProps) {
     setFindingDetail(null)
     try {
       const res = await fetch(endpoints.dashboardFindingDetail(id))
-      if (!res.ok) return
+      if (!res.ok) {
+        const msg = await readApiError(res, 'Failed to load finding detail')
+        setFindingDetail({ error: msg } as FindingDetail)
+        return
+      }
       setFindingDetail(await res.json())
+    } catch (e: any) {
+      setFindingDetail({ error: e?.message || 'Failed to load finding detail' } as FindingDetail)
     } finally {
       setDetailLoading(false)
     }
@@ -338,12 +356,14 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                       <>
                         <div className="flex items-center justify-between mb-2">
                           <span className="text-[11px] text-gray-500">{t('security.dashboard.results', { count: findingDetail.rows?.length || 0 })}</span>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); navigate('pre-built-queries', { promptId: finding.promptId }) }}
-                            className="text-[11px] text-blue-600 hover:underline font-medium"
-                          >
-                            {t('security.dashboard.openInQueryView')}
-                          </button>
+                          {finding.scenarioId && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); navigate('pre-built-queries', { scenarioId: finding.scenarioId }) }}
+                              className="text-[11px] text-blue-600 hover:underline font-medium"
+                            >
+                              {t('security.dashboard.openInQueryView')}
+                            </button>
+                          )}
                         </div>
                         <div className="overflow-auto max-h-60 border border-gray-200 dark:border-gray-700 rounded">
                           <table className="w-full text-[11px]">

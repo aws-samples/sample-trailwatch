@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { endpoints } from '../../config/api'
-import type { Session, ProcessingProgress } from '../../types/session'
+import type { Session, ProcessingProgress, IndexProgress, IndexStatusResponse } from '../../types/session'
 
 interface CallerIdentity {
   account_id: string
@@ -219,4 +219,74 @@ export function useDeleteSession() {
   }, [])
 
   return { deleteSession, loading, error }
+}
+
+export function useIndexStatus() {
+  const [status, setStatus] = useState<IndexStatusResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch(endpoints.indexStatus)
+      if (res.ok) setStatus(await res.json())
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  return { status, loading, refresh }
+}
+
+export function useIndexProgress() {
+  const [data, setData] = useState<IndexProgress | null>(null)
+  const [done, setDone] = useState(false)
+  const [active, setActive] = useState(false)
+  const sourceRef = useRef<EventSource | null>(null)
+
+  const disconnect = useCallback(() => {
+    if (sourceRef.current) {
+      sourceRef.current.close()
+      sourceRef.current = null
+    }
+    setActive(false)
+  }, [])
+
+  const connect = useCallback(() => {
+    disconnect()
+    setData(null)
+    setDone(false)
+    setActive(true)
+
+    const source = new EventSource(endpoints.indexProgress)
+    sourceRef.current = source
+
+    source.addEventListener('progress', (e) => {
+      try {
+        setData(JSON.parse((e as MessageEvent).data))
+      } catch { /* ignore */ }
+    })
+
+    source.addEventListener('done', () => {
+      setDone(true)
+      setActive(false)
+      source.close()
+      sourceRef.current = null
+    })
+
+    source.onerror = () => {
+      setActive(false)
+      source.close()
+      sourceRef.current = null
+    }
+  }, [disconnect])
+
+  useEffect(() => {
+    return () => { disconnect() }
+  }, [disconnect])
+
+  return { data, done, active, connect, disconnect }
 }

@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Search, Play, Loader2, AlertTriangle, ChevronDown } from 'lucide-react'
 import { endpoints } from '../../config/api'
+import { readApiError } from '../../comm/apiError'
+import type { NavigationContext } from '../../arc/Layout'
 
 interface Scenario {
   id: string
@@ -44,7 +46,11 @@ const SEVERITY_BADGE: Record<string, string> = {
   LOW: 'bg-blue-500 text-white',
 }
 
-export function InvestigateView() {
+interface InvestigateViewProps {
+  navContext?: NavigationContext
+}
+
+export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   const { t } = useTranslation()
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [lookups, setLookups] = useState<LookupValues | null>(null)
@@ -65,26 +71,53 @@ export function InvestigateView() {
     }).finally(() => setLoading(false))
   }, [])
 
-  const categories = ['all', ...Array.from(new Set(scenarios.map(s => s.category)))]
-  const filtered = selectedCategory === 'all' ? scenarios : scenarios.filter(s => s.category === selectedCategory)
+  // Deep-link: when arriving from Dashboard with a scenarioId, auto-select that
+  // scenario and switch its category filter so it's visible in the left list.
+  // Auto-runs the scenario only when it requires no parameter input.
+  useEffect(() => {
+    const wanted = navContext?.scenarioId
+    if (!wanted || scenarios.length === 0) return
+    const match = scenarios.find(s => s.id === wanted)
+    if (!match) return
+    setSelectedScenario(match)
+    setSelectedCategory(match.category)
+    setParamValue('')
+    setResult(null)
+    if (match.param_type === 'none') {
+      void runScenarioById(match)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navContext?.scenarioId, scenarios])
 
-  async function runScenario() {
-    if (!selectedScenario) return
-    if (selectedScenario.param_type !== 'none' && !paramValue) return
+  async function runScenarioById(scenario: Scenario, param = '') {
     setRunning(true)
     setResult(null)
     try {
       const res = await fetch(endpoints.investigateRun, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenario_id: selectedScenario.id, param: paramValue }),
+        body: JSON.stringify({ scenario_id: scenario.id, param }),
       })
+      if (!res.ok) {
+        const msg = await readApiError(res, 'Scenario run failed')
+        setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: msg })
+        return
+      }
       setResult(await res.json())
     } catch (e: any) {
-      setResult({ scenario_id: selectedScenario.id, param: paramValue, sql: '', columns: null, rows: null, error: e.message })
+      setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: e?.message || 'Network error' })
     } finally {
       setRunning(false)
     }
+  }
+
+  const categories = ['all', ...Array.from(new Set(scenarios.map(s => s.category)))]
+  const filtered = selectedCategory === 'all' ? scenarios : scenarios.filter(s => s.category === selectedCategory)
+
+  async function runScenario() {
+    if (!selectedScenario) return
+    if (selectedScenario.param_type !== 'none' && !paramValue) return
+    await runScenarioById(selectedScenario, paramValue)
   }
 
   function getDropdownOptions(): string[] {

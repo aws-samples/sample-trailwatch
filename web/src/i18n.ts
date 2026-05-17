@@ -67,6 +67,8 @@ const resources = {
       'data.sync.account': 'Account',
       'data.sync.dateRange': 'Date Range',
       'data.sync.files': 'Files',
+      'data.sync.sizeOnDisk': 'Size on Disk',
+      'data.sync.lastUpdated': 'Last Updated',
       'data.sync.status': 'Status',
 
       // S3 Config
@@ -168,12 +170,6 @@ const resources = {
       'security.prebuilt.error': 'Error',
       'security.prebuilt.noResults': 'Query returned no results.',
       'security.prebuilt.footer': 'Click "Run Query" to execute via Bedrock + DuckDB, or copy the prompt for use in kiro-cli.',
-
-      // Log Viewer
-      'data.logviewer.title': 'Log Viewer',
-      'data.logviewer.subtitle': 'Local CloudTrail log files (data/s3/)',
-      'data.logviewer.noLogs': 'No logs downloaded yet',
-      'data.logviewer.goToSync': 'Go to S3 Sync to download CloudTrail logs.',
 
       // Chat
       'security.chat.title': 'Bedrock Chat',

@@ -1,6 +1,5 @@
 import { useTranslation } from 'react-i18next'
 import { Layout } from './arc/Layout'
-import { LogViewerView } from './features/logviewer/LogViewerView'
 import { S3SyncView } from './features/logviewer/S3SyncView'
 import { DashboardView } from './features/dashboard/DashboardView'
 import { InvestigateView } from './features/query/InvestigateView'
@@ -13,14 +12,12 @@ function App() {
   const { t } = useTranslation()
   return (
     <Layout>
-      {(activeView, _navContext, navigate) => {
+      {(activeView, navContext, navigate) => {
         switch (activeView) {
           case 'dashboard':
             return <DashboardView navigate={navigate} />
           case 'pre-built-queries':
-            return <InvestigateView />
-          case 'log-viewer':
-            return <LogViewerView />
+            return <InvestigateView navContext={navContext} />
           case 's3-sync':
             return <S3SyncView />
           case 's3-config':

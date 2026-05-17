@@ -12,23 +12,29 @@ import (
 )
 
 // verifyFiles walks the session directory, counts all .json files, and validates
-// each is valid JSON. Returns total count and list of failed file paths.
-func verifyFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress) (int, []string, error) {
+// each is valid JSON. Returns total count, total bytes on disk for the session
+// (sum of all regular files), and list of failed file paths.
+func verifyFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress) (int, int64, []string, error) {
 	sessionDir := sessionLocalDir(session, dataDir)
 
-	// Collect all .json files
+	// Collect all .json files and accumulate total bytes for the session directory.
 	var jsonFiles []string
+	var diskBytes int64
 	err := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip inaccessible files
 		}
-		if !info.IsDir() && strings.HasSuffix(path, ".json") && !strings.HasSuffix(path, ".json.gz") {
+		if info.IsDir() {
+			return nil
+		}
+		diskBytes += info.Size()
+		if strings.HasSuffix(path, ".json") && !strings.HasSuffix(path, ".json.gz") {
 			jsonFiles = append(jsonFiles, path)
 		}
 		return nil
 	})
 	if err != nil {
-		return 0, nil, fmt.Errorf("walking session directory %s: %w", sessionDir, err)
+		return 0, 0, nil, fmt.Errorf("walking session directory %s: %w", sessionDir, err)
 	}
 
 	totalFiles := len(jsonFiles)
@@ -37,7 +43,7 @@ func verifyFiles(ctx context.Context, session *sessions.Session, dataDir string,
 
 	for _, jsonPath := range jsonFiles {
 		if ctx.Err() != nil {
-			return completed, failedFiles, ctx.Err()
+			return completed, diskBytes, failedFiles, ctx.Err()
 		}
 
 		if err := validateJSONFile(jsonPath); err != nil {
@@ -53,7 +59,7 @@ func verifyFiles(ctx context.Context, session *sessions.Session, dataDir string,
 		sendVerifyProgress(progressCh, session.ID, completed, totalFiles)
 	}
 
-	return totalFiles, failedFiles, nil
+	return totalFiles, diskBytes, failedFiles, nil
 }
 
 // validateJSONFile checks if a file contains valid JSON by attempting to decode it.

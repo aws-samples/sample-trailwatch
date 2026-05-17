@@ -6,7 +6,7 @@ BINARY := cloudtrail-analyzer
 DIST := ./dist
 WEB_DIST := web/dist
 
-.PHONY: build frontend embed-assets test clean run dev install
+.PHONY: build build-all frontend embed-assets test clean run dev install
 
 ## dev: Start both Go API server and Vite frontend with one command (Ctrl+C stops both)
 dev:
@@ -27,6 +27,17 @@ build: frontend embed-assets
 	@echo ""
 	@echo "Done → $(DIST)/$(BINARY)"
 	@echo "Run with: ./$(DIST)/$(BINARY)"
+
+## build-all: Build for both Linux AMD64 and ARM64 (Graviton)
+build-all: frontend embed-assets
+	@echo "Building multi-arch binaries (version: $(VERSION))..."
+	@mkdir -p $(DIST)
+	GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-arm64 ./cmd/analyzer
+	GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-amd64 ./cmd/analyzer
+	@echo ""
+	@echo "Done:"
+	@echo "  ARM64 (Graviton) → $(DIST)/$(BINARY)-linux-arm64"
+	@echo "  AMD64 (Intel)    → $(DIST)/$(BINARY)-linux-amd64"
 
 ## install: Install all dependencies (Go + Node)
 install:

@@ -71,8 +71,11 @@ func List(db *sql.DB) ([]Session, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scanning session row: %w", err)
 		}
-		s.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		s.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		s.CreatedAt = parseSessionTime(createdAt)
+		s.UpdatedAt = parseSessionTime(updatedAt)
+		if s.UpdatedAt.IsZero() {
+			s.UpdatedAt = s.CreatedAt
+		}
 		sessions = append(sessions, s)
 	}
 	if err := rows.Err(); err != nil {
@@ -146,7 +149,26 @@ func scanSession(row *sql.Row) (*Session, error) {
 		}
 		return nil, fmt.Errorf("scanning session: %w", err)
 	}
-	s.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	s.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	s.CreatedAt = parseSessionTime(createdAt)
+	s.UpdatedAt = parseSessionTime(updatedAt)
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = s.CreatedAt
+	}
 	return &s, nil
+}
+
+// parseSessionTime accepts both RFC3339 (Go writes) and SQLite's default
+// 'YYYY-MM-DD HH:MM:SS' format (when datetime('now') is used as a column default).
+// Returns zero time if the value is empty or unparseable.
+func parseSessionTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t.UTC()
+	}
+	return time.Time{}
 }

@@ -23,7 +23,7 @@ const (
 // extractFiles walks the session's local directory and decompresses all .json.gz files.
 // It is idempotent: if the .json file already exists, the .gz is skipped.
 // A total extraction byte limit is enforced across all files to guard against decompression bombs.
-func extractFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress) error {
+func extractFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress, onExtracted func(path string, size int64)) error {
 	sessionDir := sessionLocalDir(session, dataDir)
 
 	// Count total .gz files first for progress reporting
@@ -83,6 +83,10 @@ func extractFiles(ctx context.Context, session *sessions.Session, dataDir string
 
 		completed++
 		sendExtractProgress(progressCh, session.ID, completed, totalFiles)
+
+		if onExtracted != nil {
+			onExtracted(jsonPath, written)
+		}
 	}
 
 	return nil
