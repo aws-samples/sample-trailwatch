@@ -132,19 +132,36 @@ func main() {
 	accountResolver := accounts.NewResolver(db.Conn, settingsHandler.Service().LoadAWSConfig, orgRegion)
 	r.Mount("/api/accounts", accounts.NewHandler(accountResolver).Routes())
 
-	// Best-effort eager refresh: try AWS Organizations on boot but never block
-	// startup or fail it if the principal lacks the permission. Lazy fallback
-	// covers the case where this fails.
+	// Best-effort eager refresh: try AWS Organizations on boot but do not block
+	// startup or fail it if the principal lacks the permission. The most common
+	// startup state for a session_credentials user is "no creds applied yet",
+	// in which case this attempt fails and the resolver remembers the failure.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := accountResolver.RefreshOrganizations(ctx, true); err != nil {
-			slog.Info("organizations refresh skipped at startup; manual mappings only",
+			slog.Info("organizations refresh skipped at startup; will retry after credentials are applied",
 				"component", "cloudtrail-analyzer",
 				"reason", err.Error(),
 			)
 		}
 	}()
+
+	// When the user applies new credentials via the UI, clear the resolver's
+	// sticky-failure flag and re-attempt an Organizations refresh in the
+	// background. Without this, the resolver would keep skipping refreshes
+	// after a startup-time failure even once valid credentials are available.
+	settingsHandler.OnAuthChanged(func() {
+		accountResolver.OnCredentialsChanged()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := accountResolver.RefreshOrganizations(ctx, true); err != nil {
+			slog.Info("organizations refresh after credential update did not succeed; manual mappings only",
+				"component", "cloudtrail-analyzer",
+				"reason", err.Error(),
+			)
+		}
+	})
 
 	// Register /api/sessions routes
 	sessionsHandler := sessions.NewHandler(db.Conn, cfg)

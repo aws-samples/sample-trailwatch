@@ -177,6 +177,33 @@ func TestSetManual_RejectsEmptyAccountID(t *testing.T) {
 	}
 }
 
+func TestOnCredentialsChanged_ClearsStickyFailure(t *testing.T) {
+	db := newTestDB(t)
+	calls := 0
+	loader := func(_ context.Context, _ string) (aws.Config, error) {
+		calls++
+		return aws.Config{}, errors.New("simulated AccessDenied")
+	}
+	r := NewResolver(db, loader, "us-east-1")
+
+	// First call fails, sticky failure latches.
+	_, _ = r.RefreshOrganizations(context.Background(), false)
+	// Second unforced call should be a no-op.
+	_, _ = r.RefreshOrganizations(context.Background(), false)
+	if calls != 1 {
+		t.Fatalf("setup: expected 1 call, got %d", calls)
+	}
+
+	// Auth surface changes — caller signals the resolver.
+	r.OnCredentialsChanged()
+
+	// Next unforced refresh should attempt again, since the sticky flag was cleared.
+	_, _ = r.RefreshOrganizations(context.Background(), false)
+	if calls != 2 {
+		t.Errorf("expected resolver to retry after OnCredentialsChanged, got %d calls", calls)
+	}
+}
+
 func TestRefreshOrganizations_HonorsTTLAndStickyFailure(t *testing.T) {
 	db := newTestDB(t)
 	calls := 0

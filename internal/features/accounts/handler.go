@@ -22,12 +22,26 @@ func NewHandler(resolver *Resolver) *Handler {
 // Routes mounts under /api/accounts.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Get("/resolve", h.Resolve)            // GET  /api/accounts/resolve?ids=111,222
-	r.Post("/refresh", h.RefreshOrg)        // POST /api/accounts/refresh         (force AWS Organizations refresh)
-	r.Get("/manual", h.ListManual)          // GET  /api/accounts/manual          (list overrides)
-	r.Put("/manual/{id}", h.UpsertManual)   // PUT  /api/accounts/manual/{id}     (set or clear an override)
+	r.Get("/resolve", h.Resolve)             // GET  /api/accounts/resolve?ids=111,222
+	r.Get("/status", h.Status)               // GET  /api/accounts/status          (resolver state for UI hints)
+	r.Post("/refresh", h.RefreshOrg)         // POST /api/accounts/refresh         (force AWS Organizations refresh)
+	r.Get("/manual", h.ListManual)           // GET  /api/accounts/manual          (list overrides)
+	r.Put("/manual/{id}", h.UpsertManual)    // PUT  /api/accounts/manual/{id}     (set or clear an override)
 	r.Delete("/manual/{id}", h.DeleteManual) // DELETE /api/accounts/manual/{id}
 	return r
+}
+
+// Status returns a snapshot of resolver state so the UI can decide whether to
+// nudge the user toward manual mappings.
+func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
+	st, err := h.resolver.Status(r.Context())
+	if err != nil {
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to read resolver status", map[string]string{
+			"reason": err.Error(),
+		})
+		return
+	}
+	render.JSON(w, http.StatusOK, st)
 }
 
 type resolveResponse struct {

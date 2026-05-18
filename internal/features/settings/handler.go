@@ -13,9 +13,10 @@ import (
 
 // Handler provides HTTP handlers for settings endpoints.
 type Handler struct {
-	cfg     *config.Config
-	saveFn  func(*config.Config) error
-	service *Service
+	cfg              *config.Config
+	saveFn           func(*config.Config) error
+	service          *Service
+	onAuthChangedFns []func() // observers notified when the user applies new credentials
 }
 
 // NewHandler creates a new settings Handler.
@@ -31,6 +32,20 @@ func NewHandler(cfg *config.Config, saveFn func(*config.Config) error) *Handler 
 // reuse the shared AWS-config loader without duplicating credential logic.
 func (h *Handler) Service() *Service {
 	return h.service
+}
+
+// OnAuthChanged registers a callback fired in a goroutine whenever the user
+// applies new credentials (e.g., paste-and-apply session credentials in the
+// UI). Used by the accounts package to retry an Organizations refresh that
+// failed pre-credentials and would otherwise stay sticky-failed.
+func (h *Handler) OnAuthChanged(fn func()) {
+	h.onAuthChangedFns = append(h.onAuthChangedFns, fn)
+}
+
+func (h *Handler) notifyAuthChanged() {
+	for _, fn := range h.onAuthChangedFns {
+		go fn()
+	}
 }
 
 // Routes returns a Chi router with all settings routes mounted.
@@ -336,6 +351,11 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 		"component", "cloudtrail-analyzer",
 		"access_key_prefix", req.AccessKeyID[:4]+"...",
 	)
+
+	// Notify observers (e.g., the accounts resolver) that the auth surface has
+	// changed. The resolver's sticky-failure flag would otherwise keep skipping
+	// refreshes that initially failed because credentials were not yet applied.
+	h.notifyAuthChanged()
 
 	status, _ := h.service.ResolveCredentials(r.Context(), h.cfg)
 

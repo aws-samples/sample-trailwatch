@@ -58,7 +58,8 @@ type Resolver struct {
 	region    string // region for the Organizations endpoint
 	mu        sync.Mutex
 	lastOrg   time.Time
-	orgFailed bool // sticky once we've seen AccessDenied; avoids repeated calls
+	orgFailed bool   // sticky once we've seen AccessDenied; avoids repeated calls
+	lastErr   string // most recent error message from a refresh attempt, surfaced to UI
 }
 
 // NewResolver creates a resolver bound to the given SQLite handle and AWS config
@@ -150,6 +151,58 @@ func (r *Resolver) ListManual(ctx context.Context) ([]Entry, error) {
 	return out, rows.Err()
 }
 
+// OnCredentialsChanged clears the sticky-failure flag so the next refresh
+// retries even if a previous attempt failed. Call this whenever the auth
+// surface changes (e.g., a user pastes new STS credentials via the Credentials
+// view) so the resolver does not keep serving "no AWS access" forever after a
+// one-time misconfiguration.
+func (r *Resolver) OnCredentialsChanged() {
+	r.mu.Lock()
+	r.orgFailed = false
+	r.lastOrg = time.Time{}
+	r.mu.Unlock()
+}
+
+// Status reports whether AWS Organizations is currently usable as a name
+// source, the time of the last attempt, and the most recent error if any.
+// The UI uses this to surface a "set names manually" hint when the principal
+// cannot list Organizations (e.g., running from a Control Tower log archive
+// account, where ListAccounts is denied by design).
+type Status struct {
+	OrgAvailable  bool      `json:"org_available"`
+	LastAttempt   time.Time `json:"last_attempt,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	OrgEntries    int       `json:"org_entries"`
+	ManualEntries int       `json:"manual_entries"`
+}
+
+// Status returns a snapshot of the resolver's state for the UI.
+func (r *Resolver) Status(ctx context.Context) (Status, error) {
+	r.mu.Lock()
+	last := r.lastOrg
+	failed := r.orgFailed
+	lastErr := r.lastErr
+	r.mu.Unlock()
+
+	row := r.db.QueryRowContext(ctx, `
+		SELECT
+			SUM(CASE WHEN source = 'organizations' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN source = 'manual'        THEN 1 ELSE 0 END)
+		FROM account_names
+	`)
+	var orgN, manN sql.NullInt64
+	if err := row.Scan(&orgN, &manN); err != nil {
+		return Status{}, err
+	}
+	return Status{
+		OrgAvailable:  !failed && orgN.Int64 > 0,
+		LastAttempt:   last,
+		LastError:     lastErr,
+		OrgEntries:    int(orgN.Int64),
+		ManualEntries: int(manN.Int64),
+	}, nil
+}
+
 // RefreshOrganizations calls AWS Organizations ListAccounts and upserts every
 // returned account into the cache as source="organizations". Returns the count
 // of accounts learned. force=true bypasses the in-memory TTL gate; otherwise
@@ -157,6 +210,9 @@ func (r *Resolver) ListManual(ctx context.Context) ([]Entry, error) {
 //
 // Failures are logged and remembered so subsequent unforced calls become
 // no-ops; the resolver still serves whatever cache and manual entries exist.
+// Callers should invoke OnCredentialsChanged when auth changes, otherwise the
+// sticky-failure flag will keep skipping refreshes even after the underlying
+// problem is fixed.
 func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, error) {
 	r.mu.Lock()
 	if !force && time.Since(r.lastOrg) < orgRefreshTTL {
@@ -173,6 +229,8 @@ func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, e
 	if err != nil {
 		r.mu.Lock()
 		r.orgFailed = true
+		r.lastErr = err.Error()
+		r.lastOrg = time.Now()
 		r.mu.Unlock()
 		return 0, fmt.Errorf("loading aws config: %w", err)
 	}
@@ -185,6 +243,8 @@ func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, e
 		if err != nil {
 			r.mu.Lock()
 			r.orgFailed = true
+			r.lastErr = err.Error()
+			r.lastOrg = time.Now()
 			r.mu.Unlock()
 			slog.Warn("organizations list_accounts failed; account names will fall back to manual mappings",
 				"component", "cloudtrail-analyzer",
@@ -216,6 +276,7 @@ func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, e
 	r.mu.Lock()
 	r.lastOrg = time.Now()
 	r.orgFailed = false
+	r.lastErr = ""
 	r.mu.Unlock()
 
 	slog.Info("organizations cache refreshed",
