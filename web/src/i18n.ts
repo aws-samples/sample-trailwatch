@@ -167,6 +167,16 @@ const resources = {
       'settings.llm.selectedLabel': 'Selected:',
       'settings.llm.noModelsFound': 'No models found. Click Refresh after configuring valid AWS credentials.',
 
+      // Account names (manual mapping + Organizations status)
+      'settings.accountNames.title': 'Account Names',
+      'settings.accountNames.subtitle': 'Map 12-digit account IDs to friendly names. Names appear next to IDs across the dashboard, sync history, and investigation views.',
+      'settings.accountNames.placeholder': 'friendly name (e.g., prod-payments)',
+      'settings.accountNames.save': 'Save',
+      'settings.accountNames.retryOrg': 'Retry AWS Organizations',
+      'settings.accountNames.orgUnavailable': 'AWS Organizations access unavailable from this account',
+      'settings.accountNames.orgUnavailableHint': 'Set names manually below. AWS Organizations ListAccounts requires the management account or a delegated administrator; from a Control Tower log archive account, this is denied by design.',
+      'settings.accountNames.showError': 'Show last error',
+
       // System
       'settings.system.title': 'System Status',
       'settings.system.loading': 'Loading system status...',

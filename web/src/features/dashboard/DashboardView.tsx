@@ -7,6 +7,7 @@ import {
 import { RefreshCw, ExternalLink, ShieldAlert, AlertTriangle, Info, Loader2 } from 'lucide-react'
 import { endpoints } from '../../config/api'
 import { readApiError } from '../../comm/apiError'
+import { AccountLabel } from '../../comm/AccountLabel'
 import type { NavigationContext } from '../../arc/Layout'
 
 interface QueryPanel {
@@ -377,9 +378,24 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                             <tbody>
                               {(findingDetail.rows || []).slice(0, 20).map((row, ri) => (
                                 <tr key={ri} className="border-b border-gray-100 dark:border-gray-800 hover:bg-white dark:hover:bg-gray-800">
-                                  {row.map((cell, ci) => (
-                                    <td key={ci} className="px-2 py-1 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[200px] truncate" title={String(cell ?? '')}>{cell === null ? <span className="text-gray-300">—</span> : String(cell)}</td>
-                                  ))}
+                                  {row.map((cell, ci) => {
+                                    const colName = findingDetail.columns?.[ci] || ''
+                                    const isAccountCol = /\baccount(_?id)?\b|recipientaccountid|sourceaccount|targetaccount/i.test(colName)
+                                    const cellStr = cell === null ? '' : String(cell)
+                                    const isAccountValue = /^\d{12}$/.test(cellStr)
+                                    if (isAccountCol && isAccountValue) {
+                                      return (
+                                        <td key={ci} className="px-2 py-1 text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[260px] truncate" title={cellStr}>
+                                          <AccountLabel accountId={cellStr} />
+                                        </td>
+                                      )
+                                    }
+                                    return (
+                                      <td key={ci} className="px-2 py-1 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[200px] truncate" title={cellStr}>
+                                        {cell === null ? <span className="text-gray-300">—</span> : cellStr}
+                                      </td>
+                                    )
+                                  })}
                                 </tr>
                               ))}
                             </tbody>

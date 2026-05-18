@@ -5,6 +5,7 @@ import { useSettings } from '../settings/hooks'
 import { useIndexStatus, useIndexProgress } from './hooks'
 import { endpoints } from '../../config/api'
 import { readApiError } from '../../comm/apiError'
+import { AccountLabel } from '../../comm/AccountLabel'
 import type { Session, ProgressSnapshot } from '../../types/session'
 
 export function S3SyncView() {
@@ -250,7 +251,7 @@ export function S3SyncView() {
                   <tbody>
                     {sessions.filter(s => s.state !== 'downloading' && s.state !== 'extracting' && s.state !== 'verifying').map(session => (
                       <tr key={session.id} className="border-b border-gray-100 dark:border-gray-800 last:border-0">
-                        <td className="px-3 py-2 font-mono text-gray-900 dark:text-white">{session.account_id}</td>
+                        <td className="px-3 py-2 text-gray-900 dark:text-white"><AccountLabel accountId={session.account_id} /></td>
                         <td className="px-3 py-2 text-gray-600 dark:text-gray-400">{session.start_date} → {session.end_date}</td>
                         <td className="px-3 py-2 text-gray-600 dark:text-gray-400">{session.total_files}</td>
                         <td className="px-3 py-2 text-gray-600 dark:text-gray-400 tabular-nums">{session.disk_usage_bytes > 0 ? formatBytes(session.disk_usage_bytes) : '—'}</td>
@@ -441,7 +442,7 @@ function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?:
           <div className="relative">
             <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
           </div>
-          <span className="text-sm font-mono font-semibold text-gray-900 dark:text-white">{session.account_id}</span>
+          <AccountLabel accountId={session.account_id} className="text-sm font-semibold text-gray-900 dark:text-white" />
           <span className="text-[10px] text-gray-500 bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded">{session.log_region}</span>
           <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded capitalize">
             {phase}

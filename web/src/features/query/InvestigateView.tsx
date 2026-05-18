@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { Search, Play, Loader2, AlertTriangle, ChevronDown } from 'lucide-react'
 import { endpoints } from '../../config/api'
 import { readApiError } from '../../comm/apiError'
+import { AccountLabel } from '../../comm/AccountLabel'
+import { useAccountNames } from '../../comm/accountNames'
 import type { NavigationContext } from '../../arc/Layout'
 
 interface Scenario {
@@ -132,6 +134,13 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
     }
   }
 
+  // Pre-warm account-name cache for the account dropdown so labels render
+  // without an extra round-trip when the user opens the picker.
+  const accountIdsForLookup = (selectedScenario?.param_type === 'account')
+    ? (lookups?.accounts || [])
+    : []
+  const lookupAccountName = useAccountNames(accountIdsForLookup)
+
   if (loading) {
     return <div className="flex items-center justify-center h-full"><Loader2 className="w-6 h-6 animate-spin text-gray-400" /></div>
   }
@@ -225,7 +234,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                           className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white appearance-none pr-8 focus:ring-2 focus:ring-blue-500 focus:outline-none"
                         >
                           <option value="">{t('security.investigate.selectOrType')}</option>
-                          {getDropdownOptions().map(v => <option key={v} value={v}>{v}</option>)}
+                          {getDropdownOptions().map(v => {
+                            const name = selectedScenario.param_type === 'account' ? lookupAccountName(v) : null
+                            return <option key={v} value={v}>{name ? `${v} (${name})` : v}</option>
+                          })}
                         </select>
                         <ChevronDown className="absolute right-2 top-2.5 w-4 h-4 text-gray-400 pointer-events-none" />
                       </div>
@@ -279,11 +291,24 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                         <tbody>
                           {(result.rows || []).map((row, ri) => (
                             <tr key={ri} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50">
-                              {row.map((cell: any, ci: number) => (
-                                <td key={ci} className="px-3 py-1.5 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[250px] truncate" title={String(cell ?? '')}>
-                                  {cell === null ? <span className="text-gray-300">—</span> : String(cell)}
-                                </td>
-                              ))}
+                              {row.map((cell: any, ci: number) => {
+                                const colName = result.columns?.[ci] || ''
+                                const isAccountCol = /\baccount(_?id)?\b|recipientaccountid|sourceaccount|targetaccount/i.test(colName)
+                                const cellStr = cell === null ? '' : String(cell)
+                                const isAccountValue = /^\d{12}$/.test(cellStr)
+                                if (isAccountCol && isAccountValue) {
+                                  return (
+                                    <td key={ci} className="px-3 py-1.5 text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[300px] truncate" title={cellStr}>
+                                      <AccountLabel accountId={cellStr} />
+                                    </td>
+                                  )
+                                }
+                                return (
+                                  <td key={ci} className="px-3 py-1.5 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[250px] truncate" title={cellStr}>
+                                    {cell === null ? <span className="text-gray-300">—</span> : cellStr}
+                                  </td>
+                                )
+                              })}
                             </tr>
                           ))}
                         </tbody>

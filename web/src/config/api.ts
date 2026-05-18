@@ -34,4 +34,9 @@ export const endpoints = {
   indexProgress: `${API_BASE_URL}/nlquery/index/progress`,
   indexCancel: `${API_BASE_URL}/nlquery/index/cancel`,
   bedrockModels: `${API_BASE_URL}/settings/bedrock-models`,
+  accountsResolve: `${API_BASE_URL}/accounts/resolve`,
+  accountsStatus: `${API_BASE_URL}/accounts/status`,
+  accountsRefresh: `${API_BASE_URL}/accounts/refresh`,
+  accountsManual: `${API_BASE_URL}/accounts/manual`,
+  accountManual: (id: string) => `${API_BASE_URL}/accounts/manual/${id}`,
 } as const

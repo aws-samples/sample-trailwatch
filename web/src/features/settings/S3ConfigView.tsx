@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Database, CheckCircle2, XCircle, Loader2, Save, ShieldCheck, RefreshCw } from 'lucide-react'
 import { useSettings } from './hooks'
+import { AccountNamesSection } from './AccountNamesSection'
 import { StatusBadge } from '../../comm/StatusBadge'
 import { endpoints } from '../../config/api'
 import { stableStringify } from '../../utils/json'
@@ -358,6 +359,15 @@ export function S3ConfigView() {
               <span className={`text-sm ${feedback.type === 'success' ? 'text-green-700 dark:text-green-300' : 'text-red-700 dark:text-red-300'}`}>{feedback.text}</span>
             </div>
           )}
+
+          {/* Account names: union of all known account IDs (selected + caller) */}
+          <AccountNamesSection
+            accountIds={[
+              ...(mode === 'control_tower' ? selectedAccounts : []),
+              ...(accountId ? [accountId] : []),
+              ...(callerIdentity?.account_id ? [callerIdentity.account_id] : []),
+            ]}
+          />
 
         </div>
       </div>
