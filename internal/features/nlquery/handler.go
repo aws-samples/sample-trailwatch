@@ -17,17 +17,21 @@ import (
 )
 
 type Handler struct {
-	svc        *Service
-	indexer    *Indexer
-	microBatch *MicroBatchIndexer
+	svc          *Service
+	cfg          *config.Config
+	indexer      *Indexer
+	microBatch   *MicroBatchIndexer
+	sessionSpend *SessionSpend
 }
 
 func NewHandler(cfg *config.Config, db *sql.DB) *Handler {
 	idx := NewIndexer(cfg, db)
 	return &Handler{
-		svc:        NewService(cfg),
-		indexer:    idx,
-		microBatch: NewMicroBatchIndexer(idx),
+		svc:          NewService(cfg),
+		cfg:          cfg,
+		indexer:      idx,
+		microBatch:   NewMicroBatchIndexer(idx),
+		sessionSpend: NewSessionSpend(),
 	}
 }
 
@@ -46,11 +50,45 @@ func (h *Handler) BuildDataPath() string {
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Post("/execute", h.Execute)
+	r.Post("/estimate", h.Estimate)
+	r.Get("/spend", h.Spend)
+	r.Delete("/spend", h.ResetSpend)
 	r.Post("/index", h.BuildIndex)
 	r.Get("/index/status", h.IndexStatus)
 	r.Get("/index/progress", h.StreamIndexProgress)
 	r.Post("/index/cancel", h.CancelIndex)
 	return r
+}
+
+// EstimateRequest carries the prompt the UI is about to run, so the backend
+// can return a cost estimate rendered in the pre-flight banner.
+type EstimateRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+// Estimate returns a CostEstimate for the given user prompt, computed against
+// the currently-configured LLM model and rate card. The system prompt is the
+// same one the actual Execute path would use, so the estimate matches the
+// real run within the heuristic's tolerance.
+func (h *Handler) Estimate(w http.ResponseWriter, r *http.Request) {
+	var req EstimateRequest
+	if !render.DecodeStrictJSON(w, r, &req) {
+		return
+	}
+	systemPrompt := h.svc.buildSystemPrompt()
+	est := EstimateCost(h.cfg, systemPrompt, req.Prompt, 0)
+	render.JSON(w, http.StatusOK, est)
+}
+
+// Spend returns the running session-spend snapshot.
+func (h *Handler) Spend(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, http.StatusOK, h.sessionSpend.Snapshot())
+}
+
+// ResetSpend zeroes the session-spend counter.
+func (h *Handler) ResetSpend(w http.ResponseWriter, r *http.Request) {
+	h.sessionSpend.Reset()
+	render.JSON(w, http.StatusOK, h.sessionSpend.Snapshot())
 }
 
 func (h *Handler) BuildIndex(w http.ResponseWriter, r *http.Request) {
@@ -203,11 +241,25 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Compute the estimate before invoking the LLM and record it into the
+	// session counter once we have a result. Until provider responses surface
+	// real token usage, treat actual = estimated total; the counter is then a
+	// "session-to-date estimated spend" view, which is good enough for
+	// situational awareness in this single-user POC.
+	systemPrompt := h.svc.buildSystemPrompt()
+	est := EstimateCost(h.cfg, systemPrompt, req.Prompt, 0)
+
 	result, err := h.svc.Execute(r.Context(), req.Prompt)
 	if err != nil {
+		// Errors before the model was billed don't count toward spend.
 		render.Error(w, http.StatusInternalServerError, "execution_error", err.Error())
 		return
 	}
+
+	// Record the spend. Provider responses don't currently surface usage
+	// counts, so actual ~= estimate. When provider.go starts forwarding token
+	// usage from the response body, swap the second arg to the real cost.
+	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
 
 	render.JSON(w, http.StatusOK, result)
 }

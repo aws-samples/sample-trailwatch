@@ -71,6 +71,18 @@ type LLMConfig struct {
 	APIKey   string `json:"api_key,omitempty"`
 	Model    string `json:"model,omitempty"`
 	Endpoint string `json:"endpoint,omitempty"`
+	// PricingOverrides lets users replace the built-in per-model rate card
+	// with their actual contract pricing. Keyed by model id (matching whatever
+	// is set in Bedrock.ModelID or Model above), values are dollars per
+	// million tokens. Used by the cost-estimation pre-flight; falls back to
+	// hard-coded defaults when absent.
+	PricingOverrides map[string]PricingOverride `json:"pricing_overrides,omitempty"`
+}
+
+// PricingOverride represents a user-supplied rate card for one model.
+type PricingOverride struct {
+	InputPerMillionUSD  float64 `json:"input_per_million_usd"`
+	OutputPerMillionUSD float64 `json:"output_per_million_usd"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
