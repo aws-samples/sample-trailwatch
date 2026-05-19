@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Sidebar } from './Sidebar'
+import { SessionSpendChip } from '../comm/SessionSpendChip'
 
 export interface NavigationContext {
   promptId?: string
@@ -62,6 +63,7 @@ export function Layout({ children }: LayoutProps) {
           <span className="text-[11px] text-gray-400">{VIEW_TITLES[activeView] || activeView}</span>
         </div>
         <div className="flex items-center gap-4">
+          <SessionSpendChip />
           {account && (
             <span className="text-[11px] text-gray-400">
               {t('app.nav.account')} <span className="text-gray-200 font-mono">{account}</span>

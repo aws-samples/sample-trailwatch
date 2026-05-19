@@ -39,4 +39,6 @@ export const endpoints = {
   accountsRefresh: `${API_BASE_URL}/accounts/refresh`,
   accountsManual: `${API_BASE_URL}/accounts/manual`,
   accountManual: (id: string) => `${API_BASE_URL}/accounts/manual/${id}`,
+  nlqueryEstimate: `${API_BASE_URL}/nlquery/estimate`,
+  nlquerySpend: `${API_BASE_URL}/nlquery/spend`,
 } as const

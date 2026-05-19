@@ -177,6 +177,28 @@ const resources = {
       'settings.accountNames.orgUnavailableHint': 'Set names manually below. AWS Organizations ListAccounts requires the management account or a delegated administrator; from a Control Tower log archive account, this is denied by design.',
       'settings.accountNames.showError': 'Show last error',
 
+      // Bedrock cost UX
+      'cost.estimating': 'Estimating cost…',
+      'cost.estimateUnavailable': 'Estimate unavailable',
+      'cost.estTotal': 'Estimated cost',
+      'cost.inputOnly': 'input only',
+      'cost.outputBilledAfter': 'output billed after run',
+      'cost.cappedAt': 'capped at {{tokens}} tokens',
+      'cost.maxTotal': 'max total',
+      'cost.warn': 'This query is large (estimate ≥ {{threshold}}). Output is billed separately; the cap above limits the worst case.',
+      'cost.rateFallback': 'No published rate card matched {{model}} — using a Sonnet 4 fallback. Override in Settings → AI Provider for accurate numbers.',
+      'cost.chipLabel': 'Bedrock spend: ${{cost}} ({{queries}}q)',
+      'cost.chipTitle': 'Estimated session spend across {{queries}} LLM queries: ${{cost}}',
+
+      // LLM test box
+      'settings.llm.testTitle': 'Test this model',
+      'settings.llm.testSubtitle': 'Send one query to validate the model is reachable and to preview real cost. Estimate updates as you type; Run invokes the LLM.',
+      'settings.llm.testPlaceholder': 'show me failed console logins in the last 24 hours',
+      'settings.llm.testRun': 'Run',
+      'settings.llm.testRunning': 'Running…',
+      'settings.llm.testShowSql': 'Show generated SQL',
+      'settings.llm.testNoRows': 'Query ran successfully but returned no rows.',
+
       // System
       'settings.system.title': 'System Status',
       'settings.system.loading': 'Loading system status...',

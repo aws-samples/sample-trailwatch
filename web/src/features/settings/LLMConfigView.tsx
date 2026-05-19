@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Brain, CheckCircle2, Loader2, AlertTriangle, RefreshCw, Shield } from 'lucide-react'
+import { Brain, CheckCircle2, Loader2, AlertTriangle, RefreshCw, Shield, Play } from 'lucide-react'
 import { useSettings } from './hooks'
 import { endpoints } from '../../config/api'
+import { CostBanner } from '../../comm/CostBanner'
+import { readApiError } from '../../comm/apiError'
 
 type Provider = 'bedrock' | 'anthropic' | 'openai' | 'ollama'
 
@@ -57,6 +59,13 @@ export function LLMConfigView() {
   const [crisAcknowledged, setCrisAcknowledged] = useState(false)
   const [selectedModelId, setSelectedModelId] = useState('')
 
+  // Test-this-model state. Lives in this view because Settings → AI Provider
+  // is where users naturally validate their LLM is reachable.
+  const [testPrompt, setTestPrompt] = useState('')
+  const [testRunning, setTestRunning] = useState(false)
+  const [testError, setTestError] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<{ sql: string; columns: string[] | null; rows: unknown[][] | null } | null>(null)
+
   useEffect(() => {
     if (settings) {
       setProvider((settings as any).llm?.provider || 'bedrock')
@@ -96,6 +105,30 @@ export function LLMConfigView() {
       fetchModels(bedrockRegion)
     }
   }, [provider, bedrockRegion, fetchModels])
+
+  async function runTest() {
+    const prompt = testPrompt.trim()
+    if (!prompt) return
+    setTestRunning(true)
+    setTestError(null)
+    setTestResult(null)
+    try {
+      const res = await fetch(endpoints.nlqueryExecute, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      })
+      if (!res.ok) {
+        setTestError(await readApiError(res, 'Test query failed'))
+        return
+      }
+      setTestResult(await res.json())
+    } catch (e: any) {
+      setTestError(e?.message || 'Test query failed')
+    } finally {
+      setTestRunning(false)
+    }
+  }
 
   const defaultModel = (p: Provider) => {
     switch (p) {
@@ -476,6 +509,79 @@ export function LLMConfigView() {
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Brain className="w-4 h-4" />}
             {saving ? t('settings.llm.saving') : saved ? t('settings.llm.saved') : t('settings.llm.saveActivate')}
           </button>
+        </div>
+
+        {/* Test this model — sends one NLQ to validate the model is reachable
+            and to give the user a feel for cost. Pre-flight banner updates
+            live as the user types; Run actually invokes the LLM. */}
+        <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700 space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-gray-900 dark:text-white">{t('settings.llm.testTitle')}</h3>
+            <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('settings.llm.testSubtitle')}</p>
+          </div>
+
+          <textarea
+            value={testPrompt}
+            onChange={(e) => setTestPrompt(e.target.value)}
+            placeholder={t('settings.llm.testPlaceholder')}
+            rows={2}
+            className="w-full px-3 py-2 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+          />
+
+          <CostBanner prompt={testPrompt} />
+
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={runTest}
+              disabled={!testPrompt.trim() || testRunning}
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded border border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-900/20 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {testRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+              {testRunning ? t('settings.llm.testRunning') : t('settings.llm.testRun')}
+            </button>
+            {testError && (
+              <span className="text-[11px] text-red-600 dark:text-red-400">{testError}</span>
+            )}
+          </div>
+
+          {testResult && !testError && (
+            <div className="space-y-2">
+              {testResult.sql && (
+                <details>
+                  <summary className="text-[10px] cursor-pointer text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">{t('settings.llm.testShowSql')}</summary>
+                  <pre className="mt-1 text-[10px] font-mono p-2 rounded bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 overflow-x-auto whitespace-pre-wrap">{testResult.sql}</pre>
+                </details>
+              )}
+              {testResult.columns && testResult.rows && (
+                <div className="border border-gray-200 dark:border-gray-700 rounded overflow-auto max-h-60">
+                  <table className="w-full text-[11px]">
+                    <thead className="sticky top-0 bg-gray-100 dark:bg-gray-800">
+                      <tr>
+                        {testResult.columns.map((col, i) => (
+                          <th key={i} className="px-2 py-1.5 text-left font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">{col}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(testResult.rows as unknown[][] || []).slice(0, 20).map((row, ri) => (
+                        <tr key={ri} className="border-b border-gray-100 dark:border-gray-800">
+                          {row.map((cell, ci) => (
+                            <td key={ci} className="px-2 py-1 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[260px] truncate" title={String(cell ?? '')}>
+                              {cell === null ? <span className="text-gray-300">—</span> : String(cell)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {(!testResult.rows || testResult.rows.length === 0) && testResult.columns && (
+                <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('settings.llm.testNoRows')}</p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
