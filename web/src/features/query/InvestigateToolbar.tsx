@@ -176,7 +176,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
       <div className="flex flex-wrap items-end gap-3">
         {/* Time window */}
         <div className="flex flex-col gap-1">
-          <label className="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">
+          <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
             <Calendar className="inline w-3 h-3 mr-1" />
             {t('investigateToolbar.timeWindow')}
           </label>
@@ -232,7 +232,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
         {/* Accounts: chip strip when small, popover when many */}
         <div className="flex flex-col gap-1 min-w-[200px] flex-1 max-w-[640px]">
           <div className="flex items-center justify-between">
-            <label className="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">
+            <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
               <Database className="inline w-3 h-3 mr-1" />
               {t('investigateToolbar.accounts.label')}
             </label>
@@ -248,7 +248,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
           </div>
 
           {accountsLoading ? (
-            <div className="text-[11px] text-gray-500">{t('investigateToolbar.accounts.loading')}</div>
+            <div className="text-[11px] text-gray-600 dark:text-gray-400">{t('investigateToolbar.accounts.loading')}</div>
           ) : useChipStrip ? (
             <AccountChipStrip
               accounts={accounts}
@@ -270,7 +270,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
 
         {/* Seed input */}
         <div className="flex flex-col gap-1 flex-1 min-w-[260px]">
-          <label className="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">
+          <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
             {t('investigateToolbar.seed.label')}
           </label>
           <div className="flex items-center gap-1.5">
@@ -286,14 +286,15 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
                 type="button"
                 onClick={() => tb.setSeed('')}
                 title={t('investigateToolbar.seed.clear')}
-                className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                aria-label={t('investigateToolbar.seed.clear')}
+                className="p-1 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
             )}
           </div>
           {tb.state.seed && (
-            <div className="flex items-center gap-1.5 text-[10px] text-gray-500 dark:text-gray-400">
+            <div className="flex items-center gap-1.5 text-[10px] text-gray-600 dark:text-gray-300">
               <span>{t('investigateToolbar.seed.detectedAs')}</span>
               <select
                 value={tb.state.seedTypeOverride ?? detectedType}

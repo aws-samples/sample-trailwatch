@@ -167,6 +167,17 @@ export function SummaryPanel({
     setError(null)
   }, [scenarioId])
 
+  // Esc closes the panel — keyboard shortcut keeps the keyboard-heavy
+  // workflow flowing without needing to reach for the X button.
+  useEffect(() => {
+    if (!open) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
   const promptPreview = (() => {
     if (!columns || !rows) return ''
     const sliced = rows.slice(0, 50)
@@ -230,7 +241,7 @@ export function SummaryPanel({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        <div className="text-[11px] text-gray-500 dark:text-gray-400">
+        <div className="text-[11px] text-gray-600 dark:text-gray-300">
           {t('summaryPanel.scope', { scenario: scenarioName, rows: rows?.length || 0 })}
         </div>
 
@@ -250,7 +261,7 @@ export function SummaryPanel({
               <Sparkles className="w-3.5 h-3.5" />
               {recommended ? t('summaryPanel.generateRecommended') : t('summaryPanel.generate')}
             </button>
-            <p className="text-[10px] text-gray-500 dark:text-gray-400">
+            <p className="text-[10px] text-gray-600 dark:text-gray-300">
               {t('summaryPanel.disclaimer')}
             </p>
           </>
@@ -286,7 +297,7 @@ export function SummaryPanel({
               </div>
             )}
 
-            <div className="text-[11px] text-gray-500 dark:text-gray-400">
+            <div className="text-[11px] text-gray-600 dark:text-gray-300">
               {summary.rows_sent_to_model < summary.total_rows
                 ? t('summaryPanel.basedOn', { sent: summary.rows_sent_to_model, total: summary.total_rows })
                 : t('summaryPanel.basedOnAll', { count: summary.total_rows })}
@@ -295,7 +306,7 @@ export function SummaryPanel({
             {/* TL;DR — bigger, leading text. Only renders when structured. */}
             {hasStructured && summary.tldr && (
               <section>
-                <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
+                <div className="text-[10px] uppercase tracking-wide text-gray-600 dark:text-gray-300 mb-1">
                   {t('summaryPanel.section.tldr')}
                 </div>
                 <p className="text-[13px] leading-snug text-gray-900 dark:text-gray-100">
@@ -307,7 +318,7 @@ export function SummaryPanel({
             {/* Findings — severity dot + one-line text. */}
             {hasStructured && (summary.findings?.length ?? 0) > 0 && (
               <section>
-                <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
+                <div className="text-[10px] uppercase tracking-wide text-gray-600 dark:text-gray-300 mb-1">
                   {t('summaryPanel.section.findings', { count: summary.findings!.length })}
                 </div>
                 <ul className="space-y-1.5">
@@ -331,7 +342,7 @@ export function SummaryPanel({
                 clickable, not buried inside prose. */}
             {hasStructured && (summary.entities?.length ?? 0) > 0 && (
               <section>
-                <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
+                <div className="text-[10px] uppercase tracking-wide text-gray-600 dark:text-gray-300 mb-1">
                   {t('summaryPanel.section.entities', { count: summary.entities!.length })}
                 </div>
                 <ul className="divide-y divide-gray-100 dark:divide-gray-800 rounded border border-gray-200 dark:border-gray-700">
@@ -373,7 +384,7 @@ export function SummaryPanel({
                 entity value with a reason. */}
             {hasStructured && (summary.suggested_pivots?.length ?? 0) > 0 && (
               <section>
-                <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">
+                <div className="text-[10px] uppercase tracking-wide text-gray-600 dark:text-gray-300 mb-1">
                   {t('summaryPanel.section.suggestedPivots')}
                 </div>
                 <ul className="space-y-1.5">

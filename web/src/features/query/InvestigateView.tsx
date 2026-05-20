@@ -38,6 +38,8 @@ interface RunResult {
   columns: string[] | null
   rows: any[][] | null
   error?: string
+  error_hint?: string
+  error_detail?: string
 }
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -116,6 +118,16 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   // Toast and scroll target for the post-pivot guidance ("you set a seed,
   // here's what to do next"). The toast clears itself after a few seconds.
   const [pivotToast, setPivotToast] = useState<string | null>(null)
+  // Esc dismisses the pivot toast — small affordance but matches the rest
+  // of the keyboard-friendly workflow.
+  useEffect(() => {
+    if (!pivotToast) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setPivotToast(null)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [pivotToast])
   const recommendationsRef = useRef<HTMLDivElement | null>(null)
   const pivotToSeed = useCallback((value: string, type: SeedType) => {
     setSetSeedSignal(s => ({ seq: s.seq + 1, value, type }))
@@ -384,7 +396,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           <Search className="w-5 h-5 text-[#0972d3]" />
           <div>
             <h2 className="text-base font-semibold text-gray-900 dark:text-white">{t('security.investigate.title')}</h2>
-            <p className="text-[11px] text-gray-500 dark:text-gray-400">{t('security.investigate.scenarios', { count: scenarios.length })} • {t('security.investigate.crossAccount')}</p>
+            <p className="text-[11px] text-gray-600 dark:text-gray-400">{t('security.investigate.scenarios', { count: scenarios.length })} • {t('security.investigate.crossAccount')}</p>
           </div>
         </div>
       </div>
@@ -410,7 +422,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           not auto-dismiss), since prior auto-clear flashed away before users
           could read it; user dismisses via X or by clearing the seed. */}
       {pivotToast && (
-        <div className="px-6 py-2 bg-blue-600 dark:bg-blue-700 text-white text-[12px] flex items-center gap-2">
+        <div role="status" aria-live="polite" className="px-6 py-2 bg-blue-600 dark:bg-blue-700 text-white text-[12px] flex items-center gap-2">
           <span className="font-medium">{t('security.investigate.pivotToast.title')}</span>
           <span className="opacity-90 truncate">{pivotToast}</span>
           <span className="ml-auto text-[11px] opacity-90">
@@ -558,9 +570,9 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                       </span>
                     )}
                   </div>
-                  <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-tight">{s.description}</p>
+                  <p className="text-[11px] text-gray-600 dark:text-gray-300 leading-snug">{s.description}</p>
                   {s.param_type !== 'none' && (
-                    <span className="inline-block mt-1 text-[9px] text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30 px-1.5 py-0.5 rounded">
+                    <span className="inline-block mt-1 text-[10px] text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30 px-1.5 py-0.5 rounded">
                       {t('security.investigate.requires', { label: s.param_label })}
                     </span>
                   )}
@@ -575,9 +587,9 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           {!selectedScenario ? (
             <div className="flex items-center justify-center h-full text-center">
               <div>
-                <Search className="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
-                <p className="text-sm text-gray-500 dark:text-gray-400">{t('security.investigate.selectScenario')}</p>
-                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{t('security.investigate.queriesRunAgainst')}</p>
+                <Search className="w-10 h-10 text-gray-400 dark:text-gray-500 mx-auto mb-3" />
+                <p className="text-sm text-gray-700 dark:text-gray-300">{t('security.investigate.selectScenario')}</p>
+                <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">{t('security.investigate.queriesRunAgainst')}</p>
               </div>
             </div>
           ) : (
@@ -586,10 +598,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
               <div className="px-5 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
                 <div className="flex items-center gap-2 mb-2">
                   <h3 className="text-sm font-semibold text-gray-900 dark:text-white">{selectedScenario.name}</h3>
-                  <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase rounded ${SEVERITY_BADGE[selectedScenario.severity]}`}>{selectedScenario.severity}</span>
-                  <span className="text-[10px] text-gray-400 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{selectedScenario.category}</span>
+                  <span className={`px-1.5 py-0.5 text-[10px] font-bold uppercase rounded ${SEVERITY_BADGE[selectedScenario.severity]}`}>{selectedScenario.severity}</span>
+                  <span className="text-[10px] text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{selectedScenario.category}</span>
                 </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">{selectedScenario.description}</p>
+                <p className="text-xs text-gray-600 dark:text-gray-300 mb-3">{selectedScenario.description}</p>
 
                 {/* Parameter input */}
                 {selectedScenario.param_type !== 'none' && (
@@ -641,12 +653,18 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
               {/* Results */}
               <div className="flex-1 overflow-auto">
                 {result?.error && (
-                  <div className="m-4 p-3 rounded border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20">
+                  <div role="alert" className="m-4 p-3 rounded border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20">
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="w-4 h-4 text-red-500" />
                       <span className="text-xs font-medium text-red-700 dark:text-red-300">{t('security.investigate.queryError')}</span>
                     </div>
-                    <pre className="text-[11px] text-red-600 dark:text-red-400 mt-1 whitespace-pre-wrap font-mono">{result.error}</pre>
+                    {result.error_hint ? (
+                      <p className="text-[12px] text-red-700 dark:text-red-300 mt-1">{result.error_hint}</p>
+                    ) : null}
+                    <details className="mt-2">
+                      <summary className="text-[10px] cursor-pointer text-red-700 dark:text-red-300 hover:underline">{t('security.investigate.showTechnicalDetail')}</summary>
+                      <pre className="text-[11px] text-red-600 dark:text-red-400 mt-1 whitespace-pre-wrap font-mono">{result.error_detail || result.error}</pre>
+                    </details>
                   </div>
                 )}
 
@@ -705,7 +723,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                           </button>
                         </>
                       )}
-                      <span className="text-[10px] text-gray-400">{t('security.investigate.tableHint')}</span>
+                      <span className="text-[10px] text-gray-600 dark:text-gray-400">{t('security.investigate.tableHint')}</span>
                     </div>
                     <div className="relative">
                     <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-auto max-h-[60vh]">
@@ -826,7 +844,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
 
                     {result.sql && (
                       <details className="mt-3">
-                        <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-gray-600">{t('security.investigate.showSqlQuery')}</summary>
+                        <summary className="text-[10px] text-gray-600 dark:text-gray-400 cursor-pointer hover:text-gray-800 dark:hover:text-gray-200">{t('security.investigate.showSqlQuery')}</summary>
                         <pre className="text-[10px] font-mono text-gray-500 bg-gray-50 dark:bg-gray-900 p-3 rounded mt-1 overflow-x-auto border border-gray-200 dark:border-gray-700">{result.sql}</pre>
                       </details>
                     )}
