@@ -15,24 +15,24 @@ import {
 
 interface NavItem {
   id: string
-  label: string
+  labelKey: string
   icon: React.ReactNode
 }
 
 const insightsItems: NavItem[] = [
-  { id: 'dashboard', label: 'Security Dashboard', icon: <LayoutDashboard className="w-4 h-4" /> },
-  { id: 'pre-built-queries', label: 'Investigate', icon: <BookOpen className="w-4 h-4" /> },
+  { id: 'dashboard', labelKey: 'sidebar.dashboard', icon: <LayoutDashboard className="w-4 h-4" /> },
+  { id: 'pre-built-queries', labelKey: 'sidebar.investigate', icon: <BookOpen className="w-4 h-4" /> },
 ]
 
 const dataItems: NavItem[] = [
-  { id: 's3-sync', label: 'S3 Sync', icon: <CloudDownload className="w-4 h-4" /> },
+  { id: 's3-sync', labelKey: 'sidebar.s3Sync', icon: <CloudDownload className="w-4 h-4" /> },
 ]
 
 const settingsItems: NavItem[] = [
-  { id: 's3-config', label: 'S3 Config', icon: <Database className="w-4 h-4" /> },
-  { id: 'credentials', label: 'Credentials', icon: <Key className="w-4 h-4" /> },
-  { id: 'llm-config', label: 'AI Provider', icon: <Brain className="w-4 h-4" /> },
-  { id: 'system', label: 'System', icon: <Settings className="w-4 h-4" /> },
+  { id: 's3-config', labelKey: 'sidebar.s3Config', icon: <Database className="w-4 h-4" /> },
+  { id: 'credentials', labelKey: 'sidebar.credentials', icon: <Key className="w-4 h-4" /> },
+  { id: 'llm-config', labelKey: 'sidebar.aiProvider', icon: <Brain className="w-4 h-4" /> },
+  { id: 'system', labelKey: 'sidebar.system', icon: <Settings className="w-4 h-4" /> },
 ]
 
 interface SidebarProps {
@@ -65,9 +65,9 @@ export function Sidebar({ activeView, onNavigate }: SidebarProps) {
       </div>
 
       <div className="flex-1 py-2 overflow-y-auto">
-        <NavGroup title="Security" items={insightsItems} activeId={activeView} onNavigate={onNavigate} />
-        <NavGroup title="Data" items={dataItems} activeId={activeView} onNavigate={onNavigate} />
-        <NavGroup title="Settings" items={settingsItems} activeId={activeView} onNavigate={onNavigate} />
+        <NavGroup title={t('sidebar.group.security')} items={insightsItems} activeId={activeView} onNavigate={onNavigate} />
+        <NavGroup title={t('sidebar.group.data')} items={dataItems} activeId={activeView} onNavigate={onNavigate} />
+        <NavGroup title={t('sidebar.group.settings')} items={settingsItems} activeId={activeView} onNavigate={onNavigate} />
       </div>
 
       {/* Theme toggle footer */}
@@ -85,23 +85,25 @@ export function Sidebar({ activeView, onNavigate }: SidebarProps) {
 }
 
 function NavGroup({ title, items, activeId, onNavigate }: { title: string, items: NavItem[], activeId: string, onNavigate: (id: string) => void }) {
+  const { t } = useTranslation()
   return (
     <div className="mb-1">
-      <p className="px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500">{title}</p>
+      <p className="px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-300">{title}</p>
       {items.map(item => {
         const isActive = activeId === item.id
         return (
           <button
             key={item.id}
             onClick={() => onNavigate(item.id)}
+            aria-current={isActive ? 'page' : undefined}
             className={`w-full flex items-center gap-2.5 px-4 py-2 text-[13px] transition-colors ${
               isActive
                 ? 'bg-[#1a242f] text-white border-l-2 border-l-[#ff9900]'
-                : 'text-gray-400 hover:text-white hover:bg-[#2a3a4a] border-l-2 border-l-transparent'
+                : 'text-gray-300 hover:text-white hover:bg-[#2a3a4a] border-l-2 border-l-transparent'
             }`}
           >
             {item.icon}
-            <span>{item.label}</span>
+            <span>{t(item.labelKey)}</span>
           </button>
         )
       })}

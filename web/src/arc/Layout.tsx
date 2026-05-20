@@ -42,6 +42,7 @@ export function Layout({ children }: LayoutProps) {
   const [activeView, setActiveView] = useState<string>(readInitialView)
   const [navContext, setNavContext] = useState<NavigationContext>({})
   const [account, setAccount] = useState<string>('')
+  const [region, setRegion] = useState<string>('')
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
   })
@@ -56,7 +57,10 @@ export function Layout({ children }: LayoutProps) {
   useEffect(() => {
     fetch('/api/settings')
       .then(r => r.json())
-      .then(d => setAccount(d?.s3?.account_id || ''))
+      .then(d => {
+        setAccount(d?.s3?.account_id || '')
+        setRegion(d?.s3?.log_region || d?.s3?.region || '')
+      })
       .catch(() => {})
   }, [])
 
@@ -91,7 +95,9 @@ export function Layout({ children }: LayoutProps) {
               {t('app.nav.account')} <span className="text-gray-200 font-mono">{account}</span>
             </span>
           )}
-          <span className="text-[11px] text-gray-400">{t('app.nav.region')} <span className="text-gray-200">us-east-1</span></span>
+          {region && (
+            <span className="text-[11px] text-gray-400">{t('app.nav.region')} <span className="text-gray-200">{region}</span></span>
+          )}
         </div>
       </header>
 
