@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"strings"
@@ -27,6 +28,18 @@ func IsValidUUID(s string) bool {
 // unknown fields and trailing junk. On failure it writes a 400 response and
 // returns false so the caller can `if !DecodeStrictJSON(...) { return }`.
 func DecodeStrictJSON(w http.ResponseWriter, r *http.Request, out interface{}) bool {
+	// Reject non-JSON Content-Type so a stray form post can't be interpreted
+	// as JSON. An empty Content-Type is allowed for compatibility with bodyless
+	// or legacy callers — but anything declared must be application/json.
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			Error(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE",
+				"Content-Type must be application/json", nil)
+			return false
+		}
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

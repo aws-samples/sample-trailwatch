@@ -43,6 +43,15 @@ func (rw *responseWriter) Unwrap() http.ResponseWriter {
 	return rw.ResponseWriter
 }
 
+// Flush implements http.Flusher by delegating to the underlying writer.
+// This is required for SSE (Server-Sent Events) endpoints to work when
+// the StructuredLogger or Recoverer middleware wraps the ResponseWriter.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // StructuredLogger returns middleware that logs each request with slog.
 // Log fields: method, path, status_code (int), duration_ms (float64), component.
 func StructuredLogger(next http.Handler) http.Handler {
@@ -88,6 +97,21 @@ func CORS(next http.Handler) http.Handler {
 			return
 		}
 
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SecurityHeaders returns middleware that sets defensive HTTP response headers.
+// nosniff blocks MIME-type confusion attacks; DENY blocks clickjacking via iframes;
+// no-referrer keeps localhost paths out of any external referer headers if a link
+// is ever shared. CSP is intentionally omitted — the React bundle uses inline
+// styles and dynamic Vite assets, and a strict CSP would need careful tuning.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
 }

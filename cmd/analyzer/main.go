@@ -103,6 +103,7 @@ func main() {
 
 	// Apply middleware
 	r.Use(middleware.StructuredLogger)
+	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.CORS)
 	r.Use(middleware.Recoverer)
 
