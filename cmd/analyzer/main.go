@@ -130,7 +130,7 @@ func main() {
 		orgRegion = "us-east-1"
 	}
 	accountResolver := accounts.NewResolver(db.Conn, settingsHandler.Service().LoadAWSConfig, orgRegion)
-	r.Mount("/api/accounts", accounts.NewHandler(accountResolver).Routes())
+	r.Mount("/api/accounts", accounts.NewHandler(accountResolver, cfg).Routes())
 
 	// Best-effort eager refresh: try AWS Organizations on boot but do not block
 	// startup or fail it if the principal lacks the permission. The most common

@@ -83,10 +83,26 @@ func (p *BedrockProvider) GenerateSQL(ctx context.Context, systemPrompt, userPro
 			return "", fmt.Errorf("AWS session credentials expired. Remediation: go to Settings → Credentials and paste fresh session credentials")
 		}
 		if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "not authorized") {
-			return "", fmt.Errorf("AWS credentials lack bedrock:InvokeModel permission. Remediation: (1) ensure your IAM role has bedrock:InvokeModel access, (2) or switch to Anthropic API / Ollama in Settings → AI Provider")
+			return "", fmt.Errorf("AWS credentials lack bedrock:InvokeModel permission. Remediation: (1) grant your IAM role bedrock:InvokeModel access, (2) or switch to Anthropic API / Ollama in Settings → AI Provider")
 		}
 		if strings.Contains(errMsg, "ResourceNotFoundException") {
 			return "", fmt.Errorf("Bedrock model %q not available in region %s. Remediation: check model access is enabled in the Bedrock console, or change the model in config.json", modelID, p.cfg.Bedrock.Region)
+		}
+		// On-demand throughput is not supported for some models (e.g.,
+		// Claude Opus 4.x); they require a Cross-Region Inference (CRIS)
+		// profile. The fix is to prefix the model id with "us." / "eu." /
+		// "apac." so Bedrock routes via CRIS. Suggest the prefixed id
+		// inline so the user can fix it in Settings → AI Provider with one
+		// edit. We do NOT auto-prefix in the request because CRIS routes
+		// data cross-region and that consent should be explicit.
+		if strings.Contains(errMsg, "on-demand throughput isn") {
+			suggested := suggestedCRISModelID(modelID)
+			return "", fmt.Errorf(
+				"Bedrock model %q does not support on-demand invocation in this region. "+
+					"This model needs a Cross-Region Inference (CRIS) profile. "+
+					"Remediation: in Settings → AI Provider, switch the model to %q (acknowledge the CRIS data-residency notice), or pick an on-demand model like anthropic.claude-3-5-sonnet-20241022-v2:0.",
+				modelID, suggested,
+			)
 		}
 		return "", fmt.Errorf("Bedrock API error: %w", err)
 	}
@@ -128,6 +144,21 @@ func (p *BedrockProvider) loadConfig(ctx context.Context) (aws.Config, error) {
 	}
 
 	return awsconfig.LoadDefaultConfig(ctx, opts...)
+}
+
+// suggestedCRISModelID returns the most likely CRIS-prefixed equivalent of
+// the given Bedrock model id. Used to give the user an actionable hint when
+// Bedrock rejects on-demand invocation. Picks "us." as the default prefix
+// since the app's typical operator is US-based; users in other regions can
+// pick eu./apac./global. in Settings.
+func suggestedCRISModelID(id string) string {
+	id = strings.TrimSpace(id)
+	for _, p := range []string{"us.", "eu.", "apac.", "global."} {
+		if strings.HasPrefix(strings.ToLower(id), p) {
+			return id // already prefixed; no fix to suggest
+		}
+	}
+	return "us." + id
 }
 
 // --- Anthropic API Provider ---

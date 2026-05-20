@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
 
 	"github.com/go-chi/chi/v5"
@@ -12,23 +13,48 @@ import (
 // Handler exposes the resolver as HTTP endpoints.
 type Handler struct {
 	resolver *Resolver
+	cfg      *config.Config
 }
 
-// NewHandler creates a Handler bound to the given resolver.
-func NewHandler(resolver *Resolver) *Handler {
-	return &Handler{resolver: resolver}
+// NewHandler creates a Handler bound to the given resolver. cfg is read at
+// request time so changes to S3.MemberAccounts via Settings reflect on
+// subsequent /discoverable calls without a server restart.
+func NewHandler(resolver *Resolver, cfg *config.Config) *Handler {
+	return &Handler{resolver: resolver, cfg: cfg}
 }
 
 // Routes mounts under /api/accounts.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Get("/resolve", h.Resolve)             // GET  /api/accounts/resolve?ids=111,222
-	r.Get("/status", h.Status)               // GET  /api/accounts/status          (resolver state for UI hints)
-	r.Post("/refresh", h.RefreshOrg)         // POST /api/accounts/refresh         (force AWS Organizations refresh)
-	r.Get("/manual", h.ListManual)           // GET  /api/accounts/manual          (list overrides)
-	r.Put("/manual/{id}", h.UpsertManual)    // PUT  /api/accounts/manual/{id}     (set or clear an override)
-	r.Delete("/manual/{id}", h.DeleteManual) // DELETE /api/accounts/manual/{id}
+	r.Get("/resolve", h.Resolve)              // GET  /api/accounts/resolve?ids=111,222
+	r.Get("/status", h.Status)                // GET  /api/accounts/status          (resolver state for UI hints)
+	r.Get("/discoverable", h.ListDiscoverable) // GET  /api/accounts/discoverable    (toolbar account picker payload)
+	r.Post("/refresh", h.RefreshOrg)          // POST /api/accounts/refresh         (force AWS Organizations refresh)
+	r.Get("/manual", h.ListManual)            // GET  /api/accounts/manual          (list overrides)
+	r.Put("/manual/{id}", h.UpsertManual)     // PUT  /api/accounts/manual/{id}     (set or clear an override)
+	r.Delete("/manual/{id}", h.DeleteManual)  // DELETE /api/accounts/manual/{id}
 	return r
+}
+
+// ListDiscoverable returns the union of synced accounts and configured
+// member accounts, each enriched with name + has_data flag, for the
+// Investigate toolbar's account picker.
+func (h *Handler) ListDiscoverable(w http.ResponseWriter, r *http.Request) {
+	configured := []string{}
+	if h.cfg != nil {
+		configured = append(configured, h.cfg.S3.MemberAccounts...)
+		if h.cfg.S3.AccountID != "" {
+			configured = append(configured, h.cfg.S3.AccountID)
+		}
+	}
+	out, err := h.resolver.ListDiscoverable(r.Context(), configured)
+	if err != nil {
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list discoverable accounts", map[string]string{
+			"reason": err.Error(),
+		})
+		return
+	}
+	render.JSON(w, http.StatusOK, map[string]interface{}{"accounts": out})
 }
 
 // Status returns a snapshot of resolver state so the UI can decide whether to

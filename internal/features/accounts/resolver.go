@@ -6,7 +6,7 @@
 //     and only works inside an Organization.
 //   - User-supplied manual mapping (source = "manual"). Edited via Settings.
 //
-// At read time, manual entries win: an Org refresh never silently overwrites a
+// At read time, manual entries win: an Org refresh does not silently overwrite a
 // deliberate user override. Both rows are kept in the cache so the original Org
 // name is recoverable if the manual override is later cleared.
 package accounts
@@ -174,6 +174,95 @@ type Status struct {
 	LastError     string    `json:"last_error,omitempty"`
 	OrgEntries    int       `json:"org_entries"`
 	ManualEntries int       `json:"manual_entries"`
+}
+
+// DiscoverableAccount is one row in the toolbar's account picker. Combines
+// the resolver's name lookup with a "has data on disk" flag derived from
+// the sessions table, so the picker can show both "accounts I can investigate
+// right now" (HasData=true) and "accounts I configured but haven't synced
+// yet" (HasData=false) without separate round trips.
+type DiscoverableAccount struct {
+	AccountID string `json:"account_id"`
+	Name      string `json:"name,omitempty"`
+	Source    string `json:"source"` // mirrors Entry.Source
+	HasData   bool   `json:"has_data"`
+	// SessionCount is the number of completed sync sessions touching this
+	// account; useful for "stale data" affordances later.
+	SessionCount int `json:"session_count"`
+}
+
+// ListDiscoverable returns the union of:
+//   - account IDs that have at least one row in the sessions table (HasData=true)
+//   - configuredIDs supplied by the caller (typically cfg.S3.MemberAccounts)
+//
+// Each row is enriched with the resolver's name + source. Ordered by
+// account_id ascending so the picker is deterministic.
+func (r *Resolver) ListDiscoverable(ctx context.Context, configuredIDs []string) ([]DiscoverableAccount, error) {
+	// Pull synced accounts + their session counts in one query.
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT account_id, COUNT(*)
+		FROM sessions
+		WHERE account_id != ''
+		GROUP BY account_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	syncedCounts := map[string]int{}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		syncedCounts[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Build the full ID set and resolve names in one shot.
+	idSet := map[string]struct{}{}
+	for id := range syncedCounts {
+		idSet[id] = struct{}{}
+	}
+	for _, id := range configuredIDs {
+		if id != "" {
+			idSet[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+
+	entries, err := r.ResolveMany(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]DiscoverableAccount, 0, len(entries))
+	for _, e := range entries {
+		count := syncedCounts[e.AccountID]
+		out = append(out, DiscoverableAccount{
+			AccountID:    e.AccountID,
+			Name:         e.Name,
+			Source:       e.Source,
+			HasData:      count > 0,
+			SessionCount: count,
+		})
+	}
+	// Stable order for the UI.
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[i].AccountID > out[j].AccountID {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
 }
 
 // Status returns a snapshot of the resolver's state for the UI.

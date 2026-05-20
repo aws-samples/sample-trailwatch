@@ -66,6 +66,11 @@ export function LLMConfigView() {
   const [testError, setTestError] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ sql: string; columns: string[] | null; rows: unknown[][] | null } | null>(null)
 
+  // Search filter for the Bedrock model lists. Matches against model_id +
+  // model_name + provider so users can type "opus", "claude-3-5", "us.",
+  // etc. and narrow quickly. Case-insensitive substring.
+  const [modelSearch, setModelSearch] = useState('')
+
   useEffect(() => {
     if (settings) {
       setProvider((settings as any).llm?.provider || 'bedrock')
@@ -179,9 +184,17 @@ export function LLMConfigView() {
 
   const activeProvider = (settings as any)?.llm?.provider || 'bedrock'
 
-  // Split models into in-region and CRIS
-  const inRegionModels = bedrockModels.filter(m => !m.is_cris)
-  const crisModels = bedrockModels.filter(m => m.is_cris)
+  const matchesSearch = (m: BedrockModel) => {
+    if (!modelSearch.trim()) return true
+    const q = modelSearch.trim().toLowerCase()
+    return (
+      m.model_id.toLowerCase().includes(q) ||
+      (m.model_name || '').toLowerCase().includes(q) ||
+      (m.provider || '').toLowerCase().includes(q)
+    )
+  }
+  const inRegionModels = bedrockModels.filter(m => !m.is_cris && matchesSearch(m))
+  const crisModels = bedrockModels.filter(m => m.is_cris && matchesSearch(m))
 
   return (
     <div className="h-full overflow-y-auto">
@@ -285,6 +298,34 @@ export function LLMConfigView() {
 
               {!modelsLoading && !modelsError && bedrockModels.length > 0 && (
                 <div className="space-y-3">
+                  {/* Search box: filters both in-region and CRIS lists by
+                      id, name, or provider. Quick narrowing for users who
+                      know the model family (e.g., type "opus") without
+                      having to scroll. */}
+                  <div className="relative">
+                    <input
+                      type="text"
+                      value={modelSearch}
+                      onChange={e => setModelSearch(e.target.value)}
+                      placeholder={t('settings.llm.searchPlaceholder')}
+                      className="w-full px-3 py-2 pr-8 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
+                    />
+                    {modelSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setModelSearch('')}
+                        aria-label={t('settings.llm.searchClear')}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  {modelSearch && inRegionModels.length === 0 && crisModels.length === 0 && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 py-2">
+                      {t('settings.llm.searchNoMatches', { query: modelSearch })}
+                    </p>
+                  )}
                   {/* In-region models */}
                   {inRegionModels.length > 0 && (
                     <div>

@@ -51,6 +51,7 @@ func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Post("/execute", h.Execute)
 	r.Post("/estimate", h.Estimate)
+	r.Post("/summarize", h.Summarize)
 	r.Get("/spend", h.Spend)
 	r.Delete("/spend", h.ResetSpend)
 	r.Post("/index", h.BuildIndex)
@@ -58,6 +59,43 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/index/progress", h.StreamIndexProgress)
 	r.Post("/index/cancel", h.CancelIndex)
 	return r
+}
+
+// Summarize wraps the summarize.go core in an HTTP handler. The body comes
+// straight from the result panel: scenario metadata + columns + the rows
+// that were displayed, so the model summarizes exactly what the user is
+// looking at. Pre-flight estimate + session-spend recording match the
+// /execute path so the cost UX stays consistent.
+func (h *Handler) Summarize(w http.ResponseWriter, r *http.Request) {
+	var req SummarizeRequest
+	if !render.DecodeStrictJSON(w, r, &req) {
+		return
+	}
+	if len(req.Columns) == 0 {
+		render.Error(w, http.StatusBadRequest, "missing_columns", "columns are required")
+		return
+	}
+
+	// Pre-compute estimate against the rendered prompt so spend records
+	// the same number the UI showed.
+	rowsToSend := req.Rows
+	if len(rowsToSend) > MaxSummarizeRows {
+		rowsToSend = rowsToSend[:MaxSummarizeRows]
+	}
+	userPrompt := buildSummarizeUserPrompt(req, rowsToSend, len(req.Rows) > MaxSummarizeRows)
+	est := EstimateCost(h.cfg, summarizeSystemPrompt, userPrompt, 0)
+
+	provider := NewProvider(h.cfg)
+	resp, err := Summarize(r.Context(), provider, req)
+	if err != nil {
+		render.Error(w, http.StatusInternalServerError, "summarize_error", err.Error())
+		return
+	}
+
+	// Record spend the same way Execute does.
+	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
+
+	render.JSON(w, http.StatusOK, resp)
 }
 
 // EstimateRequest carries the prompt the UI is about to run, so the backend

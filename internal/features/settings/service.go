@@ -608,9 +608,19 @@ func (s *Service) tryStatic(ctx context.Context, cfg *config.Config) CredentialA
 // Bedrock Model Discovery
 // ---------------------------------------------------------------------------
 
-// ListBedrockModels calls the Bedrock ListFoundationModels API to discover available
-// models in the specified region. Models with a cross-region inference profile prefix
-// (e.g., "us.", "eu.", "ap.") are flagged as CRIS.
+// ListBedrockModels returns text-generation models available in the given
+// region. Two AWS calls are merged:
+//
+//  1. ListFoundationModels — direct on-demand-eligible models. These show
+//     in the picker without a CRIS badge.
+//  2. ListInferenceProfiles — Cross-Region Inference (CRIS) profiles, such
+//     as "us.anthropic.claude-opus-4-20250514-v1:0". These models cannot be
+//     invoked on-demand and require the responder to acknowledge the
+//     cross-region data-residency notice before selecting them.
+//
+// The earlier version of this function only called ListFoundationModels, so
+// users on accounts where Opus / certain Sonnet variants are CRIS-only saw
+// no usable model in the picker.
 func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBedrockModelsResponse, error) {
 	if region == "" {
 		region = "us-east-1"
@@ -679,17 +689,89 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 		})
 	}
 
+	// Append CRIS profiles. These are NOT returned by ListFoundationModels;
+	// without this call, accounts whose only access to Opus/Sonnet 4.x is via
+	// inference profiles would see an empty or insufficient picker. We build
+	// a set of foundation model IDs we already added so a profile that
+	// happens to share a base model name does not produce a duplicate row.
+	seen := map[string]struct{}{}
+	for _, m := range models {
+		seen[m.ModelID] = struct{}{}
+	}
+	profilesCount := 0
+	if profilesOut, perr := client.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{}); perr == nil {
+		for _, p := range profilesOut.InferenceProfileSummaries {
+			pid := aws.ToString(p.InferenceProfileId)
+			if pid == "" {
+				continue
+			}
+			if _, dup := seen[pid]; dup {
+				continue
+			}
+			pname := aws.ToString(p.InferenceProfileName)
+			if pname == "" {
+				pname = pid
+			}
+			models = append(models, BedrockModel{
+				ModelID:     pid,
+				ModelName:   pname,
+				Provider:    providerFromProfileID(pid),
+				InputModes:  []string{"TEXT"},
+				OutputModes: []string{"TEXT"},
+				IsCRIS:      true,
+				CRISNote:    "Cross-Region Inference profile: routes invocation across regions for higher availability",
+			})
+			seen[pid] = struct{}{}
+			profilesCount++
+		}
+	} else {
+		// Profiles call may fail with AccessDeniedException on tightly-scoped
+		// roles. Log once and continue with whatever foundation models we
+		// already collected — better to show a partial list than an error.
+		slog.Warn("list inference profiles failed; CRIS variants may be missing from picker",
+			"component", "cloudtrail-analyzer",
+			"region", region,
+			"error", perr.Error(),
+		)
+	}
+
 	slog.Info("listed Bedrock models",
 		"component", "cloudtrail-analyzer",
 		"region", region,
 		"total_returned", len(output.ModelSummaries),
 		"text_models", len(models),
+		"cris_profiles", profilesCount,
 	)
 
 	return &ListBedrockModelsResponse{
 		Region: region,
 		Models: models,
 	}, nil
+}
+
+// providerFromProfileID returns the model provider name guessed from the
+// inference-profile ID. Profile IDs follow patterns like
+// "us.anthropic.claude-opus-4-20250514-v1:0" — the second dot-segment is
+// the provider. Falls back to "AWS" if the shape doesn't match.
+func providerFromProfileID(pid string) string {
+	parts := strings.Split(pid, ".")
+	if len(parts) >= 2 {
+		switch parts[1] {
+		case "anthropic":
+			return "Anthropic"
+		case "amazon":
+			return "Amazon"
+		case "meta":
+			return "Meta"
+		case "ai21":
+			return "AI21"
+		case "cohere":
+			return "Cohere"
+		case "mistral":
+			return "Mistral"
+		}
+	}
+	return "AWS"
 }
 
 // ---------------------------------------------------------------------------
