@@ -41,6 +41,8 @@ interface FindingDetail {
   columns: string[] | null
   rows: (string | number | null)[][] | null
   error?: string
+  error_hint?: string
+  error_detail?: string
 }
 
 type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
@@ -259,7 +261,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-base font-semibold text-gray-900 dark:text-white">{t('security.dashboard.title')}</h1>
-            <p className="text-[11px] text-gray-500 dark:text-gray-400">
+            <p className="text-[11px] text-gray-600 dark:text-gray-400">
               {t('security.dashboard.accountInfo', { earliest: earliestEvent, latest: latestEvent, count: totalEvents.toLocaleString() })}
             </p>
           </div>
@@ -272,12 +274,12 @@ export function DashboardView({ navigate }: DashboardViewProps) {
       <div className="px-6 py-4 space-y-5">
         {/* Summary metrics */}
         <div className="grid grid-cols-3 lg:grid-cols-6 gap-2">
-          <Metric label="Events" value={totalEvents.toLocaleString()} />
-          <Metric label="Identities" value={String(uniqueIdentities)} />
-          <Metric label="Source IPs" value={String(uniqueIPs)} />
-          <Metric label="Errors" value={errorEvents.toLocaleString()} color={errorEvents > 0 ? 'text-red-600' : ''} />
-          <Metric label="Error Rate" value={`${errorRate}%`} color={errorRate > 5 ? 'text-red-600' : ''} />
-          <Metric label="Services" value={String(uniqueServices)} />
+          <Metric label={t('security.dashboard.metric.events')} value={totalEvents.toLocaleString()} />
+          <Metric label={t('security.dashboard.metric.identities')} value={String(uniqueIdentities)} />
+          <Metric label={t('security.dashboard.metric.sourceIPs')} value={String(uniqueIPs)} />
+          <Metric label={t('security.dashboard.metric.errors')} value={errorEvents.toLocaleString()} color={errorEvents > 0 ? 'text-red-600' : ''} />
+          <Metric label={t('security.dashboard.metric.errorRate')} value={`${errorRate}%`} color={errorRate > 5 ? 'text-red-600' : ''} />
+          <Metric label={t('security.dashboard.metric.services')} value={String(uniqueServices)} />
         </div>
 
         {/* Charts */}
@@ -312,11 +314,11 @@ export function DashboardView({ navigate }: DashboardViewProps) {
         {/* Severity filter */}
         <div className="flex items-center gap-2">
           <span className="text-[11px] font-medium text-gray-500 mr-1">{t('security.dashboard.filter')}</span>
-          <FilterPill label="All" count={FINDINGS.length} active={selectedSeverity === 'ALL'} onClick={() => setSelectedSeverity('ALL')} />
-          <FilterPill label="Critical" count={severityCounts.CRITICAL} active={selectedSeverity === 'CRITICAL'} onClick={() => setSelectedSeverity('CRITICAL')} color="text-red-700 bg-red-100 dark:bg-red-900/30 dark:text-red-300" />
-          <FilterPill label="High" count={severityCounts.HIGH} active={selectedSeverity === 'HIGH'} onClick={() => setSelectedSeverity('HIGH')} color="text-orange-700 bg-orange-100 dark:bg-orange-900/30 dark:text-orange-300" />
-          <FilterPill label="Medium" count={severityCounts.MEDIUM} active={selectedSeverity === 'MEDIUM'} onClick={() => setSelectedSeverity('MEDIUM')} color="text-yellow-700 bg-yellow-100 dark:bg-yellow-900/30 dark:text-yellow-300" />
-          <FilterPill label="Low" count={severityCounts.LOW} active={selectedSeverity === 'LOW'} onClick={() => setSelectedSeverity('LOW')} color="text-blue-700 bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300" />
+          <FilterPill label={t('security.dashboard.severity.all')} count={FINDINGS.length} active={selectedSeverity === 'ALL'} onClick={() => setSelectedSeverity('ALL')} />
+          <FilterPill label={t('security.dashboard.severity.critical')} count={severityCounts.CRITICAL} active={selectedSeverity === 'CRITICAL'} onClick={() => setSelectedSeverity('CRITICAL')} color="text-red-700 bg-red-100 dark:bg-red-900/30 dark:text-red-300" />
+          <FilterPill label={t('security.dashboard.severity.high')} count={severityCounts.HIGH} active={selectedSeverity === 'HIGH'} onClick={() => setSelectedSeverity('HIGH')} color="text-orange-700 bg-orange-100 dark:bg-orange-900/30 dark:text-orange-300" />
+          <FilterPill label={t('security.dashboard.severity.medium')} count={severityCounts.MEDIUM} active={selectedSeverity === 'MEDIUM'} onClick={() => setSelectedSeverity('MEDIUM')} color="text-yellow-700 bg-yellow-100 dark:bg-yellow-900/30 dark:text-yellow-300" />
+          <FilterPill label={t('security.dashboard.severity.low')} count={severityCounts.LOW} active={selectedSeverity === 'LOW'} onClick={() => setSelectedSeverity('LOW')} color="text-blue-700 bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300" />
         </div>
 
         {/* Findings list — grouped by category */}
@@ -345,7 +347,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                       <h4 className="text-sm font-medium text-gray-900 dark:text-white">{finding.title}</h4>
                       <span className={`px-1.5 py-0.5 text-[10px] font-bold uppercase rounded ${style.badge}`}>{finding.severity}</span>
                     </div>
-                    <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">{finding.description}</p>
+                    <p className="text-[11px] text-gray-600 dark:text-gray-400 mt-0.5">{finding.description}</p>
                   </div>
                   {/* Live count */}
                   <div className="flex items-center gap-3 flex-shrink-0">
@@ -353,7 +355,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                       <span className={`text-lg font-bold ${hasEvents ? 'text-gray-900 dark:text-white' : 'text-gray-300 dark:text-gray-600'}`}>
                         {count}
                       </span>
-                      {extra && <p className="text-[10px] text-gray-500">{extra}</p>}
+                      {extra && <p className="text-[10px] text-gray-600 dark:text-gray-400">{extra}</p>}
                     </div>
                     <ExternalLink className={`w-4 h-4 ${isExpanded ? 'text-blue-500' : 'text-gray-400'}`} />
                   </div>
@@ -365,14 +367,26 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                     {detailLoading ? (
                       <div className="flex items-center gap-2 py-4 justify-center">
                         <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
-                        <span className="text-xs text-gray-500">{t('security.dashboard.runningQuery')}</span>
+                        <span className="text-xs text-gray-700 dark:text-gray-300">{t('security.dashboard.runningQuery')}</span>
                       </div>
                     ) : findingDetail?.error ? (
-                      <div className="text-xs text-red-600 py-2">{findingDetail.error}</div>
+                      <div role="alert" className="py-2">
+                        {findingDetail.error_hint ? (
+                          <p className="text-xs text-red-700 dark:text-red-300">{findingDetail.error_hint}</p>
+                        ) : (
+                          <p className="text-xs text-red-700 dark:text-red-300">{findingDetail.error}</p>
+                        )}
+                        {(findingDetail.error_detail || findingDetail.error_hint) && (
+                          <details className="mt-1">
+                            <summary className="text-[10px] cursor-pointer text-red-700 dark:text-red-300 hover:underline">{t('security.investigate.showTechnicalDetail')}</summary>
+                            <pre className="text-[10px] text-red-600 dark:text-red-400 mt-1 whitespace-pre-wrap font-mono">{findingDetail.error_detail || findingDetail.error}</pre>
+                          </details>
+                        )}
+                      </div>
                     ) : findingDetail?.columns && findingDetail.columns.length > 0 ? (
                       <>
                         <div className="flex items-center justify-between mb-2">
-                          <span className="text-[11px] text-gray-500">{t('security.dashboard.results', { count: findingDetail.rows?.length || 0 })}</span>
+                          <span className="text-[11px] text-gray-600 dark:text-gray-400">{t('security.dashboard.results', { count: findingDetail.rows?.length || 0 })}</span>
                           <div className="flex items-center gap-3">
                             {(findingDetail.rows?.length || 0) > 0 && (
                               <>
@@ -407,7 +421,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                             <thead>
                               <tr className="bg-gray-100 dark:bg-gray-800">
                                 {findingDetail.columns.map((col, i) => (
-                                  <th key={i} className="px-2 py-1.5 text-left font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap border-b border-gray-200 dark:border-gray-700">{col}</th>
+                                  <th key={i} className="px-2 py-1.5 text-left font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap border-b border-gray-200 dark:border-gray-700">{col}</th>
                                 ))}
                               </tr>
                             </thead>
@@ -437,9 +451,14 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                             </tbody>
                           </table>
                         </div>
+                        {(findingDetail.rows?.length || 0) > 20 && (
+                          <p className="text-[10px] text-gray-600 dark:text-gray-400 mt-1">
+                            {t('security.dashboard.rowsTruncated', { shown: 20, total: findingDetail.rows!.length })}
+                          </p>
+                        )}
                         {findingDetail.sql && (
                           <details className="mt-2">
-                            <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-gray-600">{t('security.dashboard.showSql')}</summary>
+                            <summary className="text-[10px] text-gray-600 dark:text-gray-400 cursor-pointer hover:text-gray-800 dark:hover:text-gray-200">{t('security.dashboard.showSql')}</summary>
                             <pre className="text-[10px] font-mono text-gray-600 dark:text-gray-400 bg-gray-100 dark:bg-gray-900 p-2 rounded mt-1 overflow-x-auto">{findingDetail.sql}</pre>
                           </details>
                         )}
