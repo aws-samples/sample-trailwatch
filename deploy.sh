@@ -195,16 +195,22 @@ done
 # Copy project files (excluding node_modules, build artifacts, data)
 rsync -a --delete \
     --exclude='node_modules' \
-    --exclude='dist' \
-    --exclude='data' \
+    --exclude='/dist' \
+    --exclude='/data' \
     --exclude='.DS_Store' \
-    --exclude='analyzer' \
+    --exclude='/analyzer' \
+    --exclude='/cloudtrail-analyzer' \
     "${SCRIPT_DIR}/" "${APP_DIR}/"
 ok "Source code copied"
 
 # Belt-and-braces: confirm the destination has what Step 7+8 need.
+# Catches the previous buggy excludes that skipped cmd/analyzer/ because
+# 'analyzer' without a leading slash matches anywhere in the path.
 if [[ ! -d "${APP_DIR}/web" || ! -f "${APP_DIR}/web/package.json" ]]; then
     fail "Copy completed but ${APP_DIR}/web is missing. Check rsync excludes and source tree."
+fi
+if [[ ! -f "${APP_DIR}/cmd/analyzer/main.go" ]]; then
+    fail "Copy completed but ${APP_DIR}/cmd/analyzer/main.go is missing. Likely an over-broad rsync exclude."
 fi
 
 # ---------------------------------------------------------------------------
