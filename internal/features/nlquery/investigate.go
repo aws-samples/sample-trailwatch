@@ -70,7 +70,14 @@ func (h *InvestigateHandler) RunScenario(w http.ResponseWriter, r *http.Request)
 		"rows":        rows,
 	}
 	if err != nil {
+		hint, detail := classifyDuckDBError(err)
 		resp["error"] = err.Error()
+		if hint != "" {
+			resp["error_hint"] = hint
+		}
+		if detail != "" {
+			resp["error_detail"] = detail
+		}
 	}
 	render.JSON(w, http.StatusOK, resp)
 }

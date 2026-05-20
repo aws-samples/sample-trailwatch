@@ -216,16 +216,23 @@ func (h *DashboardHandler) GetFindingDetail(w http.ResponseWriter, r *http.Reque
 	svc := NewService(h.cfg)
 	cols, rows, err := svc.executeDuckDB(r.Context(), fq.DetailSQL)
 	resp := &QueryPanel{Columns: cols, Rows: rows}
-	if err != nil {
-		resp.Error = err.Error()
-	}
-	render.JSON(w, http.StatusOK, map[string]interface{}{
+	out := map[string]interface{}{
 		"id":      findingID,
 		"sql":     fq.DetailSQL,
 		"columns": resp.Columns,
 		"rows":    resp.Rows,
-		"error":   resp.Error,
-	})
+	}
+	if err != nil {
+		hint, detail := classifyDuckDBError(err)
+		out["error"] = err.Error()
+		if hint != "" {
+			out["error_hint"] = hint
+		}
+		if detail != "" {
+			out["error_detail"] = detail
+		}
+	}
+	render.JSON(w, http.StatusOK, out)
 }
 
 func (h *DashboardHandler) buildDataPath() string {
