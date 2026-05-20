@@ -9,7 +9,7 @@ export function SystemView() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <p className="text-sm text-gray-500 dark:text-gray-400">{t('settings.system.loading')}</p>
+        <p className="text-sm text-gray-600 dark:text-gray-300">{t('settings.system.loading')}</p>
       </div>
     )
   }
@@ -47,11 +47,11 @@ export function SystemView() {
         <>
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="px-3 py-2 rounded bg-gray-50 dark:bg-gray-800">
-              <span className="text-gray-500 dark:text-gray-400">{t('settings.system.version')}</span>
+              <span className="text-gray-600 dark:text-gray-300">{t('settings.system.version')}</span>
               <p className="font-medium text-gray-900 dark:text-white">{health.version || 'unknown'}</p>
             </div>
             <div className="px-3 py-2 rounded bg-gray-50 dark:bg-gray-800">
-              <span className="text-gray-500 dark:text-gray-400">{t('settings.system.uptime')}</span>
+              <span className="text-gray-600 dark:text-gray-300">{t('settings.system.uptime')}</span>
               <p className="font-medium text-gray-900 dark:text-white">{health.uptime || 'unknown'}</p>
             </div>
           </div>
@@ -64,13 +64,13 @@ export function SystemView() {
                   <li key={check.name} className="flex items-center justify-between px-3 py-2.5 rounded bg-gray-50 dark:bg-gray-800">
                     <div>
                       <span className="text-sm font-medium text-gray-900 dark:text-white">{check.name}</span>
-                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{check.message}</p>
+                      <p className="text-xs text-gray-600 dark:text-gray-300 mt-0.5">{check.message}</p>
                     </div>
                     <StatusBadge status={check.status} />
                   </li>
                 ))
               ) : (
-                <li className="text-sm text-gray-500 dark:text-gray-400 px-3 py-2">
+                <li className="text-sm text-gray-600 dark:text-gray-300 px-3 py-2">
                   {t('settings.system.noChecks')}
                 </li>
               )}

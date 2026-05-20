@@ -4,6 +4,7 @@ import { Brain, CheckCircle2, Loader2, AlertTriangle, RefreshCw, Shield, Play } 
 import { useSettings } from './hooks'
 import { endpoints } from '../../config/api'
 import { CostBanner } from '../../comm/CostBanner'
+import { ExpandableCell } from '../../comm/ExpandableCell'
 import { readApiError } from '../../comm/apiError'
 
 type Provider = 'bedrock' | 'anthropic' | 'openai' | 'ollama'
@@ -204,7 +205,7 @@ export function LLMConfigView() {
           <Brain className="w-5 h-5 text-purple-600" />
           <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{t('settings.llm.title')}</h2>
         </div>
-        <p className="text-xs text-gray-500 dark:text-gray-400">
+        <p className="text-xs text-gray-600 dark:text-gray-300">
           {t('settings.llm.subtitle')}
         </p>
 
@@ -235,7 +236,7 @@ export function LLMConfigView() {
                     <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">{t('settings.llm.active')}</span>
                   )}
                 </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{p.description}</p>
+                <p className="text-xs text-gray-600 dark:text-gray-300 mt-0.5">{p.description}</p>
               </div>
             </label>
           ))}
@@ -279,7 +280,7 @@ export function LLMConfigView() {
               {modelsLoading && (
                 <div className="flex items-center gap-2 py-4 justify-center">
                   <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
-                  <span className="text-xs text-gray-500">{t('settings.llm.loadingModels', { region: bedrockRegion })}</span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">{t('settings.llm.loadingModels', { region: bedrockRegion })}</span>
                 </div>
               )}
 
@@ -355,11 +356,11 @@ export function LLMConfigView() {
                               <div className="text-xs font-medium text-gray-900 dark:text-white truncate">
                                 {m.model_name}
                               </div>
-                              <div className="text-[10px] text-gray-400 font-mono truncate">
+                              <div className="text-[10px] text-gray-600 dark:text-gray-400 font-mono truncate">
                                 {m.model_id}
                               </div>
                             </div>
-                            <span className="text-[10px] text-gray-400 shrink-0">{m.provider}</span>
+                            <span className="text-[10px] text-gray-600 dark:text-gray-400 shrink-0">{m.provider}</span>
                           </label>
                         ))}
                       </div>
@@ -423,11 +424,11 @@ export function LLMConfigView() {
                                   {t('settings.llm.crisBadge')}
                                 </span>
                               </div>
-                              <div className="text-[10px] text-gray-400 font-mono truncate">
+                              <div className="text-[10px] text-gray-600 dark:text-gray-400 font-mono truncate">
                                 {m.model_id}
                               </div>
                             </div>
-                            <span className="text-[10px] text-gray-400 shrink-0">{m.provider}</span>
+                            <span className="text-[10px] text-gray-600 dark:text-gray-400 shrink-0">{m.provider}</span>
                           </label>
                         ))}
                       </div>
@@ -489,7 +490,7 @@ export function LLMConfigView() {
             {provider === 'openai' && (
               <div>
                 <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
-                  {t('settings.llm.customEndpoint')} <span className="text-gray-400">(optional)</span>
+                  {t('settings.llm.customEndpoint')} <span className="text-gray-500 dark:text-gray-400">{t('settings.llm.optional')}</span>
                 </label>
                 <input
                   type="text"
@@ -498,7 +499,7 @@ export function LLMConfigView() {
                   placeholder="https://api.openai.com/v1"
                   className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
                 />
-                <p className="text-[10px] text-gray-400 mt-1">{t('settings.llm.azureNote')}</p>
+                <p className="text-[10px] text-gray-600 dark:text-gray-400 mt-1">{t('settings.llm.azureNote')}</p>
               </div>
             )}
           </div>
@@ -523,7 +524,7 @@ export function LLMConfigView() {
             </div>
             <div>
               <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
-                {t('settings.llm.ollamaEndpoint')} <span className="text-gray-400">(optional)</span>
+                {t('settings.llm.ollamaEndpoint')} <span className="text-gray-500 dark:text-gray-400">{t('settings.llm.optional')}</span>
               </label>
               <input
                 type="text"
@@ -600,7 +601,7 @@ export function LLMConfigView() {
                     <thead className="sticky top-0 bg-gray-100 dark:bg-gray-800">
                       <tr>
                         {testResult.columns.map((col, i) => (
-                          <th key={i} className="px-2 py-1.5 text-left font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">{col}</th>
+                          <th key={i} className="px-2 py-1.5 text-left font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">{col}</th>
                         ))}
                       </tr>
                     </thead>
@@ -608,8 +609,8 @@ export function LLMConfigView() {
                       {(testResult.rows as unknown[][] || []).slice(0, 20).map((row, ri) => (
                         <tr key={ri} className="border-b border-gray-100 dark:border-gray-800">
                           {row.map((cell, ci) => (
-                            <td key={ci} className="px-2 py-1 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[260px] truncate" title={String(cell ?? '')}>
-                              {cell === null ? <span className="text-gray-300">—</span> : String(cell)}
+                            <td key={ci} className="px-2 py-1 align-top text-gray-900 dark:text-gray-100 max-w-[260px]">
+                              <ExpandableCell value={String(cell ?? '')} mono />
                             </td>
                           ))}
                         </tr>

@@ -192,7 +192,7 @@ export function S3ConfigView() {
           <Database className="w-5 h-5 text-blue-600 dark:text-blue-400" />
           <div>
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{t('settings.s3config.title')}</h2>
-            <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.s3config.subtitle')}</p>
+            <p className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.subtitle')}</p>
           </div>
         </div>
         {testResult?.valid && <StatusBadge status="ok" label="Connected" />}
@@ -205,13 +205,13 @@ export function S3ConfigView() {
           {/* Caller Identity */}
           <div className="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
             <div className="flex items-center gap-2 mb-1">
-              <ShieldCheck className="w-4 h-4 text-gray-500 dark:text-gray-400" />
+              <ShieldCheck className="w-4 h-4 text-gray-600 dark:text-gray-300" />
               <span className="text-sm font-medium text-gray-700 dark:text-gray-300">{t('settings.s3config.callerIdentity')}</span>
             </div>
-            {callerLoading && <span className="text-sm text-gray-500">{t('settings.s3config.fetching')}</span>}
+            {callerLoading && <span className="text-sm text-gray-600 dark:text-gray-300">{t('settings.s3config.fetching')}</span>}
             {callerError && <span className="text-sm text-amber-600 dark:text-amber-400">{callerError}</span>}
             {callerIdentity && (
-              <span className="text-sm"><span className="font-mono font-medium text-gray-900 dark:text-white">{callerIdentity.account_id}</span> <span className="text-xs text-gray-500">{callerIdentity.arn.split('/').pop()}</span></span>
+              <span className="text-sm"><span className="font-mono font-medium text-gray-900 dark:text-white">{callerIdentity.account_id}</span> <span className="text-xs text-gray-600 dark:text-gray-400">{callerIdentity.arn.split('/').pop()}</span></span>
             )}
           </div>
 
@@ -221,11 +221,11 @@ export function S3ConfigView() {
             <div className="grid grid-cols-2 gap-2">
               <label className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${mode === 'single' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'}`}>
                 <input type="radio" name="mode" checked={mode === 'single'} onChange={() => { setMode('single'); setOrgId(''); setDiscoveredAccounts([]) }} className="text-blue-600" />
-                <div><span className={`text-sm font-medium block ${mode === 'single' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.singleAccount')}</span><span className="text-xs text-gray-500">{t('settings.s3config.oneAccount')}</span></div>
+                <div><span className={`text-sm font-medium block ${mode === 'single' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.singleAccount')}</span><span className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.oneAccount')}</span></div>
               </label>
               <label className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${mode === 'control_tower' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'}`}>
                 <input type="radio" name="mode" checked={mode === 'control_tower'} onChange={() => setMode('control_tower')} className="text-blue-600" />
-                <div><span className={`text-sm font-medium block ${mode === 'control_tower' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.controlTower')}</span><span className="text-xs text-gray-500">{t('settings.s3config.multiAccount')}</span></div>
+                <div><span className={`text-sm font-medium block ${mode === 'control_tower' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.controlTower')}</span><span className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.multiAccount')}</span></div>
               </label>
             </div>
           </div>
@@ -258,7 +258,7 @@ export function S3ConfigView() {
           {/* Org ID — CT only */}
           {mode === 'control_tower' && (
             <div>
-              <label htmlFor="orgId" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{t('settings.s3config.orgId')} <span className="text-xs text-gray-400 font-normal">(e.g., o-hr33oy48b4)</span></label>
+              <label htmlFor="orgId" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{t('settings.s3config.orgId')} <span className="text-xs text-gray-500 dark:text-gray-400 font-normal">{t('settings.s3config.orgIdExample')}</span></label>
               <input id="orgId" type="text" value={orgId} onChange={(e) => setOrgId(e.target.value)} placeholder="o-xxxxxxxxxx" className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
           )}
@@ -321,13 +321,13 @@ export function S3ConfigView() {
 
             {/* CT mode: no accounts discovered yet */}
             {mode === 'control_tower' && !discoveringAccounts && discoveredAccounts.length === 0 && (
-              <p className="text-xs text-gray-500 dark:text-gray-400">{t('settings.s3config.clickDiscover')}</p>
+              <p className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.clickDiscover')}</p>
             )}
 
             {/* Selected accounts summary */}
             {mode === 'control_tower' && selectedAccounts.length > 0 && (
               <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
-                <span className="text-xs text-gray-500">{t('settings.s3config.accountsSelected', { count: selectedAccounts.length })}</span>
+                <span className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.accountsSelected', { count: selectedAccounts.length })}</span>
               </div>
             )}
           </div>

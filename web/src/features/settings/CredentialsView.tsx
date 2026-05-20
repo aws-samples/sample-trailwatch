@@ -19,11 +19,11 @@ interface CredentialResult {
   attempts: CredentialAttempt[]
 }
 
-const AUTH_METHODS: { value: AuthMethod; label: string; description: string; icon: string }[] = [
-  { value: 'imds', label: 'IMDS v2', description: 'EC2 Instance Role — no configuration needed', icon: '☁️' },
-  { value: 'session_credentials', label: 'Session Credentials', description: 'Paste temporary credentials from your AWS SSO portal', icon: '🔐' },
-  { value: 'sso', label: 'SSO Profile', description: 'Use a named profile from ~/.aws/config', icon: '🔑' },
-  { value: 'static', label: 'Static Keys', description: 'Permanent Access Key + Secret', icon: '📋' },
+const AUTH_METHODS: { value: AuthMethod; labelKey: string; descKey: string; icon: string }[] = [
+  { value: 'imds', labelKey: 'settings.credentials.method.imdsLabel', descKey: 'settings.credentials.method.imdsDesc', icon: '☁️' },
+  { value: 'session_credentials', labelKey: 'settings.credentials.method.sessionLabel', descKey: 'settings.credentials.method.sessionDesc', icon: '🔐' },
+  { value: 'sso', labelKey: 'settings.credentials.method.ssoLabel', descKey: 'settings.credentials.method.ssoDesc', icon: '🔑' },
+  { value: 'static', labelKey: 'settings.credentials.method.staticLabel', descKey: 'settings.credentials.method.staticDesc', icon: '📋' },
 ]
 
 export function CredentialsView() {
@@ -108,7 +108,7 @@ export function CredentialsView() {
 
   const applySessionCredentials = useCallback(async () => {
     if (!sessionAccessKeyId || !sessionSecretAccessKey || !sessionToken) {
-      setError('All three fields are required: Access Key ID, Secret Access Key, and Session Token')
+      setError(t('settings.credentials.errAllFieldsRequired'))
       return
     }
     setSaving(true)
@@ -173,7 +173,7 @@ export function CredentialsView() {
 
   const saveStaticAndValidate = useCallback(async () => {
     if (!accessKeyId || !secretAccessKey) {
-      setError('Both Access Key ID and Secret Access Key are required')
+      setError(t('settings.credentials.errBothKeysRequired'))
       return
     }
     setSaving(true)
@@ -221,7 +221,7 @@ export function CredentialsView() {
       <div className="flex items-center gap-3 px-6 py-4 border-b border-gray-200 dark:border-gray-700">
         <Shield className="w-5 h-5 text-blue-600 dark:text-blue-400" />
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{t('settings.credentials.title')}</h2>
-        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">
+        <span className="ml-auto text-xs text-gray-600 dark:text-gray-300">
           {t('settings.credentials.subtitle')}
         </span>
       </div>
@@ -258,10 +258,10 @@ export function CredentialsView() {
                     ? 'text-blue-700 dark:text-blue-300'
                     : 'text-gray-900 dark:text-white'
                 }`}>
-                  {m.label}
+                  {t(m.labelKey)}
                 </span>
-                <span className="text-xs text-gray-500 dark:text-gray-400 block truncate">
-                  {m.description}
+                <span className="text-xs text-gray-600 dark:text-gray-300 block truncate">
+                  {t(m.descKey)}
                 </span>
               </div>
               {activeMethod === m.value && (
@@ -317,7 +317,7 @@ export function CredentialsView() {
                         type="text"
                         value={sessionAccessKeyId}
                         onChange={(e) => setSessionAccessKeyId(e.target.value)}
-                        placeholder="Enter access key ID"
+                        placeholder={t('settings.credentials.phAccessKeyId')}
                         className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
                     </div>
@@ -342,7 +342,7 @@ export function CredentialsView() {
                         id="sessionToken"
                         value={sessionToken}
                         onChange={(e) => setSessionToken(e.target.value)}
-                        placeholder="Paste the full session token here..."
+                        placeholder={t('settings.credentials.phSessionToken')}
                         rows={3}
                         className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
                       />
@@ -404,7 +404,7 @@ export function CredentialsView() {
                         type="text"
                         value={accessKeyId}
                         onChange={(e) => setAccessKeyId(e.target.value)}
-                        placeholder="Enter access key ID"
+                        placeholder={t('settings.credentials.phAccessKeyId')}
                         className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
                     </div>
