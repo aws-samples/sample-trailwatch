@@ -71,5 +71,11 @@ func (s *SessionSpend) Record(estimatedUSD, actualUSD float64) {
 func (s *SessionSpend) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	*s = SessionSpend{startedAt: time.Now()}
+	s.queries = 0
+	s.estimatedUSD = 0
+	s.actualUSD = 0
+	s.startedAt = time.Now()
+	s.lastQueryAt = time.Time{}
+	s.lastQueryUSD = 0
+	s.exceededEstCnt = 0
 }
