@@ -1,7 +1,10 @@
 import { useState, useCallback, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Menu } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import { SessionSpendChip } from '../comm/SessionSpendChip'
+
+const SIDEBAR_COLLAPSED_KEY = 'cloudtrail-analyzer-sidebar-collapsed'
 
 export interface NavigationContext {
   promptId?: string
@@ -39,6 +42,16 @@ export function Layout({ children }: LayoutProps) {
   const [activeView, setActiveView] = useState<string>(readInitialView)
   const [navContext, setNavContext] = useState<NavigationContext>({})
   const [account, setAccount] = useState<string>('')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+  })
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed(prev => {
+      const next = !prev
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? '1' : '0')
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     fetch('/api/settings')
@@ -57,6 +70,15 @@ export function Layout({ children }: LayoutProps) {
     <div className="h-screen flex flex-col bg-[#f2f3f3] dark:bg-[#0f1b2d]">
       {/* AWS-style top navigation bar */}
       <header className="h-10 flex items-center px-4 bg-[#232f3e] dark:bg-[#1a242f] border-b border-[#3b4a5a] flex-shrink-0 z-20">
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          aria-label={sidebarCollapsed ? t('app.nav.expandSidebar') : t('app.nav.collapseSidebar')}
+          title={sidebarCollapsed ? t('app.nav.expandSidebar') : t('app.nav.collapseSidebar')}
+          className="mr-3 p-1 rounded text-gray-300 hover:text-white hover:bg-white/10"
+        >
+          <Menu className="w-4 h-4" />
+        </button>
         <div className="flex items-center gap-3 flex-1">
           <span className="text-[13px] font-medium text-white">{t('app.nav.cloudtrail')} {t('app.nav.securityInsights')}</span>
           <span className="text-[11px] text-gray-400">|</span>
@@ -75,9 +97,11 @@ export function Layout({ children }: LayoutProps) {
 
       <div className="flex flex-1 min-h-0">
         {/* Sidebar */}
-        <div className="w-52 flex-shrink-0">
-          <Sidebar activeView={activeView} onNavigate={(id) => handleNavigate(id)} />
-        </div>
+        {!sidebarCollapsed && (
+          <div className="w-52 flex-shrink-0">
+            <Sidebar activeView={activeView} onNavigate={(id) => handleNavigate(id)} />
+          </div>
+        )}
         {/* Main content */}
         <div className="flex-1 min-w-0 overflow-hidden">
           <div className="h-full overflow-auto">

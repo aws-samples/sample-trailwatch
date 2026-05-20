@@ -77,6 +77,18 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
   const presetsPopover = usePopover()
   const accountsPopover = usePopover()
 
+  // Close the other popover whenever this one opens, so they cannot render
+  // simultaneously and overlap. Effects compare to a ref to detect open
+  // transitions and avoid an infinite close-each-other loop.
+  useEffect(() => {
+    if (presetsPopover.isOpen) accountsPopover.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presetsPopover.isOpen])
+  useEffect(() => {
+    if (accountsPopover.isOpen) presetsPopover.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountsPopover.isOpen])
+
   // Surface state to the parent on every change so it can scope scenario
   // runs and trigger the seed-driven scenario reorder.
   useEffect(() => {
