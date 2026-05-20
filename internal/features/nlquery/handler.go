@@ -262,10 +262,12 @@ type ExecuteRequest struct {
 }
 
 type ExecuteResponse struct {
-	SQL     string          `json:"sql"`
-	Columns []string        `json:"columns"`
-	Rows    [][]interface{} `json:"rows"`
-	Error   string          `json:"error,omitempty"`
+	SQL          string          `json:"sql"`
+	Columns      []string        `json:"columns"`
+	Rows         [][]interface{} `json:"rows"`
+	Error        string          `json:"error,omitempty"`
+	ErrorHint    string          `json:"error_hint,omitempty"`    // user-facing summary
+	ErrorDetail  string          `json:"error_detail,omitempty"`  // raw engine output, collapsible
 }
 
 func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {

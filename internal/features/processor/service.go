@@ -173,7 +173,7 @@ func (s *Service) StartProcessing(ctx context.Context, sessionID string, progres
 
 	objects, totalSize, err := listObjects(pipelineCtx, client, session)
 	if err != nil {
-		s.failSession(sessionID, progressCh, "Failed to list S3 objects")
+		s.terminate(pipelineCtx, sessionID, "listing", progressCh, "Failed to list S3 objects")
 		return fmt.Errorf("listing objects: %w", err)
 	}
 
@@ -217,16 +217,10 @@ func (s *Service) StartProcessing(ctx context.Context, sessionID string, progres
 	dataDir := s.cfg.DataDir
 	err = s.downloadAndExtract(pipelineCtx, client, session, objects, dataDir, concurrency, totalSize, progressCh)
 	if err != nil {
+		s.terminate(pipelineCtx, sessionID, "downloading", progressCh, "Download/extraction failed")
 		if pipelineCtx.Err() != nil {
-			_ = sessions.UpdateState(s.db, sessionID, sessions.StateInterrupted)
-			s.sendProgress(progressCh, ProcessingProgress{
-				SessionID: sessionID,
-				Phase:     "downloading",
-				Message:   "Processing cancelled",
-			})
 			return fmt.Errorf("processing cancelled: %w", err)
 		}
-		s.failSession(sessionID, progressCh, "Download/extraction failed")
 		return fmt.Errorf("download and extract: %w", err)
 	}
 
@@ -237,7 +231,7 @@ func (s *Service) StartProcessing(ctx context.Context, sessionID string, progres
 
 	totalVerified, diskBytes, failedFiles, err := verifyFiles(pipelineCtx, session, dataDir, progressCh)
 	if err != nil {
-		s.failSession(sessionID, progressCh, "Verification failed")
+		s.terminate(pipelineCtx, sessionID, "verifying", progressCh, "Verification failed")
 		return fmt.Errorf("verifying files: %w", err)
 	}
 
@@ -506,6 +500,22 @@ func (s *Service) failSession(sessionID string, progressCh chan<- ProcessingProg
 		Phase:     "failed",
 		Message:   message,
 	})
+}
+
+// terminate routes a phase error to either interrupted or failed based on
+// whether the context was cancelled. Cancellation is a user action, not a
+// fault — the UI shows it differently from a true failure.
+func (s *Service) terminate(ctx context.Context, sessionID string, phase string, progressCh chan<- ProcessingProgress, failMessage string) {
+	if ctx.Err() != nil {
+		_ = sessions.UpdateState(s.db, sessionID, sessions.StateInterrupted)
+		s.sendProgress(progressCh, ProcessingProgress{
+			SessionID: sessionID,
+			Phase:     phase,
+			Message:   "Processing cancelled",
+		})
+		return
+	}
+	s.failSession(sessionID, progressCh, failMessage)
 }
 
 // sendProgress sends a progress event to the channel without blocking.

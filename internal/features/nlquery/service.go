@@ -40,9 +40,12 @@ func (s *Service) Execute(ctx context.Context, prompt string) (*ExecuteResponse,
 
 	columns, rows, err := s.executeDuckDB(ctx, sql)
 	if err != nil {
+		hint, detail := classifyDuckDBError(err)
 		return &ExecuteResponse{
-			SQL:   sql,
-			Error: err.Error(),
+			SQL:         sql,
+			Error:       err.Error(),
+			ErrorHint:   hint,
+			ErrorDetail: detail,
 		}, nil
 	}
 
@@ -197,6 +200,34 @@ func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]
 	}
 
 	return columns, rows, nil
+}
+
+// classifyDuckDBError turns a raw DuckDB error into a user-facing hint plus
+// the raw detail. Hints are tuned for the common LLM-generated SQL failures
+// (missing columns, type mismatches, syntax errors, timeouts) so a non-SQL
+// analyst sees an actionable next step without losing the underlying message.
+func classifyDuckDBError(err error) (hint, detail string) {
+	if err == nil {
+		return "", ""
+	}
+	detail = err.Error()
+	switch {
+	case strings.Contains(detail, "Binder Error") && strings.Contains(detail, "Could not find"):
+		hint = "The AI generated a query that references a field this dataset doesn't have. Try rephrasing your question or naming the field more precisely."
+	case strings.Contains(detail, "Binder Error"):
+		hint = "The AI generated SQL the database couldn't validate. Try rephrasing your question."
+	case strings.Contains(detail, "Catalog Error"):
+		hint = "The AI referenced a table or function that doesn't exist here. Try rephrasing or asking a simpler question."
+	case strings.Contains(detail, "Parser Error"), strings.Contains(detail, "Syntax Error"):
+		hint = "The AI generated invalid SQL. Try rephrasing your question."
+	case strings.Contains(detail, "Conversion Error"), strings.Contains(detail, "Invalid Input"):
+		hint = "The AI tried to use a value the database couldn't convert (e.g. wrong type or format). Try rephrasing."
+	case strings.Contains(detail, "context deadline exceeded"), strings.Contains(detail, "signal: killed"):
+		hint = "The query took too long and was cancelled. Try narrowing the time range or filtering by account."
+	default:
+		hint = "The query failed. See the technical detail for more."
+	}
+	return hint, detail
 }
 
 func (s *Service) buildSystemPrompt() string {
