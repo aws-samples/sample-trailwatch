@@ -66,9 +66,14 @@ info "Detected architecture: $ARCH (Go: linux/$GOARCH)"
 # Step 1: System packages
 # ---------------------------------------------------------------------------
 info "Updating system packages..."
-dnf update -y -q 2>/dev/null || yum update -y -q 2>/dev/null
-dnf install -y -q git gcc gcc-c++ make unzip tar gzip wget curl 2>/dev/null \
-    || yum install -y -q git gcc gcc-c++ make unzip tar gzip wget curl 2>/dev/null
+# AL2023 ships curl-minimal which already provides /usr/bin/curl. Asking for
+# 'curl' here without --allowerasing causes a hard conflict and silent exit
+# under set -e. Use --allowerasing so dnf swaps curl-minimal for curl when
+# needed; on systems without the conflict it is a no-op.
+# Stderr is intentionally NOT redirected so failures surface during deploy.
+dnf update -y || fail "dnf update failed; check network/repos"
+dnf install -y --allowerasing git gcc gcc-c++ make unzip tar gzip wget curl \
+    || fail "dnf install failed; check the error above"
 ok "System packages up to date"
 
 # ---------------------------------------------------------------------------
@@ -176,6 +181,17 @@ ok "Directories created: $APP_DIR, $DATA_DIR"
 info "Copying source code to ${APP_DIR}..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Verify the source tree is complete BEFORE rsync. A surprisingly common
+# breakage when teams ship the project as a zip is missing top-level
+# directories (the zip archive truncates large folders, or a re-packed
+# archive omits a path). Fail loudly with the missing path rather than
+# letting the next "cd ${APP_DIR}/web" fail with a cryptic message.
+for required in cmd internal web web/package.json go.mod; do
+    if [[ ! -e "${SCRIPT_DIR}/${required}" ]]; then
+        fail "Source tree is incomplete: missing ${SCRIPT_DIR}/${required}. Re-extract the project zip or re-clone the repo."
+    fi
+done
+
 # Copy project files (excluding node_modules, build artifacts, data)
 rsync -a --delete \
     --exclude='node_modules' \
@@ -185,6 +201,11 @@ rsync -a --delete \
     --exclude='analyzer' \
     "${SCRIPT_DIR}/" "${APP_DIR}/"
 ok "Source code copied"
+
+# Belt-and-braces: confirm the destination has what Step 7+8 need.
+if [[ ! -d "${APP_DIR}/web" || ! -f "${APP_DIR}/web/package.json" ]]; then
+    fail "Copy completed but ${APP_DIR}/web is missing. Check rsync excludes and source tree."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 7: Build frontend
