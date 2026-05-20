@@ -17,6 +17,8 @@ const resources = {
       // Navigation
       'app.nav.account': 'Account:',
       'app.nav.region': 'Region:',
+      'app.nav.collapseSidebar': 'Collapse sidebar',
+      'app.nav.expandSidebar': 'Expand sidebar',
 
       // Dashboard
       'security.dashboard.title': 'Security Findings',
@@ -236,6 +238,12 @@ const resources = {
       'cell.copied': 'Copied',
       'cell.useAsSeed': 'Use as seed',
       'cell.detectedAs': 'Detected as {{type}}',
+      'table.exportCsv': 'Export CSV',
+      'table.exportJson': 'Export JSON',
+      'security.investigate.copyRowAsJson': 'Copy row as JSON',
+      'security.investigate.noResultsFiltered': 'No results matched your filters ({{filters}}). Try widening the time window or clearing account filters.',
+      'security.investigate.filterTime': 'time range',
+      'security.investigate.filterAccounts': '{{count}} accounts',
       'security.investigate.pivotToast.title': 'Seed set:',
       'security.investigate.pivotToast.hint': '{{count}} scenarios match — see recommendations below',
       'security.investigate.recommended.title': 'Recommended next steps',

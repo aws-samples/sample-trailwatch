@@ -14,10 +14,59 @@
 
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, ArrowRight, Loader2, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Check, Copy, Loader2, Sparkles, X } from 'lucide-react'
 import { endpoints } from '../../config/api'
 import { CostBanner } from '../../comm/CostBanner'
 import type { SeedType } from './seedDetection'
+
+// Click-to-expand value cell for the summary panel. Collapsed: single-line
+// truncated. Expanded: full value wraps + Copy button. Sized for the 400px
+// fixed panel where ARNs (~120 chars) overflow.
+function ExpandValue({ value, mono = true }: { value: string; mono?: boolean }) {
+  const { t } = useTranslation()
+  const [expanded, setExpanded] = useState(false)
+  const [copied, setCopied] = useState(false)
+  async function copy(e: React.MouseEvent) {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard may be denied */ }
+  }
+  if (!expanded) {
+    return (
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        title={t('cell.clickToExpand')}
+        className={`flex-1 text-left truncate cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded px-1 -mx-1 ${mono ? 'font-mono' : ''} text-[11px] text-gray-900 dark:text-gray-100`}
+      >
+        {value}
+      </button>
+    )
+  }
+  return (
+    <span className="flex-1 min-w-0">
+      <button
+        type="button"
+        onClick={() => setExpanded(false)}
+        title={t('cell.clickToCollapse')}
+        className={`block w-full text-left break-all cursor-pointer ${mono ? 'font-mono' : ''} text-[11px] text-gray-900 dark:text-gray-100`}
+      >
+        {value}
+      </button>
+      <button
+        type="button"
+        onClick={copy}
+        className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-800"
+      >
+        {copied ? <Check className="w-3 h-3 text-green-600" /> : <Copy className="w-3 h-3" />}
+        {copied ? t('cell.copied') : t('cell.copy')}
+      </button>
+    </span>
+  )
+}
 
 interface Finding {
   severity: 'high' | 'medium' | 'low' | 'info' | string
@@ -295,12 +344,7 @@ export function SummaryPanel({
                         <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-mono bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 shrink-0">
                           {e.kind}
                         </span>
-                        <span
-                          className="flex-1 font-mono text-[11px] text-gray-900 dark:text-gray-100 truncate"
-                          title={e.value}
-                        >
-                          {e.value}
-                        </span>
+                        <ExpandValue value={e.value} />
                         {e.count > 0 && (
                           <span className="text-[10px] text-gray-500 dark:text-gray-400 shrink-0 tabular-nums">
                             ×{e.count}
@@ -340,9 +384,7 @@ export function SummaryPanel({
                       <li key={i} className="text-[12px] leading-snug">
                         <div className="text-gray-700 dark:text-gray-300">{p.reason}</div>
                         <div className="mt-0.5 flex items-center gap-2">
-                          <span className="font-mono text-[11px] text-gray-900 dark:text-gray-100 truncate" title={p.value}>
-                            {p.value}
-                          </span>
+                          <ExpandValue value={p.value} />
                           {canPivot && (
                             <button
                               type="button"

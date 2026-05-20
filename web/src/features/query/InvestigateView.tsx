@@ -11,6 +11,7 @@ import { seedTypeLabel, type SeedType } from './seedDetection'
 import { ExpandableCell } from '../../comm/ExpandableCell'
 import type { NavigationContext } from '../../arc/Layout'
 import { Sparkles } from 'lucide-react'
+import { exportRowsAsCSV, exportRowsAsJSON } from './tableExport'
 
 interface Scenario {
   id: string
@@ -164,6 +165,22 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
       return next
     })
   }, [])
+
+  // Track which row has its "copied" check shown. Single-row scope is fine —
+  // an analyst copies one row at a time during incident handoff.
+  const [copiedRow, setCopiedRow] = useState<number | null>(null)
+  const copyRowAsJSON = useCallback(async (ri: number) => {
+    if (!result?.columns || !result.rows) return
+    const row = result.rows[ri]
+    if (!row) return
+    const obj: Record<string, unknown> = {}
+    result.columns.forEach((c, i) => { obj[c] = row[i] ?? null })
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(obj, null, 2))
+      setCopiedRow(ri)
+      setTimeout(() => setCopiedRow(prev => (prev === ri ? null : prev)), 1500)
+    } catch { /* clipboard may be denied */ }
+  }, [result])
 
   // beginColumnResize wires up document-level mousemove + mouseup listeners
   // so the user can keep dragging even when the cursor leaves the small
@@ -440,7 +457,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                     disabled={running}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[11px] rounded border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 hover:bg-amber-100 dark:hover:bg-amber-900/30 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    <span className={`px-1 py-0.5 text-[8px] font-bold uppercase rounded ${SEVERITY_BADGE[s.severity] || 'bg-gray-500 text-white'}`}>{s.severity}</span>
+                    <span className={`px-1 py-0.5 text-[10px] font-bold uppercase rounded ${SEVERITY_BADGE[s.severity] || 'bg-gray-500 text-white'}`}>{s.severity}</span>
                     <span className="font-medium">{s.name}</span>
                     <Play className="w-3 h-3 text-blue-600 dark:text-blue-400" />
                   </button>
@@ -534,7 +551,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                 >
                   <div className="flex items-center gap-1.5 mb-0.5">
                     <span className="text-[12px] font-medium text-gray-900 dark:text-white">{s.name}</span>
-                    <span className={`px-1 py-0.5 text-[8px] font-bold uppercase rounded ${SEVERITY_BADGE[s.severity] || 'bg-gray-500 text-white'}`}>{s.severity}</span>
+                    <span className={`px-1 py-0.5 text-[10px] font-bold uppercase rounded ${SEVERITY_BADGE[s.severity] || 'bg-gray-500 text-white'}`}>{s.severity}</span>
                     {matchesSeed && (
                       <span className="px-1 py-0.5 text-[8px] font-semibold uppercase rounded bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-200">
                         {t('security.investigate.matchesSeed')}
@@ -598,7 +615,13 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                       type="text"
                       value={paramValue}
                       onChange={e => setParamValue(e.target.value)}
-                      placeholder={`Or paste ${selectedScenario.param_label} here...`}
+                      onKeyDown={e => {
+                        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !running && paramValue) {
+                          e.preventDefault()
+                          runScenario()
+                        }
+                      }}
+                      placeholder={`Or paste ${selectedScenario.param_label} here... (${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+Enter to run)`}
                       className="w-full mt-2 px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:outline-none"
                     />
                   </div>
@@ -607,6 +630,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                 <button
                   onClick={runScenario}
                   disabled={running || (selectedScenario.param_type !== 'none' && !paramValue)}
+                  title={navigator.platform.includes('Mac') ? '⌘+Enter' : 'Ctrl+Enter'}
                   className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded bg-[#0972d3] text-white hover:bg-[#0860b0] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -663,8 +687,27 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                           ? t('security.investigate.collapseAllRows')
                           : t('security.investigate.expandAllRows')}
                       </button>
+                      {(result.rows?.length || 0) > 0 && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => exportRowsAsCSV(result.columns!, (result.rows || []) as (string|number|null)[][], `investigate-${selectedScenario.id}`)}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                          >
+                            {t('table.exportCsv')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => exportRowsAsJSON(result.columns!, (result.rows || []) as (string|number|null)[][], `investigate-${selectedScenario.id}`)}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[10px] rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                          >
+                            {t('table.exportJson')}
+                          </button>
+                        </>
+                      )}
                       <span className="text-[10px] text-gray-400">{t('security.investigate.tableHint')}</span>
                     </div>
+                    <div className="relative">
                     <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-auto max-h-[60vh]">
                       {/* table-fixed=false: cells get min-width but can grow to fit
                           content, and the surrounding div scrolls horizontally
@@ -672,7 +715,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                       <table className="text-[11px] border-collapse">
                         <thead className="sticky top-0 z-10">
                           <tr className="bg-gray-100 dark:bg-gray-800">
-                            <th className="w-6 px-1 py-2 border-b border-gray-200 dark:border-gray-700"></th>
+                            <th className="w-12 px-1 py-2 border-b border-gray-200 dark:border-gray-700"></th>
                             {result.columns.map((col, i) => {
                               const overrideWidth = colWidths[col]
                               const effectiveStyle: React.CSSProperties = overrideWidth
@@ -704,9 +747,9 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                                       })
                                     }}
                                     title="Drag to resize · Double-click to reset"
-                                    className="absolute top-0 right-0 h-full w-2 cursor-col-resize select-none group"
+                                    className="absolute top-0 -right-1 h-full w-3 cursor-col-resize select-none group"
                                   >
-                                    <span className="absolute right-0 top-1 bottom-1 w-px bg-gray-300 dark:bg-gray-600 group-hover:w-0.5 group-hover:bg-blue-500" />
+                                    <span className="absolute right-1 top-1 bottom-1 w-px bg-gray-300 dark:bg-gray-600 group-hover:w-0.5 group-hover:bg-blue-500" />
                                   </span>
                                 </th>
                               )
@@ -718,15 +761,26 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                             const expanded = wrapAllRows || expandedRows.has(ri)
                             return (
                               <tr key={ri} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50">
-                                <td className="w-6 px-1 py-1 align-top">
-                                  <button
-                                    type="button"
-                                    onClick={() => toggleRow(ri)}
-                                    aria-label={expanded ? 'Collapse row' : 'Expand row'}
-                                    className="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 p-0.5"
-                                  >
-                                    {expanded ? '▾' : '▸'}
-                                  </button>
+                                <td className="w-12 px-1 py-1 align-top">
+                                  <div className="flex items-center gap-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleRow(ri)}
+                                      aria-label={expanded ? 'Collapse row' : 'Expand row'}
+                                      className="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 p-0.5"
+                                    >
+                                      {expanded ? '▾' : '▸'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => copyRowAsJSON(ri)}
+                                      title={t('security.investigate.copyRowAsJson')}
+                                      aria-label={t('security.investigate.copyRowAsJson')}
+                                      className="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 p-0.5 text-[10px]"
+                                    >
+                                      {copiedRow === ri ? '✓' : '⎘'}
+                                    </button>
+                                  </div>
                                 </td>
                                 {row.map((cell: any, ci: number) => {
                                   const colName = result.columns?.[ci] || ''
@@ -765,6 +819,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                         </tbody>
                       </table>
                     </div>
+                    {/* Right-edge gradient hint — signals additional columns off-screen.
+                        pointer-events-none so it never blocks scroll/clicks. */}
+                    <div aria-hidden className="pointer-events-none absolute top-0 right-0 h-full w-6 rounded-r-lg bg-gradient-to-l from-white/80 dark:from-gray-900/80 to-transparent" />
+                    </div>
 
                     {result.sql && (
                       <details className="mt-3">
@@ -778,7 +836,18 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                 {result && !result.error && (!result.columns || result.columns.length === 0) && (
                   <div className="p-8 text-center">
                     <p className="text-sm text-gray-500">{t('security.investigate.noResults')}</p>
-                    <p className="text-xs text-gray-400 mt-1">{t('security.investigate.noResultsHint')}</p>
+                    {(toolbar.timeStart || toolbar.timeEnd || toolbar.accountIds.length > 0) ? (
+                      <p className="text-xs text-gray-400 mt-1">
+                        {t('security.investigate.noResultsFiltered', {
+                          filters: [
+                            (toolbar.timeStart || toolbar.timeEnd) && t('security.investigate.filterTime'),
+                            toolbar.accountIds.length > 0 && t('security.investigate.filterAccounts', { count: toolbar.accountIds.length }),
+                          ].filter(Boolean).join(' · '),
+                        })}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-gray-400 mt-1">{t('security.investigate.noResultsHint')}</p>
+                    )}
                   </div>
                 )}
               </div>
@@ -865,7 +934,8 @@ function ActiveFiltersStrip({
         {hasSeed && (
           <ActiveChip
             label={t('investigateToolbar.active.seed', { type: seedTypeLabel(seedType) })}
-            value={truncate(seed, 32)}
+            value={truncate(seed, 60)}
+            fullValue={seed}
             onClear={onClearSeed}
           />
         )}
@@ -874,9 +944,9 @@ function ActiveFiltersStrip({
   )
 }
 
-function ActiveChip({ label, value, onClear }: { label: string; value: string; onClear: () => void }) {
+function ActiveChip({ label, value, onClear, fullValue }: { label: string; value: string; onClear: () => void; fullValue?: string }) {
   return (
-    <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-full border border-blue-200 dark:border-blue-800 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300">
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-full border border-blue-200 dark:border-blue-800 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300" title={fullValue}>
       <span className="text-gray-500 dark:text-gray-400">{label}:</span>
       <span className="font-medium">{value}</span>
       <button

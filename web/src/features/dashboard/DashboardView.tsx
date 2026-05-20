@@ -8,6 +8,8 @@ import { RefreshCw, ExternalLink, ShieldAlert, AlertTriangle, Info, Loader2 } fr
 import { endpoints } from '../../config/api'
 import { readApiError } from '../../comm/apiError'
 import { AccountLabel } from '../../comm/AccountLabel'
+import { ExpandableCell } from '../../comm/ExpandableCell'
+import { exportRowsAsCSV, exportRowsAsJSON } from '../query/tableExport'
 import type { NavigationContext } from '../../arc/Layout'
 
 interface QueryPanel {
@@ -242,7 +244,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
   return (
     <div className="h-full overflow-y-auto bg-gray-50 dark:bg-gray-950">
       {/* Header */}
-      <div className="sticky top-0 z-10 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 px-6 py-3 shadow-sm">
+      <div className="sticky top-0 z-20 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 px-6 py-3 shadow-sm">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-base font-semibold text-gray-900 dark:text-white">{t('security.dashboard.title')}</h1>
@@ -357,14 +359,34 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                       <>
                         <div className="flex items-center justify-between mb-2">
                           <span className="text-[11px] text-gray-500">{t('security.dashboard.results', { count: findingDetail.rows?.length || 0 })}</span>
-                          {finding.scenarioId && (
-                            <button
-                              onClick={(e) => { e.stopPropagation(); navigate('pre-built-queries', { scenarioId: finding.scenarioId }) }}
-                              className="text-[11px] text-blue-600 hover:underline font-medium"
-                            >
-                              {t('security.dashboard.openInQueryView')}
-                            </button>
-                          )}
+                          <div className="flex items-center gap-3">
+                            {(findingDetail.rows?.length || 0) > 0 && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); exportRowsAsCSV(findingDetail.columns!, findingDetail.rows || [], `finding-${finding.id}`) }}
+                                  className="text-[11px] text-gray-600 dark:text-gray-300 hover:underline"
+                                >
+                                  {t('table.exportCsv')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); exportRowsAsJSON(findingDetail.columns!, findingDetail.rows || [], `finding-${finding.id}`) }}
+                                  className="text-[11px] text-gray-600 dark:text-gray-300 hover:underline"
+                                >
+                                  {t('table.exportJson')}
+                                </button>
+                              </>
+                            )}
+                            {finding.scenarioId && (
+                              <button
+                                onClick={(e) => { e.stopPropagation(); navigate('pre-built-queries', { scenarioId: finding.scenarioId }) }}
+                                className="text-[11px] text-blue-600 hover:underline font-medium"
+                              >
+                                {t('security.dashboard.openInQueryView')}
+                              </button>
+                            )}
+                          </div>
                         </div>
                         <div className="overflow-auto max-h-60 border border-gray-200 dark:border-gray-700 rounded">
                           <table className="w-full text-[11px]">
@@ -385,14 +407,14 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                                     const isAccountValue = /^\d{12}$/.test(cellStr)
                                     if (isAccountCol && isAccountValue) {
                                       return (
-                                        <td key={ci} className="px-2 py-1 text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[260px] truncate" title={cellStr}>
+                                        <td key={ci} className="px-2 py-1 align-top text-gray-900 dark:text-gray-100 max-w-[260px]">
                                           <AccountLabel accountId={cellStr} />
                                         </td>
                                       )
                                     }
                                     return (
-                                      <td key={ci} className="px-2 py-1 font-mono text-gray-900 dark:text-gray-100 whitespace-nowrap max-w-[200px] truncate" title={cellStr}>
-                                        {cell === null ? <span className="text-gray-300">—</span> : cellStr}
+                                      <td key={ci} className="px-2 py-1 align-top text-gray-900 dark:text-gray-100 max-w-[280px]">
+                                        <ExpandableCell value={cellStr} mono />
                                       </td>
                                     )
                                   })}

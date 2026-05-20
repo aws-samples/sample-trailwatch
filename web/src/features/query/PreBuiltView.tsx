@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { endpoints } from '../../config/api'
+import { ExpandableCell } from '../../comm/ExpandableCell'
+import { exportRowsAsCSV, exportRowsAsJSON } from './tableExport'
 
 interface PromptTemplate {
   id: string
@@ -342,8 +344,28 @@ export function PreBuiltView({ autoRunPromptId }: PreBuiltViewProps) {
                 {/* Results table */}
                 {queryResult.columns && queryResult.columns.length > 0 && (
                   <div className="flex-1 overflow-auto px-4 py-2">
-                    <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
-                      {queryResult.rows?.length || 0} row{(queryResult.rows?.length || 0) !== 1 ? 's' : ''} returned
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-xs text-gray-500 dark:text-gray-400">
+                        {queryResult.rows?.length || 0} row{(queryResult.rows?.length || 0) !== 1 ? 's' : ''} returned
+                      </div>
+                      {(queryResult.rows?.length || 0) > 0 && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => exportRowsAsCSV(queryResult.columns, queryResult.rows || [], 'prebuilt-query')}
+                            className="text-[11px] px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                          >
+                            {t('table.exportCsv')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => exportRowsAsJSON(queryResult.columns, queryResult.rows || [], 'prebuilt-query')}
+                            className="text-[11px] px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                          >
+                            {t('table.exportJson')}
+                          </button>
+                        </div>
+                      )}
                     </div>
                     <div className="overflow-auto border border-gray-200 dark:border-gray-700 rounded">
                       <table className="w-full text-xs">
@@ -360,8 +382,8 @@ export function PreBuiltView({ autoRunPromptId }: PreBuiltViewProps) {
                           {(queryResult.rows || []).map((row, ri) => (
                             <tr key={ri} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                               {row.map((cell, ci) => (
-                                <td key={ci} className="px-3 py-1.5 text-gray-900 dark:text-gray-100 font-mono whitespace-nowrap max-w-xs truncate" title={String(cell ?? '')}>
-                                  {cell === null ? <span className="text-gray-400">&mdash;</span> : String(cell)}
+                                <td key={ci} className="px-3 py-1.5 align-top text-gray-900 dark:text-gray-100 max-w-xs">
+                                  <ExpandableCell value={String(cell ?? '')} mono />
                                 </td>
                               ))}
                             </tr>
