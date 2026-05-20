@@ -220,6 +220,17 @@ export function DashboardView({ navigate }: DashboardViewProps) {
 
   const filteredFindings = selectedSeverity === 'ALL' ? FINDINGS : FINDINGS.filter(f => f.severity === selectedSeverity)
 
+  // Group findings by category so an analyst scanning the page sees IAM,
+  // Network, Data Access etc. as distinct sections rather than one flat
+  // list. Order categories by their first finding's appearance in FINDINGS
+  // so severity-driven ordering is preserved within each section.
+  const groupedFindings = filteredFindings.reduce<{ category: string; findings: typeof FINDINGS }[]>((acc, f) => {
+    const existing = acc.find(g => g.category === f.category)
+    if (existing) existing.findings.push(f)
+    else acc.push({ category: f.category, findings: [f] })
+    return acc
+  }, [])
+
   function getFindingCount(id: string): string {
     const s = findingSummaries[id]
     if (!s?.rows?.length) return findingsLoading ? '...' : '0'
@@ -308,9 +319,13 @@ export function DashboardView({ navigate }: DashboardViewProps) {
           <FilterPill label="Low" count={severityCounts.LOW} active={selectedSeverity === 'LOW'} onClick={() => setSelectedSeverity('LOW')} color="text-blue-700 bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300" />
         </div>
 
-        {/* Findings list */}
-        <div className="space-y-1">
-          {filteredFindings.map(finding => {
+        {/* Findings list — grouped by category */}
+        <div className="space-y-4">
+          {groupedFindings.map(group => (
+          <div key={group.category}>
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1.5 px-1">{group.category}</div>
+            <div className="space-y-1">
+          {group.findings.map(finding => {
             const style = SEVERITY_STYLES[finding.severity]
             const Icon = style.icon
             const count = getFindingCount(finding.id)
@@ -328,8 +343,7 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <h4 className="text-sm font-medium text-gray-900 dark:text-white">{finding.title}</h4>
-                      <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase rounded ${style.badge}`}>{finding.severity}</span>
-                      <span className="text-[10px] text-gray-400 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded">{finding.category}</span>
+                      <span className={`px-1.5 py-0.5 text-[10px] font-bold uppercase rounded ${style.badge}`}>{finding.severity}</span>
                     </div>
                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">{finding.description}</p>
                   </div>
@@ -438,6 +452,9 @@ export function DashboardView({ navigate }: DashboardViewProps) {
               </div>
             )
           })}
+            </div>
+          </div>
+          ))}
         </div>
       </div>
     </div>

@@ -553,7 +553,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                     <span className="text-[12px] font-medium text-gray-900 dark:text-white">{s.name}</span>
                     <span className={`px-1 py-0.5 text-[10px] font-bold uppercase rounded ${SEVERITY_BADGE[s.severity] || 'bg-gray-500 text-white'}`}>{s.severity}</span>
                     {matchesSeed && (
-                      <span className="px-1 py-0.5 text-[8px] font-semibold uppercase rounded bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-200">
+                      <span className="px-1 py-0.5 text-[10px] font-semibold uppercase rounded bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-200">
                         {t('security.investigate.matchesSeed')}
                       </span>
                     )}
