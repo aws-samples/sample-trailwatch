@@ -226,8 +226,25 @@ func main() {
 	r.Post("/api/investigate/run", investigateHandler.RunScenario)
 
 	// Catch-all: unknown /api/* paths return JSON 404 so client code parsing
-	// errors as JSON doesn't choke on the dev HTML placeholder. Non-API paths
-	// continue to serve the dev landing page (production builds replace this).
+	// errors as JSON doesn't choke on HTML output. Non-API paths fall through
+	// to the embedded SPA handler when a frontend bundle is present (production
+	// builds populate cmd/analyzer/dist via deploy.sh / Makefile); otherwise
+	// they render the dev-mode placeholder so a `go run` against an empty
+	// dist/ still gives the developer a useful page.
+	dist, distOK := distFS()
+	var spa http.Handler
+	if distOK {
+		spa = spaHandler(dist)
+		slog.Info("serving embedded frontend",
+			"component", "cloudtrail-analyzer",
+		)
+	} else {
+		slog.Warn("no embedded frontend bundle found; serving dev placeholder",
+			"component", "cloudtrail-analyzer",
+			"hint", "run `npm run build` and copy web/dist to cmd/analyzer/dist before `go build`, or use `make dev` for hot-reload",
+		)
+	}
+
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasPrefix(req.URL.Path, "/api/") {
 			render.JSON(w, http.StatusNotFound, map[string]string{
@@ -237,9 +254,13 @@ func main() {
 			})
 			return
 		}
+		if spa != nil {
+			spa.ServeHTTP(w, req)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`<html><body><h1>CloudTrail Analyzer API</h1><p>Use Vite dev server at <a href="http://localhost:5173">http://localhost:5173</a> for the UI.</p></body></html>`))
+		w.Write([]byte(`<html><body><h1>CloudTrail Analyzer API</h1><p>No frontend bundle is embedded. Use the Vite dev server at <a href="http://localhost:5173">http://localhost:5173</a> for the UI, or rebuild with the production frontend.</p></body></html>`))
 	})
 
 	// Configure server. Bind to cfg.Host (defaults to 127.0.0.1) so a single-user

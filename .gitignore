@@ -12,9 +12,11 @@ data/
 .env.*
 
 # Build artifacts
-dist/
+/dist/
 /analyzer
-cmd/analyzer/dist/
+/cloudtrail-analyzer
+cmd/analyzer/dist/*
+!cmd/analyzer/dist/.gitkeep
 
 # Frontend
 web/node_modules/
