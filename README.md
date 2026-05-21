@@ -13,9 +13,100 @@ cd cloudtrail-security-insights
 sudo ./deploy.sh
 ```
 
-Open `http://<ec2-ip>:7070` in your browser.
+By default, the application binds to `127.0.0.1:7070` on the EC2 host — **opening `http://<ec2-public-ip>:7070` in a browser will not work** without additional setup. This is intentional: the app has no built-in authentication, so the loopback bind is the first line of defence. See [Accessing the UI on EC2](#accessing-the-ui-on-ec2) below for the recommended access patterns.
 
-> ⚠️ **Important Security Notice**: This application has **no built-in authentication**. Access control relies entirely on network restrictions (AWS Security Groups). Deploy only in restricted network environments or behind an authenticating reverse proxy (e.g., ALB with Cognito, nginx with OAuth2 Proxy). Never expose port 7070 to the public internet.
+> ⚠️ **Important Security Notice**: This application has **no built-in authentication**. Access control relies entirely on network restrictions (AWS Security Groups, SSM session permissions, or an authenticating reverse proxy). Do not expose port 7070 to the public internet.
+
+## Accessing the UI on EC2
+
+Pick one of the following based on your environment. Listed in the order we recommend.
+
+### Option 1 — AWS Systems Manager (SSM) port forwarding (recommended)
+
+No SSH key, no inbound Security Group rules, no public IP needed. Access is gated by IAM, and SSM sessions are recorded in CloudTrail by default. This is the recommended option when handing the deployment over to another reviewer or QA team.
+
+**One-time setup on the EC2 instance:**
+
+1. Attach the AWS managed policy `AmazonSSMManagedInstanceCore` to the instance role (most AL2023 AMIs already include the SSM Agent).
+2. Allow outbound HTTPS (443) from the instance to AWS service endpoints — present by default on a new VPC.
+
+**One-time setup on the operator's laptop:**
+
+1. Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install --cask session-manager-plugin` on macOS).
+2. Sign in to the target AWS account with credentials that include `ssm:StartSession` and `ssm:DescribeInstanceInformation`.
+3. Verify the instance is reachable:
+   ```bash
+   aws ssm describe-instance-information \
+       --filters "Key=InstanceIds,Values=<instance-id>"
+   # Look for PingStatus: Online
+   ```
+
+**Daily use — open the tunnel:**
+
+```bash
+aws ssm start-session \
+    --target <instance-id> \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters '{"portNumber":["7070"],"localPortNumber":["7070"]}'
+```
+
+Leave the terminal open. Browse to `http://localhost:7070` on the laptop.
+
+**Minimal IAM policy for the operator's role/user:**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartSession",
+        "ssm:DescribeInstanceInformation",
+        "ssm:DescribeSessions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ssm:TerminateSession"],
+      "Resource": "arn:aws:ssm:*:*:session/${aws:username}-*"
+    }
+  ]
+}
+```
+
+Scope the `Resource` on `StartSession` to specific instance ARNs in production.
+
+### Option 2 — SSH tunnel
+
+Use this if you have SSH access already configured for the instance.
+
+```bash
+ssh -i your-key.pem -L 7070:localhost:7070 ec2-user@<ec2-public-ip>
+```
+
+Browse to `http://localhost:7070` on the laptop. Inbound Security Group needs port 22 only, scoped to the operator's IP/32.
+
+### Option 3 — Bind to all interfaces (least preferred)
+
+Reachable directly from the operator's laptop, but the app has no authentication of its own. Only use this when network controls outside the app are sufficient (private subnet, restrictive Security Group sourced to a single IP, or behind an authenticating reverse proxy such as ALB with Cognito or nginx with OAuth2 Proxy).
+
+1. Edit `/opt/cloudtrail-analyzer/config.json` and set `"host": "0.0.0.0"` at the top level.
+2. `sudo systemctl restart cloudtrail-analyzer`
+3. Add an inbound Security Group rule for port 7070 sourced to a specific IP/32 (never `0.0.0.0/0`).
+
+**Do not deploy this configuration with port 7070 reachable from the public internet.**
+
+### Troubleshooting access
+
+| Symptom | Likely cause | Resolution |
+|---|---|---|
+| `aws ssm start-session` returns 403 / `UnauthorizedRequest` | Operator credentials expired or missing `ssm:StartSession` | `aws sts get-caller-identity` to confirm; refresh SSO with `aws sso login --profile <name>`. |
+| `aws ssm describe-instance-information` returns an empty list | SSM Agent not running, or instance role missing `AmazonSSMManagedInstanceCore` | On the instance: `sudo systemctl status amazon-ssm-agent`; attach the managed policy and `sudo systemctl restart amazon-ssm-agent`. |
+| Tunnel opens but browser shows "can't connect to localhost:7070" | App not running, or bound to a different port | On the instance: `sudo systemctl status cloudtrail-analyzer`; `sudo ss -tlnp \| grep 7070`. |
+| Browser loads but shows the dev placeholder page ("Use Vite dev server at :5173") | Production binary built without the frontend bundle | Rebuild via `deploy.sh`, which embeds `web/dist/` into the binary. |
+| `An error occurred (InvalidClientTokenId)` from any AWS CLI call | Stale or invalid laptop credentials | `aws configure list` to see which profile is active; `aws sso login --profile <name>` to refresh. |
 
 ## What It Does
 
@@ -296,3 +387,33 @@ This project is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 
 
 ## Deployment Notes
+
+### Default network posture
+
+- The Go server binds to `127.0.0.1:7070` by default. Connections from the LAN or public internet are dropped by the kernel before the application sees them. Override via `host` in `config.json` if you understand the trade-off (see [Option 3](#option-3--bind-to-all-interfaces-least-preferred) above).
+- Outbound HTTPS (443) is required to reach S3, Bedrock, STS, AWS Organizations, and the AWS systems used by SSM. A new VPC default Security Group provides this; locked-down environments may need explicit egress rules to `*.amazonaws.com`.
+
+### Recommended access pattern for handovers
+
+When a different reviewer / QA engineer / customer needs to drive the UI:
+
+1. Grant them an IAM role/user with the SSM policy in [Option 1](#option-1--aws-systems-manager-ssm-port-forwarding-recommended).
+2. Share the EC2 instance ID. They open the tunnel locally — no key exchange, no bastion host, no inbound Security Group changes.
+3. Revoke their IAM access when the engagement ends. The application stays untouched.
+
+SSM sessions are typically recorded as `ssm:StartSession` events in CloudTrail with the operator's identity and the target instance ID, subject to your account's CloudTrail configuration.
+
+### Updating an existing deployment
+
+```bash
+# Pull the latest code on the instance, then re-run deploy.sh — it is idempotent.
+cd ~/<source-checkout>
+git pull
+sudo ./deploy.sh
+
+# Or, if you only changed Go code or the frontend bundle, a faster path:
+cd /opt/cloudtrail-analyzer
+sudo cp -r web/dist cmd/analyzer/dist
+sudo /usr/local/go/bin/go build -o cloudtrail-analyzer ./cmd/analyzer
+sudo systemctl restart cloudtrail-analyzer
+```
