@@ -4,6 +4,8 @@ data/
 *.db
 *.duckdb
 
+.kiro
+
 # Credentials
 .aws/
 .env
