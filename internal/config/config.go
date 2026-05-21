@@ -71,6 +71,12 @@ type LLMConfig struct {
 	APIKey   string `json:"api_key,omitempty"`
 	Model    string `json:"model,omitempty"`
 	Endpoint string `json:"endpoint,omitempty"`
+	// MaxSessionSpendUSD is the maximum cumulative estimated LLM spend (in
+	// USD) allowed per application session. Once reached, paid-provider LLM
+	// endpoints return 429 until the counter is reset or the app restarts.
+	// Set to 0 to disable the cap. Default: 5.00.
+	// Ollama (local) is exempt — it has no API cost.
+	MaxSessionSpendUSD float64 `json:"max_session_spend_usd,omitempty"`
 	// PricingOverrides lets users replace the built-in per-model rate card
 	// with their actual contract pricing. Keyed by model id (matching whatever
 	// is set in Bedrock.ModelID or Model above), values are dollars per
@@ -110,7 +116,8 @@ func DefaultConfig() Config {
 			Enabled: false,
 		},
 		LLM: LLMConfig{
-			Provider: "bedrock",
+			Provider:           "bedrock",
+			MaxSessionSpendUSD: 5.00,
 		},
 	}
 }

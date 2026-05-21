@@ -260,8 +260,9 @@ func checkDuckDB(status *StartupStatus) {
 // binary is permitted to reside.  Any path returned by exec.LookPath that does
 // not match this list will be rejected before it is passed to exec.Command.
 var allowedDuckDBPaths = map[string]bool{
-	"/usr/local/bin/duckdb":   true,
-	"/usr/bin/duckdb":         true,
+	"/usr/local/bin/duckdb":    true,
+	"/usr/bin/duckdb":          true,
+	"/opt/homebrew/bin/duckdb": true,
 }
 
 func init() {
@@ -355,9 +356,9 @@ func installDuckDB() (string, error) {
 
 	// Determine install location — try system-wide first, fall back to user-local
 	installDirs := []string{
-		duckDBInstallDir,                                    // /usr/local/bin (requires root)
-		filepath.Join(os.Getenv("HOME"), ".local", "bin"),   // ~/.local/bin
-		filepath.Join(os.Getenv("HOME"), "bin"),             // ~/bin
+		duckDBInstallDir, // /usr/local/bin (requires root)
+		filepath.Join(os.Getenv("HOME"), ".local", "bin"), // ~/.local/bin
+		filepath.Join(os.Getenv("HOME"), "bin"),           // ~/bin
 	}
 
 	var installPath string

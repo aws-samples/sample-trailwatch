@@ -271,7 +271,8 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     "enabled": false
   },
   "llm": {
-    "provider": "bedrock"
+    "provider": "bedrock",
+    "max_session_spend_usd": 5.00
   }
 }
 CONFIGEOF

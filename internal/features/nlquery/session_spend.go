@@ -10,14 +10,14 @@ import (
 // when the binary restarts. The point is to give the user a "where am I
 // today" awareness inside one session.
 type SessionSpend struct {
-	mu              sync.Mutex
-	queries         int
-	estimatedUSD    float64
-	actualUSD       float64
-	startedAt       time.Time
-	lastQueryAt     time.Time
-	lastQueryUSD    float64
-	exceededEstCnt  int // queries whose actual cost exceeded the pre-flight estimate by >2x
+	mu             sync.Mutex
+	queries        int
+	estimatedUSD   float64
+	actualUSD      float64
+	startedAt      time.Time
+	lastQueryAt    time.Time
+	lastQueryUSD   float64
+	exceededEstCnt int // queries whose actual cost exceeded the pre-flight estimate by >2x
 }
 
 // NewSessionSpend returns a fresh tracker.
@@ -78,4 +78,12 @@ func (s *SessionSpend) Reset() {
 	s.lastQueryAt = time.Time{}
 	s.lastQueryUSD = 0
 	s.exceededEstCnt = 0
+}
+
+// Total returns the cumulative estimated spend in USD for the current session.
+// Used by the spend-cap guard to decide whether to allow another LLM call.
+func (s *SessionSpend) Total() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.estimatedUSD
 }

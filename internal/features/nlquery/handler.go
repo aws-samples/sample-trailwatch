@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"cloudtrail-analyzer/internal/config"
@@ -22,6 +23,7 @@ type Handler struct {
 	indexer      *Indexer
 	microBatch   *MicroBatchIndexer
 	sessionSpend *SessionSpend
+	llmInFlight  atomic.Bool // concurrency gate: only 1 LLM call at a time
 }
 
 func NewHandler(cfg *config.Config, db *sql.DB) *Handler {
@@ -61,12 +63,74 @@ func (h *Handler) Routes() chi.Router {
 	return r
 }
 
+// ---------------------------------------------------------------------------
+// LLM rate-limit guards
+// ---------------------------------------------------------------------------
+
+// acquireLLM attempts to acquire the single-flight LLM slot. If another LLM
+// request is already in progress, it writes a 429 response and returns false.
+// Callers should `if !h.acquireLLM(w) { return }` and defer releaseLLM().
+func (h *Handler) acquireLLM(w http.ResponseWriter) bool {
+	if !h.llmInFlight.CompareAndSwap(false, true) {
+		render.Error(w, http.StatusTooManyRequests, "LLM_BUSY",
+			"An AI query is already in progress. Wait for it to complete.")
+		return false
+	}
+	return true
+}
+
+// releaseLLM releases the single-flight LLM slot.
+func (h *Handler) releaseLLM() {
+	h.llmInFlight.Store(false)
+}
+
+// checkSpendCap verifies the session spend has not exceeded the configured cap.
+// Only enforced for paid providers (bedrock, anthropic, openai). Ollama is
+// exempt because it runs locally with zero API cost.
+// Returns true if the request may proceed; writes 429 and returns false if capped.
+func (h *Handler) checkSpendCap(w http.ResponseWriter) bool {
+	// Ollama is free — no spend cap applies
+	if h.cfg.LLM.Provider == "ollama" {
+		return true
+	}
+
+	cap := h.cfg.LLM.MaxSessionSpendUSD
+	if cap <= 0 {
+		// Cap disabled
+		return true
+	}
+
+	currentSpend := h.sessionSpend.Total()
+	if currentSpend >= cap {
+		render.Error(w, http.StatusTooManyRequests, "SPEND_CAP_REACHED",
+			fmt.Sprintf("Session spend cap reached ($%.2f / $%.2f). Reset via DELETE /api/nlquery/spend or restart the application.", currentSpend, cap),
+			map[string]interface{}{
+				"current_spend_usd": currentSpend,
+				"cap_usd":           cap,
+			},
+		)
+		return false
+	}
+
+	return true
+}
+
 // Summarize wraps the summarize.go core in an HTTP handler. The body comes
 // straight from the result panel: scenario metadata + columns + the rows
 // that were displayed, so the model summarizes exactly what the user is
 // looking at. Pre-flight estimate + session-spend recording match the
 // /execute path so the cost UX stays consistent.
 func (h *Handler) Summarize(w http.ResponseWriter, r *http.Request) {
+	// --- Rate-limit guards (concurrency + spend cap) ---
+	if !h.acquireLLM(w) {
+		return
+	}
+	defer h.releaseLLM()
+
+	if !h.checkSpendCap(w) {
+		return
+	}
+
 	var req SummarizeRequest
 	if !render.DecodeStrictJSON(w, r, &req) {
 		return
@@ -115,7 +179,27 @@ func (h *Handler) Estimate(w http.ResponseWriter, r *http.Request) {
 	}
 	systemPrompt := h.svc.buildSystemPrompt()
 	est := EstimateCost(h.cfg, systemPrompt, req.Prompt, 0)
-	render.JSON(w, http.StatusOK, est)
+
+	// Enrich the estimate with spend-cap awareness so the UI can show a
+	// warning before the user clicks Run.
+	type enrichedEstimate struct {
+		CostEstimate
+		CurrentSpendUSD float64 `json:"current_spend_usd"`
+		CapUSD          float64 `json:"cap_usd"`
+		WouldExceedCap  bool    `json:"would_exceed_cap"`
+	}
+
+	cap := h.cfg.LLM.MaxSessionSpendUSD
+	currentSpend := h.sessionSpend.Total()
+	wouldExceed := cap > 0 && h.cfg.LLM.Provider != "ollama" &&
+		(currentSpend+est.EstTotalCostUSD) > cap
+
+	render.JSON(w, http.StatusOK, enrichedEstimate{
+		CostEstimate:    est,
+		CurrentSpendUSD: currentSpend,
+		CapUSD:          cap,
+		WouldExceedCap:  wouldExceed,
+	})
 }
 
 // Spend returns the running session-spend snapshot.
@@ -214,13 +298,13 @@ func (h *Handler) StreamIndexProgress(w http.ResponseWriter, r *http.Request) {
 			// as event data, not as HTML. The XSS-via-html/template suggestion
 			// from semgrep does not apply here; suppressed inline with
 			// justification per CSR rules.
-			w.Write([]byte("event: progress\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write(data)                                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write([]byte("\n\n"))                       //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("event: progress\ndata: ")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write(data)                              //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("\n\n"))                    //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 			flusher.Flush()
 
 			if state.Status == "idle" || state.Status == "error" || state.Status == "paused" {
-				w.Write([]byte("event: done\ndata: {}\n\n"))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write([]byte("event: done\ndata: {}\n\n")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 				flusher.Flush()
 				return
 			}
@@ -262,15 +346,25 @@ type ExecuteRequest struct {
 }
 
 type ExecuteResponse struct {
-	SQL          string          `json:"sql"`
-	Columns      []string        `json:"columns"`
-	Rows         [][]interface{} `json:"rows"`
-	Error        string          `json:"error,omitempty"`
-	ErrorHint    string          `json:"error_hint,omitempty"`    // user-facing summary
-	ErrorDetail  string          `json:"error_detail,omitempty"`  // raw engine output, collapsible
+	SQL         string          `json:"sql"`
+	Columns     []string        `json:"columns"`
+	Rows        [][]interface{} `json:"rows"`
+	Error       string          `json:"error,omitempty"`
+	ErrorHint   string          `json:"error_hint,omitempty"`   // user-facing summary
+	ErrorDetail string          `json:"error_detail,omitempty"` // raw engine output, collapsible
 }
 
 func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
+	// --- Rate-limit guards (concurrency + spend cap) ---
+	if !h.acquireLLM(w) {
+		return
+	}
+	defer h.releaseLLM()
+
+	if !h.checkSpendCap(w) {
+		return
+	}
+
 	var req ExecuteRequest
 	if !render.DecodeStrictJSON(w, r, &req) {
 		return

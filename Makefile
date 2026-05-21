@@ -15,7 +15,7 @@ dev:
 	@echo "  → Frontend:    http://localhost:5173"
 	@echo ""
 	@trap 'kill 0' EXIT; \
-		(cd web && npx vite --host 0.0.0.0) & \
+		(cd web && npx vite) & \
 		go run -ldflags "-X main.version=$(VERSION)" ./cmd/analyzer & \
 		wait
 
