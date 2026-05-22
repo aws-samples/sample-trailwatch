@@ -43,12 +43,9 @@ export function useCallerIdentity() {
 }
 
 interface CreateSessionRequest {
-  bucket: string
   account_id: string
   org_id?: string
-  region: string
   log_region: string
-  mode: string
   start_date: string
   end_date: string
 }

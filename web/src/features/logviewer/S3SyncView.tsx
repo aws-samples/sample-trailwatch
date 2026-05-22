@@ -23,6 +23,7 @@ export function S3SyncView() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const bucket = settings?.s3?.bucket || ''
+  const bucketRegion = settings?.s3?.region || ''
   const mode = settings?.s3?.mode || 'single'
   const orgId = settings?.s3?.org_id || ''
   const accountId = settings?.s3?.account_id || ''
@@ -94,21 +95,14 @@ export function S3SyncView() {
 
     try {
       for (const acct of accountsToSync) {
-        // Create session. The backend's CreateSessionRequest accepts only the
-        // five fields below — bucket/region/mode come from the saved S3
-        // config on the server side. Sending extra fields (bucket, region,
-        // mode) used to be ignored, but DecodeStrictJSON now rejects unknown
-        // fields with `400 unknown field "bucket"`. Keep the payload aligned
-        // with internal/features/sessions/models.go::CreateSessionRequest.
+        // Create session — bucket, region, and mode come from saved S3 config on the backend
         const createRes = await fetch(endpoints.sessions, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            account_id: acct,
-            org_id: orgId || undefined,
+            account_id: acct, org_id: orgId || undefined,
             log_region: logRegion,
-            start_date: startDate,
-            end_date: endDate,
+            start_date: startDate, end_date: endDate,
           }),
         })
         if (!createRes.ok) {
