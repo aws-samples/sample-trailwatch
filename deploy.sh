@@ -232,6 +232,9 @@ info "Preparing embedded assets..."
 cd "$APP_DIR"
 rm -rf cmd/analyzer/dist
 cp -r web/dist cmd/analyzer/dist
+# Recreate .gitkeep so the source tree stays clean (go:embed needs the
+# directory to exist at compile time, and .gitkeep is what tracks it).
+touch cmd/analyzer/dist/.gitkeep
 ok "Frontend assets copied for embedding"
 
 info "Downloading Go dependencies..."

@@ -21,6 +21,7 @@ cmd/analyzer/dist/*
 # Frontend
 web/node_modules/
 web/dist/
+web/tsconfig.tsbuildinfo
 
 # OS
 .DS_Store
@@ -38,3 +39,6 @@ CSR_Fix_Instructions*
 
 # Screenshots
 Screenshot*
+
+# Local scratch docs (testing prompts, briefs, drafts)
+*.docx

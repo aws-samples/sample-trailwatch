@@ -1,5 +1,0 @@
-# Build placeholder so go:embed has a directory to find at compile time.
-# Production builds replace this directory's contents with web/dist/ output
-# (see deploy.sh "Preparing embedded assets..." step). During dev builds
-# the embed is effectively empty and the SPA handler falls through to the
-# dev-mode placeholder served by main.go.

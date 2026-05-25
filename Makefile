@@ -52,6 +52,10 @@ embed-assets:
 	@echo "Copying frontend assets for embedding..."
 	@rm -rf cmd/analyzer/dist
 	@cp -r $(WEB_DIST) cmd/analyzer/dist
+	@# Recreate the empty .gitkeep so the working tree stays clean after a build.
+	@# go:embed needs the dist/ directory to exist at compile time; .gitkeep
+	@# is the marker that keeps the directory tracked when it is otherwise empty.
+	@touch cmd/analyzer/dist/.gitkeep
 
 ## frontend: Build React app to web/dist/
 frontend:
