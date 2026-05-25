@@ -23,7 +23,6 @@ export function S3SyncView() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const bucket = settings?.s3?.bucket || ''
-  const bucketRegion = settings?.s3?.region || ''
   const mode = settings?.s3?.mode || 'single'
   const orgId = settings?.s3?.org_id || ''
   const accountId = settings?.s3?.account_id || ''
