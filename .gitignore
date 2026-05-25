@@ -6,6 +6,7 @@ data/
 
 .kiro
 
+
 # Credentials
 .aws/
 .env
@@ -42,3 +43,6 @@ Screenshot*
 
 # Local scratch docs (testing prompts, briefs, drafts)
 *.docx
+
+# Tests
+tests/
