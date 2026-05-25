@@ -49,6 +49,7 @@ const resources = {
       'common.delete': 'Delete',
       'common.copy': 'Copy',
       'common.copied': 'Copied',
+      'common.noData': 'No data',
       'data.sync.regionLabel': 'Region: {{region}}',
       'data.sync.modeControlTower': 'Control Tower',
       'data.sync.modeSingleAccount': 'Single Account',

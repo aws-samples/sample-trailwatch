@@ -298,16 +298,38 @@ export function DashboardView({ navigate }: DashboardViewProps) {
               </AreaChart>
             </ResponsiveContainer>
           </div>
-          <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+          <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-4 flex flex-col">
             <h3 className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-3">{t('security.dashboard.identityTypes')}</h3>
-            <ResponsiveContainer width="100%" height={140}>
-              <PieChart>
-                <Pie data={identityData} cx="50%" cy="50%" outerRadius={55} innerRadius={30} dataKey="value" label={({ name, percent }) => `${name} ${((percent ?? 0) * 100).toFixed(0)}%`} labelLine={false}>
-                  {identityData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <Tooltip contentStyle={{ fontSize: '10px', borderRadius: '6px' }} />
-              </PieChart>
-            </ResponsiveContainer>
+            {identityData.length === 0 ? (
+              <div className="flex-1 flex items-center justify-center text-[11px] text-gray-400">{t('common.noData', 'No data')}</div>
+            ) : (
+              <>
+                <ResponsiveContainer width="100%" height={100}>
+                  <PieChart>
+                    <Pie data={identityData} cx="50%" cy="50%" outerRadius={45} innerRadius={25} dataKey="value">
+                      {identityData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                    </Pie>
+                    <Tooltip contentStyle={{ fontSize: '10px', borderRadius: '6px' }} formatter={(v: any, n: any) => {
+                      const total = identityData.reduce((a, d) => a + d.value, 0) || 1
+                      const num = Number(v) || 0
+                      return [`${num} (${((num / total) * 100).toFixed(0)}%)`, String(n)]
+                    }} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <ul className="mt-2 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] text-gray-700 dark:text-gray-300">
+                  {(() => {
+                    const total = identityData.reduce((a, d) => a + d.value, 0) || 1
+                    return identityData.map((d, i) => (
+                      <li key={d.name} className="flex items-center gap-1.5 min-w-0">
+                        <span className="inline-block w-2 h-2 rounded-sm flex-shrink-0" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
+                        <span className="truncate" title={d.name}>{d.name}</span>
+                        <span className="ml-auto tabular-nums text-gray-500 dark:text-gray-400">{((d.value / total) * 100).toFixed(0)}%</span>
+                      </li>
+                    ))
+                  })()}
+                </ul>
+              </>
+            )}
           </div>
         </div>
 
