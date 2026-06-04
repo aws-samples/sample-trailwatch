@@ -16,7 +16,8 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AlertTriangle, ArrowRight, Check, Copy, Loader2, Sparkles, X } from 'lucide-react'
 import { endpoints } from '../../config/api'
-import { CostBanner } from '../../comm/CostBanner'
+import { CostBanner, formatUSD } from '../../comm/CostBanner'
+import { readApiError } from '../../comm/apiError'
 import type { SeedType } from './seedDetection'
 
 // Click-to-expand value cell for the summary panel. Collapsed: single-line
@@ -83,6 +84,7 @@ interface Pivot {
   reason: string
 }
 
+// Mirrors internal/features/nlquery/summarize.go::SummarizeResponse.
 interface SummarizeResponse {
   // Structured (preferred)
   tldr?: string
@@ -96,6 +98,12 @@ interface SummarizeResponse {
   suspicious_tokens?: string[]
   rows_sent_to_model: number
   total_rows: number
+  // Authoritative cost of THIS summarize call, computed server-side against
+  // the exact rows + summarize system prompt that were sent (and recorded
+  // against session spend). Omitted (0/undefined) on the legacy text path.
+  // This is the real billed number — prefer it over the pre-flight banner's
+  // approximation, which uses the NL-query system prompt. See P1-14.
+  est_cost_usd?: number
 }
 
 interface Props {
@@ -178,9 +186,20 @@ export function SummaryPanel({
     return () => document.removeEventListener('keydown', onKey)
   }, [open, onClose])
 
+  // MAX_SUMMARIZE_ROWS mirrors the backend cap (summarize.go::MaxSummarizeRows).
+  // The backend only ever sends this many rows to the model regardless of how
+  // many we POST, so both the pre-flight estimate and the request itself are
+  // bounded to the same slice — keeping the shown cost consistent with what is
+  // actually billed. See P1-14.
+  const MAX_SUMMARIZE_ROWS = 50
+
+  // Pre-flight approximation only. The /estimate endpoint prepends the
+  // NL-query system prompt, not the (shorter) summarize one, so this is a
+  // rough upper-bound, not the billed amount. The authoritative figure is
+  // summary.est_cost_usd, rendered once the call returns.
   const promptPreview = (() => {
     if (!columns || !rows) return ''
-    const sliced = rows.slice(0, 50)
+    const sliced = rows.slice(0, MAX_SUMMARIZE_ROWS)
     return `${scenarioName}\n${(scenarioDescription ?? '')}\n${columns.join(',')}\n${JSON.stringify(sliced).slice(0, 8000)}`
   })()
 
@@ -194,17 +213,20 @@ export function SummaryPanel({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          // Only the rows the backend will actually use are sent, matching the
+          // pre-flight estimate's slice. total_rows still carries the full
+          // count so the "based on first N of total" note stays accurate. See
+          // P1-14.
           scenario_id: scenarioId,
           scenario_name: scenarioName,
           scenario_description: scenarioDescription,
           columns,
-          rows,
+          rows: rows.slice(0, MAX_SUMMARIZE_ROWS),
           total_rows: rows.length,
         }),
       })
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        setError(body?.message || `HTTP ${res.status}`)
+        setError(await readApiError(res, 'Summary failed'))
         return
       }
       setSummary(await res.json())
@@ -301,6 +323,14 @@ export function SummaryPanel({
               {summary.rows_sent_to_model < summary.total_rows
                 ? t('summaryPanel.basedOn', { sent: summary.rows_sent_to_model, total: summary.total_rows })
                 : t('summaryPanel.basedOnAll', { count: summary.total_rows })}
+              {/* Authoritative billed cost from the backend (same rows + prompt
+                  actually sent). Supersedes the pre-flight banner approximation.
+                  Only shown when present (>0); the legacy text path omits it. */}
+              {typeof summary.est_cost_usd === 'number' && summary.est_cost_usd > 0 && (
+                <span className="ml-1">
+                  {t('cost.estTotal')}: ≈ {formatUSD(summary.est_cost_usd)}
+                </span>
+              )}
             </div>
 
             {/* TL;DR — bigger, leading text. Only renders when structured. */}

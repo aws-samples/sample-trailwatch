@@ -398,7 +398,6 @@ func (s *Service) sendPipelineProgress(ch chan<- ProcessingProgress, sessionID s
 	}
 }
 
-
 // optimizedHTTPClient returns an HTTP client tuned for high-throughput S3 downloads.
 // High connection pool limits allow many parallel requests to the same S3 endpoint,
 // critical for PrivateLink and VPC endpoint scenarios where latency is minimal.
@@ -448,6 +447,51 @@ func (s *Service) CancelProcessing(sessionID string) error {
 	s.clearSnapshot(sessionID)
 
 	return nil
+}
+
+// Shutdown cancels every active pipeline and marks its session interrupted.
+// It is called from main on SIGINT/SIGTERM, before server.Shutdown, so that
+// detached download/extract goroutines stop writing mid-batch and any in-flight
+// SSE handler observes the cancellation instead of blocking on the progress
+// channel until the shutdown timeout elapses. Cancelling each pipeline context
+// lets the StartProcessing goroutine return and close its progress channel,
+// which unblocks the SSE reader.
+func (s *Service) Shutdown() {
+	s.mu.Lock()
+	// Snapshot the active set so we can cancel without holding the lock while
+	// touching the database (UpdateState takes no app-level lock, but keeping
+	// the critical section short avoids stalling concurrent handlers).
+	ids := make([]string, 0, len(s.active))
+	cancels := make([]context.CancelFunc, 0, len(s.active))
+	for id, cancel := range s.active {
+		ids = append(ids, id)
+		cancels = append(cancels, cancel)
+	}
+	s.mu.Unlock()
+
+	if len(ids) == 0 {
+		return
+	}
+
+	slog.Info("cancelling active sync pipelines for shutdown",
+		"component", "cloudtrail-analyzer",
+		"active_pipelines", len(ids),
+	)
+
+	for i, id := range ids {
+		cancels[i]()
+		// Mark interrupted immediately so a restart can resume; the pipeline
+		// goroutine also routes through terminate() on its way out, which is
+		// idempotent with this update.
+		if err := sessions.UpdateState(s.db, id, sessions.StateInterrupted); err != nil {
+			slog.Warn("failed to mark session interrupted during shutdown",
+				"component", "cloudtrail-analyzer",
+				"session_id", id,
+				"error", err.Error(),
+			)
+		}
+		s.clearSnapshot(id)
+	}
 }
 
 // GetProgressChannel returns the progress channel for a session, if active.

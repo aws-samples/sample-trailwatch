@@ -7,9 +7,21 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	smithy "github.com/aws/smithy-go"
 
 	_ "modernc.org/sqlite"
 )
+
+// permanentDenial mimics an AWS Organizations AccessDenied response — a
+// permanent failure that the resolver makes sticky (see isPermanentOrgError).
+// Tests that exercise the sticky-failure gate must return this rather than a
+// plain error, which the resolver treats as transient/retryable.
+func permanentDenial() error {
+	return &smithy.GenericAPIError{
+		Code:    "AccessDeniedException",
+		Message: "simulated AccessDenied",
+	}
+}
 
 // newTestDB returns an in-memory SQLite with the migration applied.
 func newTestDB(t *testing.T) *sql.DB {
@@ -77,10 +89,10 @@ func TestSetManualAndResolve(t *testing.T) {
 	db := newTestDB(t)
 	r := NewResolver(db, failingLoader, "")
 
-	if err := r.SetManual(context.Background(), "247083000413", "prod-payments"); err != nil {
+	if err := r.SetManual(context.Background(), "123456789012", "prod-payments"); err != nil {
 		t.Fatalf("SetManual: %v", err)
 	}
-	e, err := r.ResolveOne(context.Background(), "247083000413")
+	e, err := r.ResolveOne(context.Background(), "123456789012")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,11 +105,11 @@ func TestSetManual_EmptyNameDeletes(t *testing.T) {
 	db := newTestDB(t)
 	r := NewResolver(db, failingLoader, "")
 
-	_ = r.SetManual(context.Background(), "247083000413", "prod-payments")
-	if err := r.SetManual(context.Background(), "247083000413", ""); err != nil {
+	_ = r.SetManual(context.Background(), "123456789012", "prod-payments")
+	if err := r.SetManual(context.Background(), "123456789012", ""); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	e, _ := r.ResolveOne(context.Background(), "247083000413")
+	e, _ := r.ResolveOne(context.Background(), "123456789012")
 	if e.Source != "unresolved" {
 		t.Errorf("expected unresolved after delete, got %q (%q)", e.Source, e.Name)
 	}
@@ -110,15 +122,15 @@ func TestManualOverridesOrganizations(t *testing.T) {
 	// Simulate an Org-sourced entry...
 	_, err := db.Exec(`
 		INSERT INTO account_names (account_id, name, source) VALUES (?, ?, ?)
-	`, "247083000413", "Production Payments LLC", SourceOrganizations)
+	`, "123456789012", "Production Payments LLC", SourceOrganizations)
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	// ...then a manual override.
-	if err := r.SetManual(context.Background(), "247083000413", "prod-payments"); err != nil {
+	if err := r.SetManual(context.Background(), "123456789012", "prod-payments"); err != nil {
 		t.Fatalf("SetManual: %v", err)
 	}
-	e, _ := r.ResolveOne(context.Background(), "247083000413")
+	e, _ := r.ResolveOne(context.Background(), "123456789012")
 	if e.Name != "prod-payments" {
 		t.Errorf("expected manual override 'prod-payments', got %q (source=%q)", e.Name, e.Source)
 	}
@@ -133,11 +145,11 @@ func TestClearingManualFallsBackToOrganizations(t *testing.T) {
 
 	_, _ = db.Exec(`
 		INSERT INTO account_names (account_id, name, source) VALUES (?, ?, ?)
-	`, "247083000413", "Production Payments LLC", SourceOrganizations)
-	_ = r.SetManual(context.Background(), "247083000413", "prod-payments")
-	_ = r.SetManual(context.Background(), "247083000413", "")
+	`, "123456789012", "Production Payments LLC", SourceOrganizations)
+	_ = r.SetManual(context.Background(), "123456789012", "prod-payments")
+	_ = r.SetManual(context.Background(), "123456789012", "")
 
-	e, _ := r.ResolveOne(context.Background(), "247083000413")
+	e, _ := r.ResolveOne(context.Background(), "123456789012")
 	if e.Source != SourceOrganizations {
 		t.Errorf("expected fallback to organizations, got %q (%q)", e.Source, e.Name)
 	}
@@ -182,7 +194,7 @@ func TestOnCredentialsChanged_ClearsStickyFailure(t *testing.T) {
 	calls := 0
 	loader := func(_ context.Context, _ string) (aws.Config, error) {
 		calls++
-		return aws.Config{}, errors.New("simulated AccessDenied")
+		return aws.Config{}, permanentDenial()
 	}
 	r := NewResolver(db, loader, "us-east-1")
 
@@ -209,7 +221,7 @@ func TestRefreshOrganizations_HonorsTTLAndStickyFailure(t *testing.T) {
 	calls := 0
 	loader := func(_ context.Context, _ string) (aws.Config, error) {
 		calls++
-		return aws.Config{}, errors.New("simulated AccessDenied")
+		return aws.Config{}, permanentDenial()
 	}
 	r := NewResolver(db, loader, "us-east-1")
 

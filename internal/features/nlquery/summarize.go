@@ -120,6 +120,13 @@ type SummarizeResponse struct {
 	// (capped at MaxSummarizeRows).
 	RowsSentToModel int `json:"rows_sent_to_model"`
 	TotalRows       int `json:"total_rows"`
+	// EstCostUSD is the estimated cost of this summarize call, computed
+	// server-side against the same rows + system prompt that were actually
+	// sent to the model. The handler fills it in. The pre-flight CostBanner is
+	// only an approximation (it sends the NL-query system prompt against a
+	// preview of the rows); this value is the one recorded against the session
+	// spend, so the UI can show the real number once the summary returns.
+	EstCostUSD float64 `json:"est_cost_usd,omitempty"`
 }
 
 // Summarize sends the result rows to the configured LLM with the strict
@@ -371,7 +378,7 @@ func splitOnNonIdentifier(s string) []string {
 		if cur.Len() == 0 {
 			return
 		}
-		// Trim trailing sentence punctuation so "247083000413." -> "247083000413".
+		// Trim trailing sentence punctuation so "123456789012." -> "123456789012".
 		// Leading dots are unusual but also stripped for symmetry.
 		t := strings.Trim(cur.String(), ".,;:")
 		if t != "" {

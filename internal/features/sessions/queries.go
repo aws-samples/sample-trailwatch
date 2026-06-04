@@ -118,20 +118,29 @@ func Delete(db *sql.DB, id string) error {
 	return nil
 }
 
-// MarkInterrupted marks all sessions in downloading or extracting state as interrupted.
-// This is called on startup to handle sessions that were in progress when the app stopped.
-func MarkInterrupted(db *sql.DB) error {
-	query := `UPDATE sessions SET state = ?, updated_at = ? WHERE state IN (?, ?)`
-	_, err := db.Exec(query,
+// MarkInterrupted marks all sessions left in an in-flight state as interrupted.
+// It is called on startup to recover sessions that were mid-pipeline when the
+// app stopped (crash, SIGTERM, or a shutdown that cancelled the pipeline). The
+// in-flight states are downloading, extracting, and verifying — the pipeline
+// transitions downloading -> verifying -> query-ready, so a crash during the
+// verify phase would otherwise leave the session stuck forever.
+func MarkInterrupted(db *sql.DB) (int64, error) {
+	query := `UPDATE sessions SET state = ?, updated_at = ? WHERE state IN (?, ?, ?)`
+	result, err := db.Exec(query,
 		StateInterrupted,
 		time.Now().UTC().Format(time.RFC3339),
 		StateDownloading,
 		StateExtracting,
+		StateVerifying,
 	)
 	if err != nil {
-		return fmt.Errorf("marking interrupted sessions: %w", err)
+		return 0, fmt.Errorf("marking interrupted sessions: %w", err)
 	}
-	return nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("checking rows affected: %w", err)
+	}
+	return rows, nil
 }
 
 // scanSession scans a single row into a Session struct.

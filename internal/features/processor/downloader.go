@@ -20,6 +20,18 @@ import (
 
 // listObjects lists all .json.gz files in S3 for the session's path and date range.
 // Returns the list of objects and total size in bytes.
+//
+// IMPORTANT — delivery date vs event time: CloudTrail partitions log files by
+// the UTC *delivery* date (the day CloudTrail wrote the file to S3), which is
+// encoded in the S3 prefix as .../CloudTrail/{region}/{YYYY}/{MM}/{DD}/. The
+// session's StartDate/EndDate select that delivery-date partition, NOT the
+// eventTime of the records inside. Because CloudTrail can batch and deliver an
+// event up to ~15 minutes (occasionally longer) after it occurs, an event that
+// happened just before a UTC midnight boundary may be delivered into the next
+// day's partition. As a result, a single-day sync can miss a few records near
+// the day boundary, and event-time filtering applied later (in queries) should
+// be paired with a slightly wider sync window when boundary completeness
+// matters. This is a known limitation of partitioning by delivery date.
 func listObjects(ctx context.Context, client *s3.Client, session *sessions.Session) ([]S3Object, int64, error) {
 	var objects []S3Object
 	var totalSize int64
@@ -151,7 +163,17 @@ func downloadFiles(ctx context.Context, client *s3.Client, session *sessions.Ses
 }
 
 // downloadSingleFile downloads a single S3 object to the local filesystem.
+//
+// This is the single write chokepoint for both the download-only and the
+// pipelined download+extract paths, so the zip-slip / path-traversal guard
+// (N25) lives here: an S3 key containing a ".." segment or an absolute path
+// could otherwise resolve to a localPath OUTSIDE the data dir. We reject such
+// keys before creating any directory or file.
 func downloadSingleFile(ctx context.Context, client *s3.Client, bucket, key, localPath string) error {
+	if hasUnsafeKeySegment(key) {
+		return fmt.Errorf("refusing to write S3 key with unsafe path segment: %q", key)
+	}
+
 	// Ensure directory exists
 	dir := filepath.Dir(localPath)
 	if err := os.MkdirAll(dir, 0700); err != nil { // nosemgrep: incorrect-default-permission
@@ -208,8 +230,33 @@ func constructS3Prefix(session *sessions.Session, date time.Time) string {
 
 // constructLocalPath builds the local filesystem path for a downloaded S3 object.
 // Pattern: {dataDir}/s3/{bucket}/{s3Key}
+//
+// The returned path is NOT yet validated for containment: the S3 object key is
+// attacker-influenceable (a malicious or misconfigured bucket can return keys
+// containing ".." segments), so callers MUST route the actual write through
+// downloadSingleFile, which validates the key against path traversal before
+// touching the filesystem (zip-slip guard, N25). filepath.Join cleans the
+// joined path, so a key like "../../etc/x" would otherwise resolve OUTSIDE the
+// data dir — hence the guard at the single write chokepoint.
 func constructLocalPath(dataDir, bucket, s3Key string) string {
 	return filepath.Join(dataDir, "s3", bucket, s3Key)
+}
+
+// hasUnsafeKeySegment reports whether the slash-separated S3 key is unsafe to
+// join under the data dir: an absolute key, or one containing a ".." parent
+// segment, would let the local write escape {dataDir}/s3/{bucket} (zip-slip /
+// path traversal). S3 uses "/" as its key separator independent of the host
+// OS, so we split on "/" regardless of platform.
+func hasUnsafeKeySegment(key string) bool {
+	if strings.HasPrefix(key, "/") {
+		return true
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // sendDownloadProgress sends a download progress event.

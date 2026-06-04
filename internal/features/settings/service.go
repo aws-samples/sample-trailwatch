@@ -172,25 +172,29 @@ func (s *Service) ListControlTowerAccounts(ctx context.Context, bucket, region s
 		prefix = "AWSLogs/"
 	}
 
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	// Page through all results: a large org has more member-account prefixes
+	// than fit in a single ListObjectsV2 response, so we follow the
+	// continuation token rather than reading only the first page.
+	var accounts []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(100),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
-	}
-
-	var accounts []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
-			continue
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
 		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
-			accounts = append(accounts, parts[0])
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
+			parts := strings.Split(trimmed, "/")
+			if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
+				accounts = append(accounts, parts[0])
+			}
 		}
 	}
 
@@ -241,14 +245,35 @@ func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region stri
 		return nil, fmt.Errorf("no prefixes found at bucket root in %q", bucket)
 	}
 
-	// Check the first CommonPrefix to determine structure
-	firstPrefix := aws.ToString(output.CommonPrefixes[0].Prefix)
-	firstEntry := strings.TrimSuffix(firstPrefix, "/")
+	// Scan ALL returned top-level prefixes rather than only the first one.
+	//
+	// Heuristic note: this looks at the (up to 20) top-level prefixes returned
+	// in a single page and classifies the bucket by the first recognizable
+	// entry — an Organization-ID-shaped prefix ("o-...") implies Control Tower,
+	// otherwise an "AWSLogs" prefix implies a single account. Scanning the whole
+	// page (not just CommonPrefixes[0]) avoids a misclassification when an
+	// unrelated prefix (e.g. "config/", an access-log prefix, or a lifecycle
+	// marker) happens to sort ahead of the real CloudTrail prefix. Org-ID
+	// detection is preferred first because a Control Tower bucket also contains
+	// no top-level "AWSLogs/" entry, so checking org-ID before AWSLogs cannot
+	// produce a false "single" verdict. If neither shape is found we fail with a
+	// clear error rather than guessing, which is the safer default.
+	var orgID string
+	hasAWSLogs := false
+	rootEntries := make([]string, 0, len(output.CommonPrefixes))
+	for _, cp := range output.CommonPrefixes {
+		entry := strings.TrimSuffix(aws.ToString(cp.Prefix), "/")
+		rootEntries = append(rootEntries, entry)
+		if orgID == "" && strings.HasPrefix(entry, "o-") && orgIDPattern.MatchString(entry) {
+			orgID = entry
+		}
+		if entry == "AWSLogs" {
+			hasAWSLogs = true
+		}
+	}
 
-	// Control Tower: root entry starts with "o-" (org ID)
-	if strings.HasPrefix(firstEntry, "o-") && orgIDPattern.MatchString(firstEntry) {
-		orgID := firstEntry
-
+	// Control Tower: a root entry is an org ID ("o-...")
+	if orgID != "" {
 		// List accounts at {org_id}/AWSLogs/{org_id}/
 		accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, fmt.Sprintf("%s/AWSLogs/%s/", orgID, orgID))
 		if err != nil {
@@ -270,8 +295,8 @@ func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region stri
 		}, nil
 	}
 
-	// Single account: root entry is "AWSLogs/"
-	if firstEntry == "AWSLogs" {
+	// Single account: a root entry is "AWSLogs/"
+	if hasAWSLogs {
 		accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, "AWSLogs/")
 		if err != nil {
 			return nil, fmt.Errorf("listing accounts under AWSLogs/: %w", err)
@@ -291,30 +316,33 @@ func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region stri
 		}, nil
 	}
 
-	return nil, fmt.Errorf("unrecognized bucket structure — root entry is %q (expected org ID starting with o- or AWSLogs/)", firstEntry)
+	return nil, fmt.Errorf("unrecognized bucket structure — root entries are %q (expected an org ID starting with o- or an AWSLogs/ prefix)", rootEntries)
 }
 
 // listAccountsAtPrefix lists 12-digit account IDs under a given S3 prefix.
 func (s *Service) listAccountsAtPrefix(ctx context.Context, client *s3.Client, bucket, prefix string) ([]string, error) {
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	// Follow the continuation token so orgs with many member accounts are not
+	// silently truncated to the first page of results.
+	var accounts []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(100),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
-	}
-
-	var accounts []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
-			continue
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
 		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
-			accounts = append(accounts, parts[0])
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
+			parts := strings.Split(trimmed, "/")
+			if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
+				accounts = append(accounts, parts[0])
+			}
 		}
 	}
 
@@ -344,25 +372,28 @@ func (s *Service) DiscoverRegions(ctx context.Context, bucket, region, accountID
 		prefix = fmt.Sprintf("AWSLogs/%s/CloudTrail/", accountID)
 	}
 
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	// Page through all region prefixes; an account with CloudTrail enabled in
+	// many regions can return more than one page of CommonPrefixes.
+	var regions []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(50),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("listing regions at %s: %w", prefix, err)
-	}
-
-	var regions []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
-			continue
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing regions at %s: %w", prefix, err)
 		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && parts[0] != "" {
-			regions = append(regions, parts[0])
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
+			parts := strings.Split(trimmed, "/")
+			if len(parts) > 0 && parts[0] != "" {
+				regions = append(regions, parts[0])
+			}
 		}
 	}
 
@@ -409,15 +440,20 @@ func (s *Service) VerifyLogs(ctx context.Context, req *VerifyLogsRequest) (*Veri
 			req.AccountID, req.LogRegion, dateStr)
 	}
 
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	// Page through all objects so the reported file count reflects each log
+	// file for the sample date, not just the first page.
+	fileCount := 0
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(req.Bucket),
 		Prefix: aws.String(prefix),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("listing objects at %s: %w", prefix, err)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing objects at %s: %w", prefix, err)
+		}
+		fileCount += len(page.Contents)
 	}
-
-	fileCount := len(output.Contents)
 
 	if fileCount == 0 {
 		return &VerifyLogsResponse{
@@ -699,7 +735,26 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 		seen[m.ModelID] = struct{}{}
 	}
 	profilesCount := 0
-	if profilesOut, perr := client.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{}); perr == nil {
+	// Page through the inference profiles: ListInferenceProfiles returns a
+	// NextToken when there are more profiles than fit in one response, so a CRIS
+	// model on page 2+ (e.g. Opus when an account has many profiles) would
+	// otherwise vanish from the picker. We follow the token until it is empty.
+	var nextToken *string
+	for {
+		profilesOut, perr := client.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+			NextToken: nextToken,
+		})
+		if perr != nil {
+			// Profiles call may fail with AccessDeniedException on tightly-scoped
+			// roles. Log once and continue with whatever foundation models we
+			// already collected — better to show a partial list than an error.
+			slog.Warn("list inference profiles failed; CRIS variants may be missing from picker",
+				"component", "cloudtrail-analyzer",
+				"region", region,
+				"error", perr.Error(),
+			)
+			break
+		}
 		for _, p := range profilesOut.InferenceProfileSummaries {
 			pid := aws.ToString(p.InferenceProfileId)
 			if pid == "" {
@@ -724,15 +779,10 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 			seen[pid] = struct{}{}
 			profilesCount++
 		}
-	} else {
-		// Profiles call may fail with AccessDeniedException on tightly-scoped
-		// roles. Log once and continue with whatever foundation models we
-		// already collected — better to show a partial list than an error.
-		slog.Warn("list inference profiles failed; CRIS variants may be missing from picker",
-			"component", "cloudtrail-analyzer",
-			"region", region,
-			"error", perr.Error(),
-		)
+		if profilesOut.NextToken == nil || aws.ToString(profilesOut.NextToken) == "" {
+			break
+		}
+		nextToken = profilesOut.NextToken
 	}
 
 	slog.Info("listed Bedrock models",

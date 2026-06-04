@@ -6,7 +6,7 @@ BINARY := cloudtrail-analyzer
 DIST := ./dist
 WEB_DIST := web/dist
 
-.PHONY: build build-all frontend embed-assets test clean run dev install
+.PHONY: build build-all frontend embed-assets test test-race lint clean run dev install
 
 ## dev: Start both Go API server and Vite frontend with one command (Ctrl+C stops both)
 dev:
@@ -23,7 +23,7 @@ dev:
 build: frontend embed-assets
 	@echo "Building Go binary (version: $(VERSION))..."
 	@mkdir -p $(DIST)
-	go build -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY) ./cmd/analyzer
+	go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY) ./cmd/analyzer
 	@echo ""
 	@echo "Done → $(DIST)/$(BINARY)"
 	@echo "Run with: ./$(DIST)/$(BINARY)"
@@ -32,8 +32,8 @@ build: frontend embed-assets
 build-all: frontend embed-assets
 	@echo "Building multi-arch binaries (version: $(VERSION))..."
 	@mkdir -p $(DIST)
-	GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-arm64 ./cmd/analyzer
-	GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-amd64 ./cmd/analyzer
+	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-arm64 ./cmd/analyzer
+	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(DIST)/$(BINARY)-linux-amd64 ./cmd/analyzer
 	@echo ""
 	@echo "Done:"
 	@echo "  ARM64 (Graviton) → $(DIST)/$(BINARY)-linux-arm64"
@@ -44,7 +44,9 @@ install:
 	@echo "Installing Go dependencies..."
 	go mod download
 	@echo "Installing frontend dependencies..."
-	cd web && npm install
+	@# Use npm ci so the install honours package-lock.json exactly, matching
+	@# deploy.sh and avoiding lockfile drift between dev and deploy.
+	cd web && npm ci
 	@echo "Done."
 
 ## embed-assets: Copy frontend build output to cmd/analyzer/dist/ for go:embed
@@ -64,17 +66,43 @@ frontend:
 
 ## test: Run Go and frontend tests
 test:
-	@echo "Running Go tests..."
-	go test ./...
+	@echo "Running Go tests (with race detector)..."
+	go test -race ./...
 	@echo "Running frontend tests..."
-	cd web && npx vitest --run
+	@# --passWithNoTests so the suite does not fail with exit 1 when no
+	@# frontend test files exist yet (vitest exits non-zero otherwise).
+	cd web && npx vitest --run --passWithNoTests
 
-## clean: Remove build artifacts
+## test-race: Run Go tests with the race detector only (no frontend)
+test-race:
+	@echo "Running Go tests with race detector..."
+	go test -race ./...
+
+## lint: Check formatting (gofmt) and run go vet
+lint:
+	@echo "Checking gofmt..."
+	@unformatted="$$(gofmt -l . 2>/dev/null)"; \
+		if [ -n "$$unformatted" ]; then \
+			echo "These files are not gofmt-clean:"; \
+			echo "$$unformatted"; \
+			echo "Run: gofmt -w ."; \
+			exit 1; \
+		fi
+	@echo "Running go vet..."
+	go vet ./...
+	@echo "Lint passed."
+
+## clean: Remove build artifacts (keeps cmd/analyzer/dist/.gitkeep that go:embed needs)
 clean:
 	@echo "Cleaning..."
 	rm -rf $(DIST)
 	rm -rf $(WEB_DIST)
+	@# go:embed requires cmd/analyzer/dist to exist at compile time, with
+	@# .gitkeep as the tracked marker. Remove the built assets but recreate
+	@# the directory and its .gitkeep so a subsequent `go build` still works.
 	rm -rf cmd/analyzer/dist
+	@mkdir -p cmd/analyzer/dist
+	@touch cmd/analyzer/dist/.gitkeep
 
 ## run: Build production binary and execute
 run: build

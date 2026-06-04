@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -62,6 +63,16 @@ func (h *Handler) Routes() chi.Router {
 	r.Post("/index/cancel", h.CancelIndex)
 	return r
 }
+
+// MaxPromptChars bounds the size of a free-form NLQ prompt forwarded to the
+// paid LLM. The request body as a whole is already capped at 1 MiB by
+// render.DecodeStrictJSON, but that cap is far larger than any legitimate
+// question and would let a caller push ~1 MiB of text through the per-token
+// billing path on each Execute. This second, tighter bound is applied after
+// the concurrency/spend gates and before the model call so an oversized prompt
+// is rejected cheaply rather than being priced and sent. ~8000 chars ≈ 2000
+// input tokens, which is generous for a natural-language security question.
+const MaxPromptChars = 8000
 
 // ---------------------------------------------------------------------------
 // LLM rate-limit guards
@@ -152,12 +163,24 @@ func (h *Handler) Summarize(w http.ResponseWriter, r *http.Request) {
 	provider := NewProvider(h.cfg)
 	resp, err := Summarize(r.Context(), provider, req)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "summarize_error", err.Error())
+		// The underlying error can be a raw AWS SDK / provider string carrying
+		// the caller's principal ARN or endpoint. Log the raw value
+		// server-side and return a redacted message to the browser.
+		slog.Warn("summarize call failed",
+			"component", "cloudtrail-analyzer",
+			"error", err.Error(),
+		)
+		render.Error(w, http.StatusInternalServerError, "summarize_error", redactErrorString(err.Error(), h.cfg))
 		return
 	}
 
 	// Record spend the same way Execute does.
 	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
+
+	// Carry the estimate the backend actually computed (same rows + same
+	// system prompt that were sent) so the UI can reflect the real cost
+	// instead of the pre-flight banner's approximation. See P1-14.
+	resp.EstCostUSD = est.EstTotalCostUSD
 
 	render.JSON(w, http.StatusOK, resp)
 }
@@ -375,6 +398,16 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the prompt before it reaches the paid LLM. The concurrency and
+	// spend-cap gates above already ran; this rejects an oversized prompt
+	// cheaply so a caller can't forward ~1 MiB (the body cap) of text into the
+	// per-token billing path on each request.
+	if len(req.Prompt) > MaxPromptChars {
+		render.Error(w, http.StatusRequestEntityTooLarge, "prompt_too_large",
+			fmt.Sprintf("Question is too long (%d characters; limit %d). Ask a shorter question.", len(req.Prompt), MaxPromptChars))
+		return
+	}
+
 	// Compute the estimate before invoking the LLM and record it into the
 	// session counter once we have a result. Until provider responses surface
 	// real token usage, treat actual = estimated total; the counter is then a
@@ -386,7 +419,7 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 	result, err := h.svc.Execute(r.Context(), req.Prompt)
 	if err != nil {
 		// Errors before the model was billed don't count toward spend.
-		render.Error(w, http.StatusInternalServerError, "execution_error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "execution_error", redactErrorString(err.Error(), h.cfg))
 		return
 	}
 
@@ -395,5 +428,50 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 	// usage from the response body, swap the second arg to the real cost.
 	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
 
+	// A DuckDB failure surfaces as a 200 with the error fields populated. The
+	// raw engine output can echo the local data-dir absolute path and the AWS
+	// account/org IDs (they appear in the read_json() path). Keep the raw
+	// detail server-side only and hand the browser a redacted copy plus the
+	// user-facing hint.
+	if result.Error != "" || result.ErrorDetail != "" {
+		slog.Warn("duckdb query failed",
+			"component", "cloudtrail-analyzer",
+			"error", result.Error,
+			"detail", result.ErrorDetail,
+		)
+		result.Error = redactErrorString(result.Error, h.cfg)
+		result.ErrorDetail = redactErrorString(result.ErrorDetail, h.cfg)
+	}
+
 	render.JSON(w, http.StatusOK, result)
+}
+
+// redactErrorString removes locally-identifying detail from an engine/SDK error
+// string before it is returned to the browser. The raw string is still logged
+// server-side for diagnosis; this only strips what the client does not need:
+//   - the absolute local data directory path (filesystem layout disclosure)
+//   - the AWS account ID and org ID interpolated into the read_json() path
+//
+// It is deliberately conservative — it generalizes known-sensitive substrings
+// rather than attempting to parse the message — so a hint like "field not
+// found" still reaches the user intact.
+func redactErrorString(s string, cfg *config.Config) string {
+	if s == "" || cfg == nil {
+		return s
+	}
+	// Order matters: redact the longer/more-specific values first so a data
+	// dir that contains the account ID is generalized as a path, not split.
+	// These are exactly the config-derived values interpolated into the
+	// read_json() path that DuckDB echoes back in its stderr on error.
+	for _, secret := range []string{
+		cfg.DataDir,
+		cfg.S3.Bucket,
+		cfg.S3.OrgID,
+		cfg.S3.AccountID,
+	} {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, "[redacted]")
+		}
+	}
+	return s
 }

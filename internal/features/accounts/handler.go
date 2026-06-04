@@ -26,13 +26,13 @@ func NewHandler(resolver *Resolver, cfg *config.Config) *Handler {
 // Routes mounts under /api/accounts.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Get("/resolve", h.Resolve)              // GET  /api/accounts/resolve?ids=111,222
-	r.Get("/status", h.Status)                // GET  /api/accounts/status          (resolver state for UI hints)
+	r.Get("/resolve", h.Resolve)               // GET  /api/accounts/resolve?ids=111,222
+	r.Get("/status", h.Status)                 // GET  /api/accounts/status          (resolver state for UI hints)
 	r.Get("/discoverable", h.ListDiscoverable) // GET  /api/accounts/discoverable    (toolbar account picker payload)
-	r.Post("/refresh", h.RefreshOrg)          // POST /api/accounts/refresh         (force AWS Organizations refresh)
-	r.Get("/manual", h.ListManual)            // GET  /api/accounts/manual          (list overrides)
-	r.Put("/manual/{id}", h.UpsertManual)     // PUT  /api/accounts/manual/{id}     (set or clear an override)
-	r.Delete("/manual/{id}", h.DeleteManual)  // DELETE /api/accounts/manual/{id}
+	r.Post("/refresh", h.RefreshOrg)           // POST /api/accounts/refresh         (force AWS Organizations refresh)
+	r.Get("/manual", h.ListManual)             // GET  /api/accounts/manual          (list overrides)
+	r.Put("/manual/{id}", h.UpsertManual)      // PUT  /api/accounts/manual/{id}     (set or clear an override)
+	r.Delete("/manual/{id}", h.DeleteManual)   // DELETE /api/accounts/manual/{id}
 	return r
 }
 
@@ -75,7 +75,8 @@ type resolveResponse struct {
 }
 
 // Resolve returns names for the given comma-separated account IDs.
-//   GET /api/accounts/resolve?ids=247083000413,391114186676
+//
+//	GET /api/accounts/resolve?ids=123456789012,210987654321
 func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 	idsParam := r.URL.Query().Get("ids")
 	if idsParam == "" {

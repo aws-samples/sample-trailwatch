@@ -44,12 +44,12 @@ func TestBuildFilteredEventsExpr_TimeRange(t *testing.T) {
 
 func TestBuildFilteredEventsExpr_AccountFilterMatchesEither(t *testing.T) {
 	got := buildFilteredEventsExpr(fakeRead, InvestigateFilters{
-		AccountIDs: []string{"247083000413", "391114186676"},
+		AccountIDs: []string{"123456789012", "210987654321"},
 	})
-	if !strings.Contains(got, `r.recipientAccountId IN ('247083000413', '391114186676')`) {
+	if !strings.Contains(got, `r.recipientAccountId IN ('123456789012', '210987654321')`) {
 		t.Errorf("missing recipientAccountId predicate: %s", got)
 	}
-	if !strings.Contains(got, `r.userIdentity.accountId IN ('247083000413', '391114186676')`) {
+	if !strings.Contains(got, `r.userIdentity.accountId IN ('123456789012', '210987654321')`) {
 		t.Errorf("missing userIdentity.accountId predicate: %s", got)
 	}
 	if !strings.Contains(got, " OR ") {
@@ -60,9 +60,9 @@ func TestBuildFilteredEventsExpr_AccountFilterMatchesEither(t *testing.T) {
 func TestBuildFilteredEventsExpr_RejectsNonNumericAccountID(t *testing.T) {
 	// SQL injection payload should be silently dropped by isValidAccountID.
 	got := buildFilteredEventsExpr(fakeRead, InvestigateFilters{
-		AccountIDs: []string{"247083000413", "'; DROP TABLE events; --"},
+		AccountIDs: []string{"123456789012", "'; DROP TABLE events; --"},
 	})
-	if !strings.Contains(got, `'247083000413'`) {
+	if !strings.Contains(got, `'123456789012'`) {
 		t.Errorf("legit ID dropped: %s", got)
 	}
 	if strings.Contains(got, "DROP") || strings.Contains(got, "--") {
@@ -84,7 +84,7 @@ func TestBuildFilteredEventsExpr_AllNonNumericIDsCollapse(t *testing.T) {
 func TestBuildFilteredEventsExpr_TimeAndAccountTogether(t *testing.T) {
 	got := buildFilteredEventsExpr(fakeRead, InvestigateFilters{
 		TimeStart:  "2026-05-01",
-		AccountIDs: []string{"247083000413"},
+		AccountIDs: []string{"123456789012"},
 	})
 	// Should be one filtered subquery with two AND-joined predicates.
 	if !strings.Contains(got, "WHERE r.eventTime >= '2026-05-01' AND") {
@@ -100,18 +100,41 @@ func TestBuildFilteredEventsExpr_QuoteEscape(t *testing.T) {
 	}
 }
 
+func TestBuildSQL_EscapesDataPathQuote(t *testing.T) {
+	// H6: dataPath is assembled from config-derived values (S3 bucket, org_id,
+	// account_id) that settings accept with only an emptiness check. A single
+	// quote in any of them would otherwise break out of the read_json('...')
+	// literal and bypass the read-only allowlist. The path must be quote-doubled
+	// before it reaches the literal.
+	h := &InvestigateHandler{}
+	dataPath := "/data/s3/buck'et/AWSLogs/"
+	sql := h.buildSQL("iam-write-ops", "", dataPath, InvestigateFilters{})
+	if sql == "" {
+		t.Fatal("expected SQL for known scenario, got empty string")
+	}
+	// The escaped form (quote doubled) must be present...
+	if !strings.Contains(sql, `read_json('/data/s3/buck''et/AWSLogs/**/*.json'`) {
+		t.Errorf("data path single quote not escaped in read_json literal: %s", sql)
+	}
+	// ...and the raw single quote must NOT appear as a literal break-out
+	// (`buck'et` with a lone quote would close the literal early).
+	if strings.Contains(sql, `buck'et`) {
+		t.Errorf("raw unescaped quote leaked into SQL (literal break-out): %s", sql)
+	}
+}
+
 func TestIsValidAccountID(t *testing.T) {
 	cases := []struct {
 		in   string
 		want bool
 	}{
-		{"247083000413", true},
+		{"123456789012", true},
 		{"000000000000", true},
-		{"24708300041", false},  // 11 digits
-		{"2470830004130", false}, // 13 digits
+		{"24708300041", false},   // 11 digits
+		{"1234567890120", false}, // 13 digits
 		{"24708300041a", false},  // letter
 		{"", false},
-		{"   247083000413   ", false}, // whitespace
+		{"   123456789012   ", false}, // whitespace
 	}
 	for _, c := range cases {
 		got := isValidAccountID(c.in)

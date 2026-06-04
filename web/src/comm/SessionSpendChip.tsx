@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { DollarSign } from 'lucide-react'
 import { endpoints } from '../config/api'
 
+// Mirrors internal/features/nlquery/session_spend.go::SessionSpendSnapshot.
 interface Snapshot {
   queries: number
   estimated_usd: number
@@ -48,7 +49,8 @@ export function SessionSpendChip() {
 
   if (!snap || snap.queries === 0) return null
 
-  const cost = snap.estimated_usd
+  // Guard against a missing/NaN figure so the chip never renders "$NaN".
+  const cost = Number.isFinite(snap.estimated_usd) ? snap.estimated_usd : 0
   return (
     <span
       className="inline-flex items-center gap-1 text-[11px] text-gray-300"

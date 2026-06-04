@@ -82,6 +82,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Detect whether the SPA was actually built into the binary. The go:embed
+	// directive always matches the committed dist/.gitkeep, so a clean build that
+	// skipped `npm run build` produces a binary that silently serves an API-only
+	// placeholder with no build error. Surface that loudly: in a production build
+	// (make build / deploy.sh) this is a broken artifact; in dev mode (make dev /
+	// go run) it is expected because the Vite dev server serves the UI instead.
+	frontendEmbedded := FrontendEmbedded()
+	if !frontendEmbedded {
+		slog.Warn("no frontend assets embedded — serving API-only placeholder. "+
+			"This is expected in dev mode (use the Vite dev server at :5173). "+
+			"In a production build it means `npm run build` did not run before `go build`; "+
+			"rebuild via `make build` or deploy.sh so dist/index.html is embedded.",
+			"component", "cloudtrail-analyzer",
+			"frontend_embedded", false,
+		)
+	}
+
 	// Open SQLite database
 	db, err := database.NewDB(cfg.DataDir)
 	if err != nil {
@@ -96,13 +113,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Recover crashed sync sessions: any session left in an in-flight state
+	// (downloading/extracting/verifying) when the app last stopped cannot resume
+	// on its own and would otherwise be stuck forever. Mark them interrupted so
+	// the user can restart them from the UI. Non-fatal: a recovery failure should
+	// not block startup.
+	if interrupted, err := sessions.MarkInterrupted(db.Conn); err != nil {
+		slog.Warn("failed to recover interrupted sessions at startup",
+			"component", "cloudtrail-analyzer",
+			"error", err.Error(),
+		)
+	} else if interrupted > 0 {
+		slog.Info("marked in-flight sessions interrupted at startup",
+			"component", "cloudtrail-analyzer",
+			"count", interrupted,
+		)
+	}
+
 	// Record startup time for uptime calculation
 	startedAt := time.Now()
 
 	// Set up Chi router
 	r := chi.NewRouter()
 
-	// Apply middleware
+	// Apply middleware. TrustedHost runs first so a DNS-rebinding request is
+	// rejected before any handler (or even logging of a successful path) runs.
+	r.Use(middleware.TrustedHost(cfg))
 	r.Use(middleware.StructuredLogger)
 	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.CORS)
@@ -112,10 +148,11 @@ func main() {
 	r.Get("/api/health", func(w http.ResponseWriter, req *http.Request) {
 		uptime := time.Since(startedAt).Seconds()
 		render.JSON(w, http.StatusOK, map[string]interface{}{
-			"status":  "ok",
-			"version": version,
-			"uptime":  fmt.Sprintf("%.0fs", uptime),
-			"startup": startupStatus,
+			"status":            "ok",
+			"version":           version,
+			"uptime":            fmt.Sprintf("%.0fs", uptime),
+			"startup":           startupStatus,
+			"frontend_embedded": frontendEmbedded,
 		})
 	})
 
@@ -228,14 +265,10 @@ func main() {
 
 	// Serve embedded frontend assets in production, or fallback dev page.
 	// The frontendFS embed.FS is rooted at "dist/" inside cmd/analyzer/.
+	// frontendEmbedded (computed at startup via FrontendEmbedded) already
+	// confirmed whether dist/index.html is present in the embed.
 	frontendRoot, embErr := fs.Sub(frontendFS, "dist")
-	hasFrontend := embErr == nil
-	if hasFrontend {
-		// Check that index.html actually exists in the embed (build was run)
-		if _, err := fs.Stat(frontendRoot, "index.html"); err != nil {
-			hasFrontend = false
-		}
-	}
+	hasFrontend := frontendEmbedded && embErr == nil
 
 	if hasFrontend {
 		fileServer := http.FileServer(http.FS(frontendRoot))
@@ -319,6 +352,14 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down", "component", "cloudtrail-analyzer")
+
+	// Cancel detached sync pipelines BEFORE server.Shutdown. This stops
+	// download/extract goroutines from writing mid-batch and marks their
+	// sessions interrupted (recoverable on the next start). It also closes each
+	// pipeline's progress channel, which unblocks any in-flight SSE progress
+	// handler — otherwise server.Shutdown would block on that handler for the
+	// full timeout below while it waited on a channel that never closed.
+	processorHandler.Service().Shutdown()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

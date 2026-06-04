@@ -126,13 +126,13 @@ type VerifyLogsResponse struct {
 
 // BedrockModel represents a single model available in Bedrock.
 type BedrockModel struct {
-	ModelID      string `json:"model_id"`
-	ModelName    string `json:"model_name"`
-	Provider     string `json:"provider"`
-	InputModes   []string `json:"input_modes"`
-	OutputModes  []string `json:"output_modes"`
-	IsCRIS       bool   `json:"is_cris"`
-	CRISNote     string `json:"cris_note,omitempty"`
+	ModelID     string   `json:"model_id"`
+	ModelName   string   `json:"model_name"`
+	Provider    string   `json:"provider"`
+	InputModes  []string `json:"input_modes"`
+	OutputModes []string `json:"output_modes"`
+	IsCRIS      bool     `json:"is_cris"`
+	CRISNote    string   `json:"cris_note,omitempty"`
 }
 
 // ListBedrockModelsRequest represents a request to list models in a region.

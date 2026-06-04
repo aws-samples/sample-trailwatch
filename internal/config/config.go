@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/kelseyhightower/envconfig"
@@ -22,7 +24,22 @@ type Config struct {
 	// Host is the bind address. Defaults to 127.0.0.1 (loopback only) so a
 	// single-user local tool isn't reachable from the LAN. Set to "0.0.0.0"
 	// to expose the API on all interfaces.
-	Host                   string        `json:"host" envconfig:"HOST"`
+	Host string `json:"host" envconfig:"HOST"`
+	// TrustedHosts is the allowlist of Host header values the server accepts.
+	// It defends against DNS-rebinding: a website the user visits cannot make
+	// their browser send authenticated requests to the loopback server unless
+	// the Host header matches an entry here. localhost / 127.0.0.1 / [::1] (with
+	// or without the configured port) are always accepted; add extra hostnames
+	// here when fronting the app with an authenticating reverse proxy. Set a
+	// single entry "*" to disable the check (not recommended).
+	TrustedHosts []string `json:"trusted_hosts,omitempty" envconfig:"TRUSTED_HOSTS"`
+	// AllowAutoInstall gates the convenience auto-download of third-party
+	// binaries (DuckDB CLI, Ollama) by the running server. It defaults to
+	// false: the server will NOT fetch-and-execute installers on its own.
+	// When the binary is missing, startup reports an error with setup
+	// guidance instead. Set to true (or env CTA_ALLOW_AUTO_INSTALL=true) to
+	// opt back into the verified, checksum-pinned auto-install path.
+	AllowAutoInstall       bool          `json:"allow_auto_install,omitempty" envconfig:"CTA_ALLOW_AUTO_INSTALL"`
 	DataDir                string        `json:"data_dir" envconfig:"DATA_DIR"`
 	LogLevel               string        `json:"log_level" envconfig:"LOG_LEVEL"`
 	QueryTimeoutSeconds    int           `json:"query_timeout_seconds" envconfig:"QUERY_TIMEOUT_SECONDS"`
@@ -33,6 +50,87 @@ type Config struct {
 	Bedrock                BedrockConfig `json:"bedrock"`
 	LLM                    LLMConfig     `json:"llm"`
 }
+
+// TrustedHostAllowed reports whether the given Host header (which may include a
+// port) is permitted. Loopback names are always allowed; configured
+// TrustedHosts add to that set. A TrustedHosts entry of "*" disables the check.
+// This is the single source of truth used by the trusted-host middleware.
+func (c *Config) TrustedHostAllowed(hostHeader string) bool {
+	if hostHeader == "" {
+		// No Host header at all (HTTP/1.0 or a raw client). Reject — every
+		// real browser sends one, and an empty value can't be matched safely.
+		return false
+	}
+
+	// Split host:port if present. net.SplitHostPort fails on a bare host, so
+	// fall back to the raw value in that case.
+	host := hostHeader
+	if h, _, err := splitHostPort(hostHeader); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+
+	// Always-allowed loopback identities.
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+
+	for _, t := range c.TrustedHosts {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		if t == "*" {
+			return true
+		}
+		// Allow either a bare hostname or a host:port entry to match.
+		if th, _, err := splitHostPort(t); err == nil {
+			t = th
+		}
+		if t == host {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHostPort is a thin wrapper that only treats a value as host:port when it
+// genuinely parses as one, so IPv6 literals and bare hostnames are handled
+// without pulling the net import into every caller.
+func splitHostPort(hostport string) (host, port string, err error) {
+	// Reuse strconv to detect a trailing :port cheaply for the common case,
+	// but defer to net.SplitHostPort semantics via a minimal reimplementation
+	// to correctly handle bracketed IPv6 ([::1]:7070).
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
+		if end < 0 {
+			return "", "", errNoPort
+		}
+		host = hostport[1:end]
+		rest := hostport[end+1:]
+		if strings.HasPrefix(rest, ":") {
+			port = rest[1:]
+		}
+		return host, port, nil
+	}
+	i := strings.LastIndexByte(hostport, ':')
+	if i < 0 {
+		return "", "", errNoPort
+	}
+	// Guard against unbracketed IPv6 (multiple colons) being misread.
+	if strings.IndexByte(hostport, ':') != i {
+		return "", "", errNoPort
+	}
+	host = hostport[:i]
+	port = hostport[i+1:]
+	if _, convErr := strconv.Atoi(port); convErr != nil {
+		return "", "", errNoPort
+	}
+	return host, port, nil
+}
+
+var errNoPort = errors.New("no port in host header")
 
 // S3Config holds S3 bucket configuration.
 type S3Config struct {

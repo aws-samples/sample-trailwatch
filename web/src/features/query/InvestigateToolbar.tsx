@@ -62,6 +62,15 @@ const TIME_PRESETS: { id: 'last_24h' | 'last_7d' | 'last_30d' | 'custom_clear'; 
 
 const SEED_TYPE_OPTIONS: SeedType[] = ['arn', 'access_key', 'ip', 'account', 'user', 'role']
 
+// Presets store a full RFC3339 instant (true rolling window) while the
+// <input type="date"> controls only accept/display YYYY-MM-DD. dateInputValue
+// renders just the date portion so a preset still shows a sensible day in the
+// picker; editing the picker writes a plain YYYY-MM-DD back to state, which the
+// backend also accepts.
+function dateInputValue(v: string): string {
+  return v.slice(0, 10)
+}
+
 // Above this many discoverable accounts, switch from inline chips to a
 // popover. Tuned so the chip strip does not horizontally overflow on the
 // typical responder's screen.
@@ -183,14 +192,14 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
           <div className="flex items-center gap-1.5">
             <input
               type="date"
-              value={tb.state.timeStart}
+              value={dateInputValue(tb.state.timeStart)}
               onChange={(e) => tb.setTimeStart(e.target.value)}
               className="px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
             />
             <span className="text-xs text-gray-400">→</span>
             <input
               type="date"
-              value={tb.state.timeEnd}
+              value={dateInputValue(tb.state.timeEnd)}
               onChange={(e) => tb.setTimeEnd(e.target.value)}
               className="px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
             />

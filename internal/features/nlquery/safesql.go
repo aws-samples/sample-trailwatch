@@ -111,7 +111,7 @@ func ValidateReadSQL(sql string) error {
 	return nil
 }
 
-// stripStringLiterals replaces each '...' (with '' as the escape) by spaces of
+// stripStringLiterals replaces each '...' (with ” as the escape) by spaces of
 // the same length, preserving offsets so subsequent regexes match positionally.
 func stripStringLiterals(s string) string {
 	out := make([]byte, len(s))
@@ -157,6 +157,28 @@ func hasMultipleStatements(code string) bool {
 		}
 	}
 	return false
+}
+
+// escapeSQLLiteral escapes a string for safe interpolation INSIDE a
+// single-quoted DuckDB string literal. It doubles embedded single quotes (the
+// SQL-standard escape) so a value containing a quote cannot break out of the
+// literal and inject SQL. The caller is responsible for supplying the
+// surrounding quotes — see quoteSQLLiteral for the quoted form.
+//
+// This is the single escaping primitive used wherever config-derived values
+// (S3 bucket, org_id, account_id, region, data dir) are interpolated into the
+// read_json('...') path and other handcoded query fragments. Those values were
+// previously interpolated raw, so a quote in a bucket/org/account value could
+// break out of the literal and bypass the read-only allowlist.
+func escapeSQLLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// quoteSQLLiteral returns the value wrapped in single quotes with embedded
+// quotes doubled, e.g. `O'Brien` -> `'O”Brien'`. Use this when building a
+// complete quoted literal.
+func quoteSQLLiteral(s string) string {
+	return "'" + escapeSQLLiteral(s) + "'"
 }
 
 func firstWord(lower string) string {

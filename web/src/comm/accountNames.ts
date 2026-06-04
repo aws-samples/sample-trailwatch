@@ -51,18 +51,22 @@ function flushPending() {
   fetch(url)
     .then(res => (res.ok ? res.json() : Promise.reject(res.status)))
     .then((data: { entries: Entry[] }) => {
+      // A successful response is authoritative: the backend reports a real
+      // outcome for each ID, including a definitive "unresolved" (no manual
+      // mapping and no Organizations name). That IS cacheable — caching it
+      // stops us re-asking for an ID the backend has already told us it can't
+      // name. The UI falls back to the bare ID.
       for (const e of data.entries || []) cache.set(e.account_id, e)
       notify()
     })
     .catch(() => {
-      // Mark requested IDs as unresolved so we don't retry forever and the UI
-      // can fall back to the bare ID. They'll get a real value the next time
-      // refreshAccountNames is called.
-      for (const id of ids) {
-        if (!cache.has(id)) {
-          cache.set(id, { account_id: id, name: '', source: 'unresolved' })
-        }
-      }
+      // Transient failure (network error, 5xx, or a 403 UNTRUSTED_HOST from the
+      // Host-validation middleware). This is NOT a backend "unresolved" verdict,
+      // so do NOT poison the cache: caching these IDs as "unresolved" would pin
+      // them permanently and the UI would never recover after the blip clears.
+      // Leave them uncached so the next schedule() retries. The UI renders the
+      // bare ID in the meantime (a cache miss already falls back to the ID).
+      // notify() so any in-flight on-demand lookups settle to the bare ID.
       notify()
     })
 }
@@ -119,6 +123,29 @@ export function useAccountNames(ids: string[]): (id: string | null | undefined) 
 export function refreshAccountNames(ids: string[]): void {
   for (const id of ids) cache.delete(id)
   schedule(ids)
+}
+
+/**
+ * Drop every cached "unresolved" entry and re-fetch the affected IDs. Call this
+ * when the auth surface changes (e.g., the user pastes new STS credentials or
+ * forces an AWS Organizations refresh): an ID that resolved to "unresolved"
+ * under the old credentials may now have an Organizations name. Entries that
+ * already have a name (manual/organizations) are left untouched so a credential
+ * change does not flicker known names. Mirrors the backend resolver's
+ * OnCredentialsChanged, which clears its sticky-failure flag for the same reason.
+ */
+export function retryUnresolved(): void {
+  const stale: string[] = []
+  for (const [id, e] of cache) {
+    if (e.source === 'unresolved' || !e.name) {
+      stale.push(id)
+    }
+  }
+  for (const id of stale) cache.delete(id)
+  if (stale.length > 0) {
+    notify()
+    schedule(stale)
+  }
 }
 
 /**

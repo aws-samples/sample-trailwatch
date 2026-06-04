@@ -16,7 +16,7 @@ Two real responder modes are not served:
 Two cross-cutting QoL gaps were also called out:
 
 - Time window must be a first-class, deliberate choice — not implied by which logs are synced.
-- Account names should appear next to account IDs everywhere. `247083000413` means nothing under pressure; `prod-payments` means everything.
+- Account names should appear next to account IDs everywhere. `123456789012` means nothing under pressure; `prod-payments` means everything.
 
 ## Audience and scope
 

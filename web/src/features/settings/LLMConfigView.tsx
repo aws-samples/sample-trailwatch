@@ -52,6 +52,7 @@ export function LLMConfigView() {
   const [bedrockRegion, setBedrockRegion] = useState('ap-south-1')
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   // Bedrock model discovery
   const [bedrockModels, setBedrockModels] = useState<BedrockModel[]>([])
@@ -74,11 +75,11 @@ export function LLMConfigView() {
 
   useEffect(() => {
     if (settings) {
-      setProvider((settings as any).llm?.provider || 'bedrock')
-      setModel((settings as any).llm?.model || '')
-      setEndpoint((settings as any).llm?.endpoint || '')
-      setBedrockRegion((settings as any).bedrock?.region || 'ap-south-1')
-      setSelectedModelId((settings as any).bedrock?.model_id || '')
+      setProvider((settings.llm?.provider as Provider) || 'bedrock')
+      setModel(settings.llm?.model || '')
+      setEndpoint(settings.llm?.endpoint || '')
+      setBedrockRegion(settings.bedrock?.region || 'ap-south-1')
+      setSelectedModelId(settings.bedrock?.model_id || '')
     }
   }, [settings])
 
@@ -148,6 +149,7 @@ export function LLMConfigView() {
   const save = useCallback(async () => {
     setSaving(true)
     setSaved(false)
+    setSaveError(null)
     try {
       const body: Record<string, string> = { llm_provider: provider }
       if (apiKey) body.llm_api_key = apiKey
@@ -165,15 +167,19 @@ export function LLMConfigView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (res.ok) {
-        setSaved(true)
-        refetch()
-        setTimeout(() => setSaved(false), 3000)
+      if (!res.ok) {
+        setSaveError(await readApiError(res, t('settings.llm.saveFailed', { defaultValue: 'Failed to save settings' })))
+        return
       }
+      setSaved(true)
+      refetch()
+      setTimeout(() => setSaved(false), 3000)
+    } catch (e) {
+      setSaveError((e as Error)?.message || t('settings.llm.saveFailed', { defaultValue: 'Failed to save settings' }))
     } finally {
       setSaving(false)
     }
-  }, [provider, apiKey, model, endpoint, bedrockRegion, selectedModelId, refetch])
+  }, [provider, apiKey, model, endpoint, bedrockRegion, selectedModelId, refetch, t])
 
   if (settingsLoading) {
     return (
@@ -183,7 +189,7 @@ export function LLMConfigView() {
     )
   }
 
-  const activeProvider = (settings as any)?.llm?.provider || 'bedrock'
+  const activeProvider = settings?.llm?.provider || 'bedrock'
 
   const matchesSearch = (m: BedrockModel) => {
     if (!modelSearch.trim()) return true
@@ -473,7 +479,7 @@ export function LLMConfigView() {
                 placeholder={provider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
                 className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
               />
-              {(settings as any)?.llm?.has_key && !apiKey && (
+              {settings?.llm?.has_key && !apiKey && (
                 <p className="text-[10px] text-green-600 mt-1">{t('settings.llm.apiKeyConfigured')}</p>
               )}
             </div>
@@ -551,6 +557,11 @@ export function LLMConfigView() {
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Brain className="w-4 h-4" />}
             {saving ? t('settings.llm.saving') : saved ? t('settings.llm.saved') : t('settings.llm.saveActivate')}
           </button>
+          {saveError && (
+            <div className="mt-2 p-2.5 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+              <p className="text-xs text-red-700 dark:text-red-300">{saveError}</p>
+            </div>
+          )}
         </div>
 
         {/* Test this model — sends one NLQ to validate the model is reachable
@@ -606,7 +617,7 @@ export function LLMConfigView() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(testResult.rows as unknown[][] || []).slice(0, 20).map((row, ri) => (
+                      {testResult.rows.slice(0, 20).map((row, ri) => (
                         <tr key={ri} className="border-b border-gray-100 dark:border-gray-800">
                           {row.map((cell, ci) => (
                             <td key={ci} className="px-2 py-1 align-top text-gray-900 dark:text-gray-100 max-w-[260px]">

@@ -15,6 +15,14 @@ import (
 
 const (
 	// maxPerFileBytes is the maximum decompressed size for a single .json.gz file (256 MB).
+	//
+	// This is kept in lockstep with the read side: every read_json(...) call in
+	// the nlquery package now passes maximum_object_size=268435456 (256 MB) via
+	// the maxObjectSize constant (indexer.go), so a decompressed CloudTrail file
+	// the extractor accepts up to 256 MB is no longer rejected by DuckDB's
+	// per-object cap during indexing or querying (resolves N20/N30). If this cap
+	// is raised, raise maxObjectSize to match; lowering this extractor cap would
+	// truncate large-but-valid files mid-record and is intentionally not done.
 	maxPerFileBytes int64 = 256 * 1024 * 1024
 	// maxTotalExtractBytes is the maximum total decompressed output for one extraction run (4 GB).
 	maxTotalExtractBytes int64 = 4 * 1024 * 1024 * 1024

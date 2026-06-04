@@ -69,6 +69,23 @@ const SEVERITY_STYLES: Record<Severity, { bg: string, border: string, text: stri
 
 const COLORS = ['#3b82f6', '#8b5cf6', '#06b6d4', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#6366f1']
 
+// Coerce a DuckDB cell to a number. The backend now returns real JSON null for
+// SQL NULL (no longer the string "NULL"), so null/empty cells must be treated
+// as 0 rather than coerced to NaN (N98/N103). Non-numeric strings also fall
+// back to 0 so a single bad cell can't render "NaN" into a metric or chart.
+function toNum(v: unknown): number {
+  if (v === null || v === undefined || v === '') return 0
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
+
+// Compute a whole-number percentage, guarding against divide-by-zero so 0/0
+// renders 0% instead of "NaN%" (N94).
+function pct(part: number, whole: number): number {
+  if (!whole || !Number.isFinite(whole) || !Number.isFinite(part)) return 0
+  return Math.round((part / whole) * 100)
+}
+
 const FINDINGS: FindingDef[] = [
   { id: 'root-account-usage', title: 'Root Account Usage', description: 'API calls by AWS root account', severity: 'CRITICAL', category: 'Malicious Activity', promptId: 'root-account-usage', scenarioId: 'gd-root-usage' },
   { id: 'cloudtrail-changes', title: 'CloudTrail Tampering', description: 'StopLogging, DeleteTrail, audit config changes', severity: 'CRITICAL', category: 'Operational Changes', promptId: 'cloudtrail-changes', scenarioId: 'gd-logging-disabled' },
@@ -205,17 +222,33 @@ export function DashboardView({ navigate }: DashboardViewProps) {
   if (!data) return <div />
 
   const summary = data.summary?.rows?.[0]
-  const totalEvents = summary ? Number(summary[0]) : 0
-  const uniqueIdentities = summary ? Number(summary[1]) : 0
-  const uniqueIPs = summary ? Number(summary[2]) : 0
-  const errorEvents = summary ? Number(summary[3]) : 0
-  const errorRate = summary ? Number(summary[4]) : 0
-  const uniqueServices = summary ? Number(summary[5]) : 0
-  const earliestEvent = summary ? String(summary[6]).slice(0, 16) : ''
-  const latestEvent = summary ? String(summary[7]).slice(0, 16) : ''
+  const totalEvents = toNum(summary?.[0])
+  const uniqueIdentities = toNum(summary?.[1])
+  const uniqueIPs = toNum(summary?.[2])
+  const errorEvents = toNum(summary?.[3])
+  const errorRate = toNum(summary?.[4])
+  const uniqueServices = toNum(summary?.[5])
+  // Date columns can come back as real null on an empty index; only stringify
+  // when present so we don't render "null" into the header (N98/N103).
+  const earliestEvent = summary?.[6] != null ? String(summary[6]).slice(0, 16) : ''
+  const latestEvent = summary?.[7] != null ? String(summary[7]).slice(0, 16) : ''
 
-  const identityData = (data.identity_types?.rows || []).map(r => ({ name: String(r[0]), value: Number(r[1]) }))
-  const hourlyData = (data.hourly_volume?.rows || []).map(r => ({ hour: `${String(r[0]).padStart(2, '0')}:00`, total: Number(r[1]), errors: Number(r[2]), writes: Number(r[3]) }))
+  const identityData = (data.identity_types?.rows || []).map(r => ({ name: String(r[0]), value: toNum(r[1]) }))
+
+  // Build a complete 0..23 hour series and merge in the queried counts. The
+  // query only returns rows for hours that had events, so plotting it directly
+  // drops empty hours and the line gets connected across non-adjacent buckets,
+  // drawing phantom activity (N83/N100). Seeding every hour with zero keeps the
+  // line truthful. write_ops is intentionally not plotted (N102).
+  const hourlyByHour = new Map<number, { total: number; errors: number }>()
+  ;(data.hourly_volume?.rows || []).forEach(r => {
+    const h = toNum(r[0])
+    if (h >= 0 && h <= 23) hourlyByHour.set(h, { total: toNum(r[1]), errors: toNum(r[2]) })
+  })
+  const hourlyData = Array.from({ length: 24 }, (_, h) => {
+    const counts = hourlyByHour.get(h)
+    return { hour: `${String(h).padStart(2, '0')}:00`, total: counts?.total ?? 0, errors: counts?.errors ?? 0 }
+  })
 
   const severityCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
   FINDINGS.forEach(f => severityCounts[f.severity]++)
@@ -236,22 +269,21 @@ export function DashboardView({ navigate }: DashboardViewProps) {
   function getFindingCount(id: string): string {
     const s = findingSummaries[id]
     if (!s?.rows?.length) return findingsLoading ? '...' : '0'
-    const row = (s.rows as any[])[0]
-    if (!row || !row[0]) return '0'
-    return String(row[0])
+    const cell = s.rows[0]?.[0]
+    // The count cell is a real number, or null/empty for SQL NULL (N98/N103);
+    // toNum maps both null and a non-numeric value to 0 rather than "NaN".
+    return String(toNum(cell))
   }
 
   function getFindingExtra(id: string): string {
-    try {
-      const s = findingSummaries[id]
-      if (!s) return ''
-      const rows = s.rows as any[][] | null
-      const cols = s.columns as string[] | null
-      if (!rows || rows.length === 0 || !cols || cols.length < 2) return ''
-      const val = rows[0]?.[1]
-      if (!val) return ''
-      return `${val} ${cols[1]!.replace(/_/g, ' ')}`
-    } catch { return '' }
+    const s = findingSummaries[id]
+    const rows = s?.rows
+    const cols = s?.columns
+    if (!rows || rows.length === 0 || !cols || cols.length < 2) return ''
+    const val = rows[0]?.[1]
+    // Treat real null / empty as "no extra"; don't render the string "null".
+    if (val === null || val === undefined || val === '') return ''
+    return `${val} ${cols[1]!.replace(/_/g, ' ')}`
   }
 
   return (
@@ -310,20 +342,20 @@ export function DashboardView({ navigate }: DashboardViewProps) {
                       {identityData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                     </Pie>
                     <Tooltip contentStyle={{ fontSize: '10px', borderRadius: '6px' }} formatter={(v: any, n: any) => {
-                      const total = identityData.reduce((a, d) => a + d.value, 0) || 1
-                      const num = Number(v) || 0
-                      return [`${num} (${((num / total) * 100).toFixed(0)}%)`, String(n)]
+                      const total = identityData.reduce((a, d) => a + d.value, 0)
+                      const num = toNum(v)
+                      return [`${num} (${pct(num, total)}%)`, String(n)]
                     }} />
                   </PieChart>
                 </ResponsiveContainer>
                 <ul className="mt-2 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] text-gray-700 dark:text-gray-300">
                   {(() => {
-                    const total = identityData.reduce((a, d) => a + d.value, 0) || 1
+                    const total = identityData.reduce((a, d) => a + d.value, 0)
                     return identityData.map((d, i) => (
                       <li key={d.name} className="flex items-center gap-1.5 min-w-0">
                         <span className="inline-block w-2 h-2 rounded-sm flex-shrink-0" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
                         <span className="truncate" title={d.name}>{d.name}</span>
-                        <span className="ml-auto tabular-nums text-gray-500 dark:text-gray-400">{((d.value / total) * 100).toFixed(0)}%</span>
+                        <span className="ml-auto tabular-nums text-gray-500 dark:text-gray-400">{pct(d.value, total)}%</span>
                       </li>
                     ))
                   })()}

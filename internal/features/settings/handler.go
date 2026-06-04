@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
@@ -164,6 +165,39 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		if !validMethods[req.AuthMethod] {
 			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "auth_method must be one of: imds, session_credentials, sso, static", map[string]string{
 				"field": "auth_method",
+			})
+			return
+		}
+	}
+
+	// Validate path-bearing fields against path traversal (N91). bucket,
+	// account_id, org_id, log_region, and each member account ID are
+	// interpolated into local filesystem paths (constructLocalPath,
+	// sessionLocalDir) and into S3 prefixes. A value containing a slash, a
+	// ".." segment, a null byte, or a leading "." could redirect a write
+	// outside the data dir or escape the intended prefix. Reject them here so
+	// the values that reach the path-construction code are already sanitized.
+	pathFields := map[string]string{
+		"bucket":     req.Bucket,
+		"account_id": req.AccountID,
+		"org_id":     req.OrgID,
+		"log_region": req.LogRegion,
+	}
+	for field, val := range pathFields {
+		if val == "" {
+			continue
+		}
+		if !isSafePathSegment(val) {
+			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "value contains characters not allowed in a path segment (no '/', '\\', '..', or control characters)", map[string]string{
+				"field": field,
+			})
+			return
+		}
+	}
+	for _, acct := range req.MemberAccounts {
+		if acct != "" && !isSafePathSegment(acct) {
+			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "member account ID contains characters not allowed in a path segment", map[string]string{
+				"field": "member_accounts",
 			})
 			return
 		}
@@ -330,6 +364,18 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Session credentials are stored in the process environment so the AWS SDK
+	// credential chain can pick them up (see Service.loadAWSConfig). NOTE on
+	// credential exposure (N23): once these AWS_* vars are set on the process,
+	// a child process spawned via exec.Command inherits them by default
+	// (os/exec copies os.Environ when cmd.Env is nil). The DuckDB and Ollama
+	// subprocesses spawned in the nlquery package do NOT need AWS credentials —
+	// they read local files / a local model server — so those exec sites should
+	// pass a filtered cmd.Env that drops AWS_* to avoid leaking live credentials
+	// into unrelated subprocesses. That scrubbing belongs at the exec.Command
+	// call sites (internal/features/nlquery/{service.go,indexer.go,provider.go}
+	// and internal/startup/validator.go), which are owned elsewhere; flagged for
+	// the orchestrator.
 	os.Setenv("AWS_ACCESS_KEY_ID", req.AccessKeyID)
 	os.Setenv("AWS_SECRET_ACCESS_KEY", req.SecretAccessKey)
 	os.Setenv("AWS_SESSION_TOKEN", req.SessionToken)
@@ -541,4 +587,30 @@ func (h *Handler) VerifyLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	render.JSON(w, http.StatusOK, result)
+}
+
+// isSafePathSegment reports whether v is safe to interpolate into a single
+// filesystem path segment or S3 prefix component. It rejects path separators
+// ("/" or "\"), parent-directory references (".."), a leading "." (hidden /
+// relative markers), and control characters including the null byte. This is a
+// conservative allowlist of shape rather than a per-field format check: bucket,
+// account_id, org_id, log_region, and member account IDs all flow into local
+// write paths, so any value that could redirect a write is refused before it is
+// persisted (N91 / pairs with the path-traversal guard in constructLocalPath).
+func isSafePathSegment(v string) bool {
+	if v == "" {
+		return false
+	}
+	if v == ".." || strings.HasPrefix(v, ".") {
+		return false
+	}
+	if strings.Contains(v, "..") {
+		return false
+	}
+	for _, r := range v {
+		if r == '/' || r == '\\' || r == 0 || r < 0x20 {
+			return false
+		}
+	}
+	return true
 }

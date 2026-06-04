@@ -290,10 +290,15 @@ function formatRelativeTime(iso: string): string {
 function IndexProgressCard() {
   const { t } = useTranslation()
   const { status, refresh } = useIndexStatus()
-  const { data: progress, done, active, connect } = useIndexProgress()
+  const { data: progress, done, active, connect, disconnect } = useIndexProgress()
+  // Tracks whether we've already opened a stream for the current build episode.
+  // Without this guard the effect would re-`connect()` every time the hook flips
+  // `active` to false (e.g. between backoff retries), defeating the backoff.
+  const streamingRef = useRef(false)
 
   const handleBuild = async () => {
     await fetch(endpoints.indexBuild, { method: 'POST' })
+    streamingRef.current = true
     connect()
     refresh()
   }
@@ -307,11 +312,19 @@ function IndexProgressCard() {
     if (done) refresh()
   }, [done, refresh])
 
+  // Open the live stream once per build episode and tear it down when the build
+  // leaves the "building" state. The hook owns reconnect-with-backoff while the
+  // build is in progress, so we must not re-connect on every `active` flip.
   useEffect(() => {
-    if (status?.index_status === 'building' && !active) {
+    const building = status?.index_status === 'building'
+    if (building && !streamingRef.current) {
+      streamingRef.current = true
       connect()
+    } else if (!building && streamingRef.current) {
+      streamingRef.current = false
+      disconnect()
     }
-  }, [status, active, connect])
+  }, [status, connect, disconnect])
 
   const pct = progress?.percentage || 0
   const isBuilding = status?.index_status === 'building' || active
@@ -347,10 +360,10 @@ function IndexProgressCard() {
           </div>
           <div className="flex items-center justify-between mb-3">
             <span className="text-[11px] text-gray-700 dark:text-gray-300">
-              {formatBytes(progress.processed_bytes)} / {formatBytes(progress.total_bytes)}
+              {formatBytes(progress.processed_bytes || 0)} / {formatBytes(progress.total_bytes || 0)}
             </span>
             <span className="text-[11px] text-gray-700 dark:text-gray-300">
-              {t('data.sync.indexProgress', { processed: progress.processed_files, total: progress.total_files, pct: pct.toFixed(0) })}
+              {t('data.sync.indexProgress', { processed: progress.processed_files || 0, total: progress.total_files || 0, pct: pct.toFixed(0) })}
             </span>
           </div>
           <button type="button" onClick={handleCancel}
@@ -412,16 +425,33 @@ function IndexProgressCard() {
   )
 }
 
+const ACTIVE_SESSION_STATES: ReadonlySet<string> = new Set(['downloading', 'extracting', 'verifying'])
+
 function ActiveSessionCard({ session, snapshot }: { session: Session, snapshot?: ProgressSnapshot }) {
   const { t } = useTranslation()
   const [cancelling, setCancelling] = useState(false)
+
+  // Clear the latched "cancelling" state once the session leaves an active state
+  // (completed/failed/interrupted) so the button doesn't stay stuck if the card
+  // is still mounted during the transition.
+  useEffect(() => {
+    if (!ACTIVE_SESSION_STATES.has(session.state)) setCancelling(false)
+  }, [session.state])
 
   async function handleCancel() {
     if (cancelling) return
     setCancelling(true)
     try {
-      await fetch(endpoints.sessionCancel(session.id), { method: 'POST' })
-    } catch { /* best-effort; the backend may already be tearing down */ }
+      const res = await fetch(endpoints.sessionCancel(session.id), { method: 'POST' })
+      // A failed cancel request should not leave the button latched forever; the
+      // user may want to retry. (A successful cancel transitions the session to a
+      // terminal state, which clears the flag via the effect above.)
+      if (!res.ok) setCancelling(false)
+    } catch {
+      // best-effort; the backend may already be tearing down. Reset so the
+      // control is usable again if the request itself failed.
+      setCancelling(false)
+    }
   }
 
   const pct = snapshot?.percentage || 0

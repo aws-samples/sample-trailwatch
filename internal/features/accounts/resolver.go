@@ -22,6 +22,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
+	smithy "github.com/aws/smithy-go"
 )
 
 // Source values stored in account_names.source.
@@ -53,13 +54,21 @@ type Entry struct {
 // uses per-connection mutexes), but ResolveMany takes a copy of the cache into
 // a map per call and is safe to invoke from many goroutines.
 type Resolver struct {
-	db        *sql.DB
-	loadAWS   AWSConfigLoader
-	region    string // region for the Organizations endpoint
-	mu        sync.Mutex
-	lastOrg   time.Time
-	orgFailed bool   // sticky once we've seen AccessDenied; avoids repeated calls
-	lastErr   string // most recent error message from a refresh attempt, surfaced to UI
+	db      *sql.DB
+	loadAWS AWSConfigLoader
+	region  string // region for the Organizations endpoint
+	mu      sync.Mutex
+	lastOrg time.Time
+	// orgFailed is sticky ONLY for permanent failures (the principal can't
+	// list Organizations, or the account isn't in an org). Transient failures
+	// — throttling, timeouts, 5xx, network errors — do not set it, so the next
+	// refresh retries instead of serving "no AWS access" forever after one
+	// blip. See isPermanentOrgError.
+	orgFailed bool
+	// lastErr is a generalized, user-safe description of the most recent
+	// refresh failure surfaced to the UI. The raw SDK error (which can carry a
+	// principal ARN or endpoint) is logged server-side, not stored here.
+	lastErr string
 }
 
 // NewResolver creates a resolver bound to the given SQLite handle and AWS config
@@ -71,6 +80,61 @@ func NewResolver(db *sql.DB, loadAWS AWSConfigLoader, region string) *Resolver {
 		region = "us-east-1"
 	}
 	return &Resolver{db: db, loadAWS: loadAWS, region: region}
+}
+
+// permanentOrgErrorCodes are the Organizations API error codes that mean
+// "retrying with the same credentials won't help": the principal is not
+// permitted to list accounts, or this account is not part of an organization.
+// Only these make the failure sticky. Everything else (throttling, timeouts,
+// 5xx, transient network errors) is treated as recoverable so the next refresh
+// retries.
+var permanentOrgErrorCodes = map[string]struct{}{
+	"AccessDeniedException":             {},
+	"AWSOrganizationsNotInUseException": {},
+	"AccountNotRegisteredException":     {},
+}
+
+// isPermanentOrgError reports whether err is a permanent Organizations failure
+// (one that should stick) versus a transient one (one we should retry). A
+// non-API error — a DNS failure, a dropped connection, a context deadline — is
+// treated as transient.
+func isPermanentOrgError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		_, permanent := permanentOrgErrorCodes[apiErr.ErrorCode()]
+		return permanent
+	}
+	return false
+}
+
+// refreshFailureMessage returns a generalized, user-safe description of an
+// Organizations refresh failure for the Status UI. It deliberately does not
+// include the raw SDK error string, which can carry the caller's principal ARN
+// or the resolved endpoint.
+func refreshFailureMessage(err error) string {
+	if isPermanentOrgError(err) {
+		return "AWS Organizations is not available to the configured credentials. Set account names manually in Settings."
+	}
+	return "A transient error occurred while listing AWS Organizations accounts; it will be retried."
+}
+
+// recordRefreshFailure stores the generalized error and only marks the failure
+// sticky when it is permanent. The raw error is logged server-side by the
+// caller. Must be called with r.mu unheld.
+//
+// On a permanent failure it advances lastOrg so unforced retries are gated the
+// same as a success. On a transient failure it leaves lastOrg untouched so the
+// TTL gate does not block the next unforced retry — otherwise a single blip
+// would suppress refreshes for the full orgRefreshTTL window.
+func (r *Resolver) recordRefreshFailure(err error) {
+	permanent := isPermanentOrgError(err)
+	r.mu.Lock()
+	r.orgFailed = permanent
+	r.lastErr = refreshFailureMessage(err)
+	if permanent {
+		r.lastOrg = time.Now()
+	}
+	r.mu.Unlock()
 }
 
 // ResolveMany looks up names for the given account IDs. It does not call AWS;
@@ -169,11 +233,14 @@ func (r *Resolver) OnCredentialsChanged() {
 // cannot list Organizations (e.g., running from a Control Tower log archive
 // account, where ListAccounts is denied by design).
 type Status struct {
-	OrgAvailable  bool      `json:"org_available"`
-	LastAttempt   time.Time `json:"last_attempt,omitempty"`
-	LastError     string    `json:"last_error,omitempty"`
-	OrgEntries    int       `json:"org_entries"`
-	ManualEntries int       `json:"manual_entries"`
+	OrgAvailable bool      `json:"org_available"`
+	LastAttempt  time.Time `json:"last_attempt,omitempty"`
+	// LastError is a generalized, user-safe description of the most recent
+	// refresh failure — not the raw SDK error (which can carry a principal ARN
+	// or endpoint). The raw error is logged server-side.
+	LastError     string `json:"last_error,omitempty"`
+	OrgEntries    int    `json:"org_entries"`
+	ManualEntries int    `json:"manual_entries"`
 }
 
 // DiscoverableAccount is one row in the toolbar's account picker. Combines
@@ -297,11 +364,14 @@ func (r *Resolver) Status(ctx context.Context) (Status, error) {
 // of accounts learned. force=true bypasses the in-memory TTL gate; otherwise
 // the call is skipped if the last successful refresh was within orgRefreshTTL.
 //
-// Failures are logged and remembered so subsequent unforced calls become
-// no-ops; the resolver still serves whatever cache and manual entries exist.
-// Callers should invoke OnCredentialsChanged when auth changes, otherwise the
-// sticky-failure flag will keep skipping refreshes even after the underlying
-// problem is fixed.
+// Permanent failures (the principal can't list Organizations, or the account
+// isn't in an org) are remembered so subsequent unforced calls become no-ops;
+// the resolver still serves whatever cache and manual entries exist. Transient
+// failures (throttling, timeouts, 5xx, network errors) are NOT made sticky, so
+// the next refresh retries rather than poisoning account IDs as "unresolved"
+// after one blip. Callers should still invoke OnCredentialsChanged when auth changes,
+// otherwise the sticky permanent-failure flag keeps skipping refreshes even
+// after the underlying problem is fixed.
 func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, error) {
 	r.mu.Lock()
 	if !force && time.Since(r.lastOrg) < orgRefreshTTL {
@@ -316,11 +386,14 @@ func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, e
 
 	awsCfg, err := r.loadAWS(ctx, r.region)
 	if err != nil {
-		r.mu.Lock()
-		r.orgFailed = true
-		r.lastErr = err.Error()
-		r.lastOrg = time.Now()
-		r.mu.Unlock()
+		// A config-load failure is a local/transient problem (missing creds,
+		// IMDS unreachable), not a permanent Organizations denial — keep it
+		// non-sticky so a later refresh retries once creds are in place.
+		r.recordRefreshFailure(err)
+		slog.Warn("organizations refresh could not load aws config",
+			"component", "cloudtrail-analyzer",
+			"error", err.Error(),
+		)
 		return 0, fmt.Errorf("loading aws config: %w", err)
 	}
 	client := organizations.NewFromConfig(awsCfg)
@@ -330,13 +403,13 @@ func (r *Resolver) RefreshOrganizations(ctx context.Context, force bool) (int, e
 	for {
 		out, err := client.ListAccounts(ctx, &organizations.ListAccountsInput{NextToken: token})
 		if err != nil {
-			r.mu.Lock()
-			r.orgFailed = true
-			r.lastErr = err.Error()
-			r.lastOrg = time.Now()
-			r.mu.Unlock()
+			// Only a permanent error (AccessDenied / not-in-org) sticks; a
+			// transient error stays retryable so account names aren't pinned
+			// "unresolved" after a single throttle or timeout.
+			r.recordRefreshFailure(err)
 			slog.Warn("organizations list_accounts failed; account names will fall back to manual mappings",
 				"component", "cloudtrail-analyzer",
+				"permanent", isPermanentOrgError(err),
 				"error", err.Error(),
 			)
 			return count, err

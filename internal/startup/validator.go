@@ -3,7 +3,9 @@ package startup
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"cloudtrail-analyzer/internal/config"
@@ -48,7 +51,10 @@ type StartupStatus struct {
 //
 // Non-blocking checks (report status, don't fail startup):
 //   - Credentials availability
-//   - DuckDB CLI availability (auto-installed from GitHub if missing)
+//   - DuckDB CLI availability. When cfg.AllowAutoInstall is true, a missing CLI
+//     is auto-installed from GitHub after SHA-256 verification of the release
+//     archive; otherwise startup reports an error with setup guidance and does
+//     not download anything.
 func Validate(cfg *config.Config) (*StartupStatus, error) {
 	status := &StartupStatus{}
 
@@ -65,8 +71,8 @@ func Validate(cfg *config.Config) (*StartupStatus, error) {
 	// Check 3: Credentials — non-blocking
 	checkCredentials(cfg, status)
 
-	// Check 4: DuckDB CLI — verify present, auto-install if missing (non-blocking)
-	checkDuckDB(status)
+	// Check 4: DuckDB CLI — verify present; auto-install if missing and allowed (non-blocking)
+	checkDuckDB(status, cfg.AllowAutoInstall)
 
 	slog.Info("startup validation complete",
 		"data_dir", status.DataDir.Status,
@@ -210,8 +216,10 @@ func checkCredentials(cfg *config.Config, status *StartupStatus) {
 }
 
 // checkDuckDB verifies the DuckDB CLI is available in PATH.
-// If not found, it attempts to download and install it automatically.
-func checkDuckDB(status *StartupStatus) {
+// If not found and allowAutoInstall is true, it downloads, verifies (SHA-256),
+// and installs the CLI automatically. When auto-install is disabled, a missing
+// CLI is reported as an error with setup guidance and nothing is downloaded.
+func checkDuckDB(status *StartupStatus, allowAutoInstall bool) {
 	// Check if duckdb is already in PATH
 	path, err := exec.LookPath("duckdb")
 	if err == nil {
@@ -223,6 +231,20 @@ func checkDuckDB(status *StartupStatus) {
 		status.DuckDB = CheckResult{
 			Status:  "ok",
 			Message: fmt.Sprintf("DuckDB CLI available: %s (version %s)", path, ver),
+		}
+		return
+	}
+
+	// Not in PATH. Only fetch-and-execute an installer when the operator has
+	// explicitly opted in; otherwise report an error with setup guidance.
+	if !allowAutoInstall {
+		slog.Warn("duckdb CLI not found in PATH and auto-install is disabled",
+			"component", "cloudtrail-analyzer",
+		)
+		status.DuckDB = CheckResult{
+			Status: "error",
+			Message: "DuckDB CLI not found; install it (https://duckdb.org/docs/installation/) " +
+				"or set allow_auto_install:true in config.json to let the server download it",
 		}
 		return
 	}
@@ -285,11 +307,49 @@ func getDuckDBVersion(path string) (string, error) {
 	if !allowedDuckDBPaths[path] && !allowedDuckDBPaths[resolved] {
 		return "", fmt.Errorf("duckdb path not in allowlist: %s", path)
 	}
-	out, err := exec.Command(path, "--version").Output() // nosemgrep: dangerous-exec-command
+	cmd := exec.Command(path, "--version") // nosemgrep: dangerous-exec-command
+	// The version probe needs no AWS credentials; strip them from the
+	// subprocess environment so they aren't exposed to the DuckDB binary (N23).
+	cmd.Env = scrubbedEnvNoAWS()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
 	return string(bytes.TrimSpace(out)), nil
+}
+
+// scrubbedEnvNoAWS returns a copy of the process environment with AWS
+// credential variables removed, for subprocesses (the DuckDB version probe)
+// that have no need for the operator's AWS credentials (N23). Non-credential
+// AWS settings such as AWS_REGION are preserved. This mirrors the helper in the
+// nlquery package; it is duplicated here to avoid a package dependency from the
+// startup checks into a feature package.
+func scrubbedEnvNoAWS() []string {
+	awsCredPrefixes := []string{
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+		"AWS_SECURITY_TOKEN", "AWS_CREDENTIAL", "AWS_PROFILE",
+		"AWS_WEB_IDENTITY", "AWS_CONTAINER", "AWS_SHARED_CREDENTIALS_FILE",
+	}
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, kv := range src {
+		name := kv
+		if eq := strings.IndexByte(kv, '='); eq >= 0 {
+			name = kv[:eq]
+		}
+		upper := strings.ToUpper(name)
+		drop := false
+		for _, p := range awsCredPrefixes {
+			if upper == p || strings.HasPrefix(upper, p) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // installDuckDB downloads the DuckDB CLI binary from GitHub releases and
@@ -331,21 +391,22 @@ func installDuckDB() (string, error) {
 		"url", url,
 	)
 
-	// Download the zip file
+	// Shared client for the archive and its checksum file.
 	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(url)
+
+	// Download the zip file
+	zipData, err := httpGetBytes(client, url)
 	if err != nil {
 		return "", fmt.Errorf("downloading DuckDB from %s: %w", url, err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("downloading DuckDB: HTTP %d from %s", resp.StatusCode, url)
-	}
-
-	zipData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading DuckDB download: %w", err)
+	// Verify the archive's SHA-256 against the digest published alongside the
+	// release BEFORE extracting or writing any executable bytes. The release
+	// publishes "<file>.sha256" next to each archive; prefer it over a
+	// hardcoded map so the expected digest stays correct across patch releases.
+	// Abort on any mismatch — we will not extract or execute an unverified binary.
+	if err := verifyDuckDBChecksum(client, url, fileName, zipData); err != nil {
+		return "", err
 	}
 
 	// Extract the duckdb binary from the zip
@@ -387,6 +448,74 @@ func installDuckDB() (string, error) {
 	os.Setenv("PATH", installDir+string(os.PathListSeparator)+currentPath)
 
 	return installPath, nil
+}
+
+// httpGetBytes performs a GET and returns the full response body, treating any
+// non-200 status as an error. Used for both the DuckDB archive and its checksum.
+func httpGetBytes(client *http.Client, url string) ([]byte, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// verifyDuckDBChecksum downloads the SHA-256 digest published next to the
+// release archive ("<url>.sha256"), parses the hex digest, and compares it
+// against the SHA-256 of the downloaded archive bytes. It returns an error on
+// any mismatch so the caller can abort before extracting or executing the
+// binary. fileName is the archive's base name, used only for clearer messages.
+func verifyDuckDBChecksum(client *http.Client, url, fileName string, zipData []byte) error {
+	checksumURL := url + ".sha256"
+	sumData, err := httpGetBytes(client, checksumURL)
+	if err != nil {
+		return fmt.Errorf("downloading DuckDB checksum from %s: %w", checksumURL, err)
+	}
+
+	expected, err := parseSHA256Digest(sumData)
+	if err != nil {
+		return fmt.Errorf("parsing DuckDB checksum for %s: %w", fileName, err)
+	}
+
+	actual := fmt.Sprintf("%x", sha256.Sum256(zipData))
+	if !strings.EqualFold(actual, expected) {
+		return fmt.Errorf("DuckDB checksum mismatch for %s: expected %s, got %s", fileName, expected, actual)
+	}
+
+	slog.Info("verified DuckDB CLI checksum",
+		"component", "cloudtrail-analyzer",
+		"file", fileName,
+		"sha256", actual,
+	)
+	return nil
+}
+
+// parseSHA256Digest extracts the hex SHA-256 digest from the contents of a
+// ".sha256" file. Such files are typically one of:
+//
+//	<64-hex-digest>
+//	<64-hex-digest>  <filename>
+//
+// The first whitespace-delimited token is taken as the digest and validated to
+// be exactly 32 bytes of hex.
+func parseSHA256Digest(data []byte) (string, error) {
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty checksum file")
+	}
+	digest := fields[0]
+	decoded, err := hex.DecodeString(digest)
+	if err != nil {
+		return "", fmt.Errorf("checksum is not valid hex: %w", err)
+	}
+	if len(decoded) != sha256.Size {
+		return "", fmt.Errorf("checksum has wrong length: got %d bytes, want %d", len(decoded), sha256.Size)
+	}
+	return digest, nil
 }
 
 // extractDuckDBFromZip extracts the "duckdb" binary from an in-memory zip archive.

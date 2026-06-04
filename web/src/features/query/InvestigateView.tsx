@@ -926,10 +926,24 @@ function ActiveFiltersStrip({
 
   if (!hasTime && !hasAccounts && !hasSeed) return null
 
+  // Presets store a full RFC3339 instant for a true rolling window; manual
+  // date-picker edits store a plain YYYY-MM-DD. Render the date plus a compact
+  // HH:MM when a time component is present, so a rolling window reads cleanly
+  // (e.g. "2026-06-03 08:12 → 2026-06-04 08:12") instead of dumping millisecond
+  // precision into the chip.
+  const fmtBound = (v: string): string => {
+    if (!v.includes('T')) return v
+    const d = new Date(v)
+    if (Number.isNaN(d.getTime())) return v
+    const date = v.slice(0, 10)
+    const hh = String(d.getUTCHours()).padStart(2, '0')
+    const mm = String(d.getUTCMinutes()).padStart(2, '0')
+    return `${date} ${hh}:${mm}`
+  }
   const timeLabel = (() => {
-    if (timeStart && timeEnd) return `${timeStart} → ${timeEnd}`
-    if (timeStart) return `≥ ${timeStart}`
-    if (timeEnd) return `≤ ${timeEnd}`
+    if (timeStart && timeEnd) return `${fmtBound(timeStart)} → ${fmtBound(timeEnd)}`
+    if (timeStart) return `≥ ${fmtBound(timeStart)}`
+    if (timeEnd) return `≤ ${fmtBound(timeEnd)}`
     return ''
   })()
 

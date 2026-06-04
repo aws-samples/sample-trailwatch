@@ -8,11 +8,63 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"cloudtrail-analyzer/internal/config"
 )
+
+// nullSentinel is the marker DuckDB prints for SQL NULL when invoked with
+// `-nullvalue`. It is an improbable token (no NUL byte — argv cannot carry one)
+// chosen so it does not collide with any real CloudTrail cell value, letting
+// the CSV row builder distinguish a genuine NULL from an empty field or the
+// literal text "NULL". See the NULL handling in executeDuckDB (N31/N98/N103).
+const nullSentinel = "\x1eCTA_NULL\x1e"
+
+// maxFreeFormRows is the defensive upper bound applied to free-form NLQ
+// (Execute path) results. The system prompt asks the LLM for `LIMIT 100`, but
+// nothing enforced it, so a generated query missing the clause could stream
+// millions of rows back through the API (N29). We append a bounded outer LIMIT
+// as a guard; queries that already cap themselves below this are unaffected.
+const maxFreeFormRows = 1000
+
+// DuckDB write-lock retry policy (H11). While a sync micro-batch or a manual
+// re-index holds the index file's process-level write lock, a concurrent
+// read query fails fast with a lock-conflict error. We retry a few times with
+// a short delay so a query issued during indexing succeeds once the writer
+// releases the lock, then fall back to an actionable message.
+const (
+	duckDBLockRetries           = 5
+	duckDBLockRetryDelay        = 400 * time.Millisecond
+	duckDBIndexingInProgressMsg = "The index is being updated right now (a log sync or re-index is in progress). This query was retried but the index is still busy — wait a few seconds and run it again."
+)
+
+// duckDBLockKeywords are substrings DuckDB emits when a second process cannot
+// open the database file because the writer holds the lock. Matched
+// case-insensitively against stderr.
+var duckDBLockKeywords = []string{
+	"could not set lock",
+	"conflicting lock",
+	"file is already open",
+	"another process",
+	"set lock on file",
+}
+
+// isDuckDBLockError reports whether the DuckDB stderr indicates a write-lock
+// conflict (the index file is open for writing by the sync/re-index path).
+func isDuckDBLockError(stderr string) bool {
+	if stderr == "" {
+		return false
+	}
+	low := strings.ToLower(stderr)
+	for _, kw := range duckDBLockKeywords {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
+}
 
 type Service struct {
 	cfg *config.Config
@@ -38,7 +90,14 @@ func (s *Service) Execute(ctx context.Context, prompt string) (*ExecuteResponse,
 		"sql", sql,
 	)
 
-	columns, rows, err := s.executeDuckDB(ctx, sql)
+	// Defensive row cap (N29): the prompt requests LIMIT 100 but cannot enforce
+	// it. Wrap the generated query in a bounded outer LIMIT so a query that omits
+	// its own LIMIT cannot return an unbounded result set. The wrapped query is
+	// still validated by ValidateReadSQL inside executeDuckDB. Queries that
+	// already cap below the guard are unaffected.
+	guarded := guardRowLimit(sql)
+
+	columns, rows, err := s.executeDuckDB(ctx, guarded)
 	if err != nil {
 		hint, detail := classifyDuckDBError(err)
 		return &ExecuteResponse{
@@ -73,23 +132,37 @@ func (s *Service) generateSQL(ctx context.Context, prompt string) (string, error
 	return extractSQL(rawText), nil
 }
 
-func rewriteForIndex(sql string) string {
-	// Replace the read_json + unnest pattern with a direct table scan
-	// Pattern: "SELECT unnest(Records) as r FROM read_json('...'...)"  →  "SELECT r FROM events"
-	// The indexed table already has unnested records stored as column 'r'
-	idx := strings.Index(sql, "SELECT unnest(Records) as r")
-	if idx == -1 {
+// unnestReadJSONRe matches the handcoded / prompted "SELECT unnest(Records) as r
+// FROM read_json(" preamble that every dataset-reading query uses. It is
+// deliberately case-insensitive and whitespace-tolerant (N32): the LLM (and a
+// future prompt edit) can vary spacing, newlines, and keyword casing, and a
+// brittle exact-string match would silently miss the rewrite — leaving the
+// query pointed at the raw read_json path glob while we believe it is hitting
+// the indexed table. A miss here is not just a slow query: it changes the data
+// source AND the column types (variant fields are JSON in the index, STRUCT in
+// the raw files), so detection must tolerate formatting drift.
+var unnestReadJSONRe = regexp.MustCompile(`(?is)select\s+unnest\s*\(\s*Records\s*\)\s+as\s+r\s+from\s+read_json\s*\(`)
+
+// rewriteForIndex rewrites a dataset query so it reads the prebuilt DuckDB
+// `events` table instead of re-parsing the raw JSON files via read_json(). The
+// indexed table already stores the unnested records as column 'r'.
+//
+// CROSS-ACCOUNT SCOPE (H5): the only thing that scoped a raw read_json query to
+// the configured account/region was the file-path glob (…/AWSLogs/<account>/…).
+// The index is built across ALL synced accounts/regions, so dropping the path
+// without re-applying the scope would silently widen a single-account question
+// to every synced account. We therefore re-apply the configured account scope
+// as a real WHERE on the indexed `recipientAccountId` column. cfg is the source
+// of truth for the configured scope; scopeAccountIDs derives the member set.
+func rewriteForIndex(sql string, cfg *config.Config) string {
+	loc := unnestReadJSONRe.FindStringIndex(sql)
+	if loc == nil {
 		return sql
 	}
-
-	// Find the closing parenthesis of the FROM clause
-	fromIdx := strings.Index(sql[idx:], "FROM read_json(")
-	if fromIdx == -1 {
-		return sql
-	}
-
-	// Find the matching closing paren for read_json(...)
-	start := idx + fromIdx + len("FROM read_json(")
+	idx := loc[0]
+	// loc[1] sits just past the opening paren of read_json( — scan from there
+	// for its matching close paren so we excise the whole read_json(...) call.
+	start := loc[1]
 	depth := 1
 	end := start
 	for end < len(sql) && depth > 0 {
@@ -101,9 +174,54 @@ func rewriteForIndex(sql string) string {
 		end++
 	}
 
-	// Replace the entire subquery with "events"
-	replacement := sql[:idx] + "SELECT r FROM events" + sql[end:]
-	return replacement
+	// Replace the inner unnest+read_json subquery body with a scan of the
+	// indexed table, re-applying the configured account scope so the index
+	// path answers the same question the raw-path query would have.
+	inner := "SELECT r FROM events"
+	if scope := indexScopeWhere(cfg); scope != "" {
+		inner += " WHERE " + scope
+	}
+	return sql[:idx] + inner + sql[end:]
+}
+
+// scopeAccountIDs returns the set of AWS account IDs the current config scopes
+// queries to. When a member-account subset is selected it wins (the user picked
+// those accounts); otherwise we fall back to the single configured account. IDs
+// are filtered to the 12-digit shape so a malformed config value cannot reach
+// the SQL builder.
+func scopeAccountIDs(cfg *config.Config) []string {
+	var raw []string
+	if len(cfg.S3.MemberAccounts) > 0 {
+		raw = cfg.S3.MemberAccounts
+	} else if cfg.S3.AccountID != "" {
+		raw = []string{cfg.S3.AccountID}
+	}
+
+	var ids []string
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if isValidAccountID(id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// indexScopeWhere builds the `recipientAccountId IN (...)` predicate that
+// re-applies the configured account scope to a query against the shared index
+// (H5). Returns "" when no account scope is configured (nothing to constrain).
+// Each ID is emitted via quoteSQLLiteral as defense in depth even though
+// scopeAccountIDs already restricts them to digits.
+func indexScopeWhere(cfg *config.Config) string {
+	ids := scopeAccountIDs(cfg)
+	if len(ids) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(ids))
+	for i, id := range ids {
+		quoted[i] = quoteSQLLiteral(id)
+	}
+	return fmt.Sprintf("r.recipientAccountId IN (%s)", strings.Join(quoted, ", "))
 }
 
 func extractSQL(text string) string {
@@ -130,6 +248,22 @@ func extractSQL(text string) string {
 	return strings.TrimSpace(text)
 }
 
+// guardRowLimit wraps a free-form query in a bounded outer LIMIT so a missing
+// LIMIT in LLM-generated SQL cannot return an unbounded result set (N29). The
+// query (a single SELECT or WITH…SELECT statement, already shape-checked
+// upstream by ValidateReadSQL when executed) becomes the FROM subquery of an
+// outer `SELECT * FROM (<query>) LIMIT maxFreeFormRows`. A trailing semicolon
+// is trimmed first because a subquery cannot contain one. This is an upper
+// bound only: a query whose own LIMIT is smaller still wins.
+func guardRowLimit(query string) string {
+	trimmed := strings.TrimSpace(query)
+	trimmed = strings.TrimRight(trimmed, "; \t\r\n")
+	if trimmed == "" {
+		return query
+	}
+	return fmt.Sprintf("SELECT * FROM (%s) LIMIT %d;", trimmed, maxFreeFormRows)
+}
+
 func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]interface{}, error) {
 	// Defense-in-depth: every query routed through the read path is validated
 	// before reaching DuckDB. Blocks LLM hallucinations and prompt-injection
@@ -154,22 +288,62 @@ func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]
 	indexPath := BuildIndexedDataSource(s.cfg)
 	if indexPath != "" {
 		dbTarget = filepath.Join(s.cfg.DataDir, indexDBName)
-		sql = rewriteForIndex(sql)
+		sql = rewriteForIndex(sql, s.cfg)
 		readOnly = true
 	}
 
-	// Single DuckDB process with -csv (includes headers as first row)
+	// Single DuckDB process with -csv (includes headers as first row).
+	//
+	// -nullvalue makes DuckDB emit a distinct sentinel for SQL NULL instead of
+	// the default empty field, so we can tell a real NULL apart from an empty
+	// string in the CSV (N31/N98/N103). Without it, a genuine NULL and the
+	// literal text "NULL" both arrived as the same string, the nil-guards in
+	// the dashboard/lookups row builders were dead, and downstream Number()
+	// coercions mis-rendered. We pick a sentinel that cannot collide with real
+	// data and map it back to nil in the row builder below.
 	args := []string{}
 	if readOnly {
 		args = append(args, "-readonly")
 	}
-	args = append(args, "-csv", dbTarget, sql)
+	args = append(args, "-nullvalue", nullSentinel, "-csv", dbTarget, sql)
 
-	cmd := exec.CommandContext(timeoutCtx, "duckdb", args...)
-	output, err := cmd.Output()
-	if err != nil {
+	// DuckDB takes a process-level write lock on the index file while a sync's
+	// micro-batch or a manual re-index is writing. A concurrent read query
+	// against the same file fails immediately with a lock-conflict error rather
+	// than blocking. Retry a few times with a short backoff so a query issued
+	// during an active index build succeeds once the writer releases the lock,
+	// instead of surfacing a confusing failure (H11). If the lock is still held
+	// after the retries, return an actionable "indexing in progress" message.
+	var output []byte
+	var err error
+	for attempt := 0; ; attempt++ {
+		cmd := exec.CommandContext(timeoutCtx, "duckdb", args...)
+		// DuckDB has no need for the operator's AWS credentials; strip them from
+		// the subprocess environment so live STS tokens don't leak into it (N23).
+		cmd.Env = scrubbedEnv()
+		output, err = cmd.Output()
+		if err == nil {
+			break
+		}
+
+		var stderr string
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, nil, fmt.Errorf("DuckDB error: %s", string(exitErr.Stderr))
+			stderr = string(exitErr.Stderr)
+		}
+
+		if isDuckDBLockError(stderr) && attempt < duckDBLockRetries && timeoutCtx.Err() == nil {
+			select {
+			case <-timeoutCtx.Done():
+			case <-time.After(duckDBLockRetryDelay):
+			}
+			continue
+		}
+
+		if isDuckDBLockError(stderr) {
+			return nil, nil, fmt.Errorf("%s", duckDBIndexingInProgressMsg)
+		}
+		if stderr != "" {
+			return nil, nil, fmt.Errorf("DuckDB error: %s", stderr)
 		}
 		return nil, nil, fmt.Errorf("running DuckDB: %w", err)
 	}
@@ -194,7 +368,15 @@ func (s *Service) executeDuckDB(ctx context.Context, sql string) ([]string, [][]
 	for _, record := range records[1:] {
 		row := make([]interface{}, len(record))
 		for i, val := range record {
-			row[i] = val
+			// Map the NULL sentinel emitted by `-nullvalue` back to a real nil
+			// so the nil-guards in callers (dashboard/lookups) are live and a
+			// genuine SQL NULL is no longer confused with the literal string
+			// "NULL" or an empty value. Non-null cells stay strings.
+			if val == nullSentinel {
+				row[i] = nil
+			} else {
+				row[i] = val
+			}
 		}
 		rows = append(rows, row)
 	}
@@ -232,6 +414,11 @@ func classifyDuckDBError(err error) (hint, detail string) {
 
 func (s *Service) buildSystemPrompt() string {
 	dataPath := s.buildDataPath()
+	// The path is interpolated inside a read_json('...') literal in the example
+	// query below. Escape any embedded single quote so a quote in a config-derived
+	// path component cannot break out of the literal in the SQL the LLM mimics
+	// (H6). The plain-text "Data Location" line uses the unescaped path.
+	readPath := escapeSQLLiteral(dataPath)
 
 	return fmt.Sprintf(`You are a DuckDB SQL generator for AWS CloudTrail log analysis.
 
@@ -248,14 +435,14 @@ SELECT r.*
 FROM (
   SELECT unnest(Records) as r
   FROM read_json('%s**/*.json',
-    maximum_object_size=16777216,
+    maximum_object_size=268435456,
     auto_detect=true,
     union_by_name=true)
 )
 WHERE <your_conditions>;
 
 ## Key Rules
-- Always use read_json() with maximum_object_size=16777216, auto_detect=true, union_by_name=true
+- Always use read_json() with maximum_object_size=268435456, auto_detect=true, union_by_name=true
 - Always unnest Records array
 - Access nested fields with dot notation: r.userIdentity."type", r.userIdentity.arn
 - "type" is a reserved word - always quote it: r.userIdentity."type"
@@ -283,7 +470,7 @@ All other fields including userIdentity remain STRUCT and use dot access as befo
 - DuckDB uses double quotes for identifiers and single quotes for strings
 - Use TRY_CAST() instead of CAST() when data types might not parse cleanly
 - COUNT(DISTINCT x) is valid in DuckDB
-- For approximate distinct counts on large data use approx_count_distinct()`, dataPath, dataPath, s.cfg.S3.AccountID, s.cfg.S3.Region)
+- For approximate distinct counts on large data use approx_count_distinct()`, dataPath, readPath, s.cfg.S3.AccountID, s.cfg.S3.Region)
 }
 
 func (s *Service) buildDataPath() string {
@@ -321,4 +508,3 @@ func (s *Service) buildIndexDataPath() string {
 
 	return s.buildDataPath()
 }
-

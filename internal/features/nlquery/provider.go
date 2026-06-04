@@ -40,6 +40,24 @@ func NewProvider(cfg *config.Config) LLMProvider {
 	}
 }
 
+// llmHTTPTimeout returns the per-request timeout for the HTTP-based LLM
+// providers (Anthropic, OpenAI, Ollama). A bounded client timeout keeps a hung
+// or wedged endpoint from holding the single-flight LLM slot open forever,
+// which would 429-block every subsequent NL query until the server restarts.
+// We honor QueryTimeoutSeconds when the operator has raised it, but keep a
+// floor: LLM generation (especially a cold local Ollama model) routinely takes
+// longer than a DuckDB query, so a too-small QueryTimeoutSeconds should not cut
+// off a legitimately in-progress completion.
+func llmHTTPTimeout(cfg *config.Config) time.Duration {
+	const floor = 120 * time.Second
+	if cfg != nil && cfg.QueryTimeoutSeconds > 0 {
+		if d := time.Duration(cfg.QueryTimeoutSeconds) * time.Second; d > floor {
+			return d
+		}
+	}
+	return floor
+}
+
 // --- Bedrock Provider ---
 
 type BedrockProvider struct {
@@ -88,6 +106,9 @@ func (p *BedrockProvider) GenerateSQL(ctx context.Context, systemPrompt, userPro
 		if strings.Contains(errMsg, "ResourceNotFoundException") {
 			return "", fmt.Errorf("Bedrock model %q not available in region %s. Remediation: check model access is enabled in the Bedrock console, or change the model in config.json", modelID, p.cfg.Bedrock.Region)
 		}
+		if strings.Contains(errMsg, "ThrottlingException") || strings.Contains(errMsg, "TooManyRequests") {
+			return "", fmt.Errorf("Bedrock throttled this request (ThrottlingException). Remediation: (1) wait a few seconds and retry, (2) request a higher Bedrock requests-per-minute quota for model %q in Service Quotas, or (3) switch to a less contended model in Settings → AI Provider", modelID)
+		}
 		// On-demand throughput is not supported for some models (e.g.,
 		// Claude Opus 4.x); they require a Cross-Region Inference (CRIS)
 		// profile. The fix is to prefix the model id with "us." / "eu." /
@@ -111,12 +132,21 @@ func (p *BedrockProvider) GenerateSQL(ctx context.Context, systemPrompt, userPro
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
+		StopReason string `json:"stop_reason"`
 	}
 	if err := json.Unmarshal(resp.Body, &result); err != nil {
 		return "", fmt.Errorf("parsing response: %w", err)
 	}
 	if len(result.Content) == 0 {
 		return "", fmt.Errorf("empty response from Bedrock")
+	}
+	// stop_reason == "max_tokens" means the model hit the 2048-token cap and
+	// the SQL is likely truncated mid-statement. We surface a warning rather
+	// than failing: the validator downstream rejects malformed SQL anyway, but
+	// the log line helps explain an otherwise-confusing parse failure.
+	if result.StopReason == "max_tokens" {
+		slog.Warn("Bedrock response truncated at max_tokens cap; generated SQL may be incomplete",
+			"component", "cloudtrail-analyzer", "max_tokens", 2048)
 	}
 	return result.Content[0].Text, nil
 }
@@ -137,6 +167,26 @@ func (p *BedrockProvider) loadConfig(ctx context.Context) (aws.Config, error) {
 			os.Getenv("AWS_SECRET_ACCESS_KEY"),
 			os.Getenv("AWS_SESSION_TOKEN"),
 		)))
+	case "static":
+		// Long-lived IAM user keys stored in config.json. Bedrock previously
+		// ignored this method and silently fell back to the default chain;
+		// wire it through so the configured keys are actually used.
+		opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			p.cfg.Auth.AccessKeyID,
+			p.cfg.Auth.SecretAccessKey,
+			p.cfg.Auth.SessionToken,
+		)))
+	case "imds":
+		// imds resolves credentials from the EC2 Instance Metadata Service.
+		// LoadDefaultConfig's default chain already queries IMDS when no
+		// static/profile credentials are present, so we add no explicit
+		// provider here and let the chain resolve the instance role.
+		//
+		// NOTE: imds is EC2-only. It does NOT work in ECS / EKS / Fargate or
+		// with IRSA — those container environments expose credentials via the
+		// container credential endpoint or web-identity token, both of which
+		// the default chain also handles automatically. If you run there,
+		// leave auth.method on the default chain rather than forcing imds.
 	case "sso":
 		if p.cfg.Auth.SSOProfile != "" {
 			opts = append(opts, awsconfig.WithSharedConfigProfile(p.cfg.Auth.SSOProfile))
@@ -201,7 +251,12 @@ func (p *AnthropicProvider) GenerateSQL(ctx context.Context, systemPrompt, userP
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	resp, err := http.DefaultClient.Do(req)
+	// A hung endpoint must not pin the single-flight LLM slot indefinitely (it
+	// would 429-block every NL query until restart). Bound the call with a
+	// client timeout in addition to the request context so cancellation
+	// propagates both from the caller and from the deadline.
+	client := &http.Client{Timeout: llmHTTPTimeout(p.cfg)}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("calling Anthropic API: %w", err)
 	}
@@ -265,7 +320,9 @@ func (p *OpenAIProvider) GenerateSQL(ctx context.Context, systemPrompt, userProm
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Bound the call so a hung endpoint can't wedge the single-flight LLM slot.
+	client := &http.Client{Timeout: llmHTTPTimeout(p.cfg)}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("calling OpenAI API: %w", err)
 	}
@@ -329,7 +386,8 @@ func (p *OllamaProvider) GenerateSQL(ctx context.Context, systemPrompt, userProm
 	req, _ := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	// Bound the call so a hung local model can't wedge the single-flight LLM slot.
+	client := &http.Client{Timeout: llmHTTPTimeout(p.cfg)}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("calling Ollama: %w", err)
@@ -365,7 +423,17 @@ func (p *OllamaProvider) ensureRunning(ctx context.Context) error {
 	// Check if ollama binary exists
 	ollamaPath, err := exec.LookPath("ollama")
 	if err != nil {
-		slog.Info("ollama not found, installing...", "component", "cloudtrail-analyzer")
+		// Auto-install fetches and runs a third-party installer from inside the
+		// running server. That is convenient but a real supply-chain risk, so
+		// it is OFF by default (cfg.AllowAutoInstall). When disabled we stop
+		// here with setup guidance instead of silently downloading code.
+		if p.cfg == nil || !p.cfg.AllowAutoInstall {
+			return fmt.Errorf("Ollama is not installed and server-side auto-install is disabled. " +
+				"Remediation: (1) install Ollama manually from https://ollama.com/download, " +
+				"(2) or set allow_auto_install: true in config.json to opt into the auto-install path, " +
+				"(3) or switch to AWS Bedrock or the Anthropic API in Settings → AI Provider")
+		}
+		slog.Info("ollama not found, auto-install enabled, installing...", "component", "cloudtrail-analyzer")
 		if installErr := p.installOllama(); installErr != nil {
 			return fmt.Errorf("ollama not installed and auto-install failed: %w", installErr)
 		}
@@ -375,6 +443,10 @@ func (p *OllamaProvider) ensureRunning(ctx context.Context) error {
 	// Start Ollama server
 	slog.Info("starting ollama server", "component", "cloudtrail-analyzer", "path", ollamaPath)
 	cmd := exec.Command(ollamaPath, "serve")
+	// Ollama is a local LLM server and has no need for the operator's AWS
+	// credentials; strip them from its environment so live STS tokens don't
+	// leak into the long-running subprocess (N23).
+	cmd.Env = scrubbedEnv()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting ollama server: %w", err)
 	}
@@ -446,6 +518,18 @@ func (p *OllamaProvider) ensureModel(ctx context.Context) error {
 }
 
 func (p *OllamaProvider) installOllama() error {
+	// Reaching here means the operator has explicitly set allow_auto_install:
+	// true (gated in ensureRunning). Even then we avoid the classic
+	// `curl … | sh` pattern: piping a remote script straight into a shell runs
+	// whatever the network served, with no chance to inspect or pin it. Instead
+	// we download the installer to a temp file and execute that file — mirroring
+	// the deploy.sh NodeSource pattern. The trade-off: we still run a remote
+	// installer (Ollama publishes no per-release checksum we can pin here), but
+	// the script lands on disk first so it can be logged/inspected and is not
+	// fed to a shell from a live socket. To avoid running a remote installer at
+	// all, pre-install Ollama manually from https://ollama.com/download and
+	// leave allow_auto_install off.
+
 	// Check internet connectivity first
 	if !p.hasInternet() {
 		return fmt.Errorf("no internet connectivity detected. Ollama requires internet to install and download models. " +
@@ -456,18 +540,30 @@ func (p *OllamaProvider) installOllama() error {
 
 	switch runtime.GOOS {
 	case "darwin":
+		// On macOS we install via Homebrew (a verified package manager with its
+		// own integrity checks) rather than running the upstream shell script.
 		if _, err := exec.LookPath("brew"); err != nil {
-			return fmt.Errorf("Homebrew not found. Install Ollama manually: https://ollama.com/download " +
-				"Or run: curl -fsSL https://ollama.com/install.sh | sh")
+			return fmt.Errorf("Homebrew not found. Install Ollama manually: https://ollama.com/download")
 		}
 		cmd := exec.Command("brew", "install", "ollama")
+		cmd.Env = scrubbedEnv() // installer needs no AWS credentials (N23)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("brew install ollama failed: %s. Remediation: install manually from https://ollama.com/download", string(out))
 		}
 		return nil
 	case "linux":
-		cmd := exec.Command("sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh")
+		scriptPath, err := p.downloadInstallScript("https://ollama.com/install.sh")
+		if err != nil {
+			return fmt.Errorf("downloading ollama install script: %w. Remediation: check internet access, or install manually from https://ollama.com/download", err)
+		}
+		defer os.Remove(scriptPath)
+
+		// Execute the downloaded script with sh <file> rather than piping the
+		// HTTP response into a shell. The script is on disk and could be
+		// inspected before this runs in a more locked-down deployment.
+		cmd := exec.Command("sh", scriptPath)
+		cmd.Env = scrubbedEnv() // installer needs no AWS credentials (N23)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("ollama install script failed: %s. Remediation: check internet access, or install manually from https://ollama.com/download", string(out))
@@ -478,6 +574,43 @@ func (p *OllamaProvider) installOllama() error {
 			"Remediation: install manually from https://ollama.com/download, "+
 			"or switch to AWS Bedrock or Anthropic API in Settings → AI Provider", runtime.GOOS)
 	}
+}
+
+// downloadInstallScript fetches url into a private temp file and returns its
+// path. The caller is responsible for removing the file. Writing to disk first
+// (instead of curl|sh) keeps a fetched-from-network script out of a live shell
+// pipe and leaves an artifact that can be inspected or logged.
+func (p *OllamaProvider) downloadInstallScript(url string) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("installer download returned HTTP %d", resp.StatusCode)
+	}
+
+	// 0600 so only this user can read/execute the fetched script.
+	f, err := os.CreateTemp("", "ollama-install-*.sh")
+	if err != nil {
+		return "", err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 func (p *OllamaProvider) hasInternet() bool {

@@ -164,7 +164,7 @@ Configure your preferred LLM provider in Settings → AI Provider:
 - **AWS Bedrock** (default) — uses existing AWS credentials
 - **Anthropic API** — direct API key
 - **OpenAI / Compatible** — supports Azure OpenAI, corporate proxies
-- **Ollama (local)** — auto-installs, runs locally without internet egress when configured, no API key needed
+- **Ollama (local)** — runs locally, no API key needed. Install Ollama yourself before selecting this provider. Server-side auto-install is off by default and is gated behind an explicit opt-in flag (`allow_auto_install`); see [LLM Provider Security](#llm-provider-security).
 
 > ⚠️ **Data Privacy Notice**: When AI queries are enabled, CloudTrail log metadata (event names, IP addresses, IAM identities, timestamps) is sent to the configured LLM provider for natural language processing. Verify this aligns with your organization's data classification policies before enabling. For workloads where keeping data on the host is preferred, consider **Ollama**, which is designed to run locally without external API calls when configured that way.
 
@@ -190,8 +190,11 @@ make dev
 make build
 # → ./dist/cloudtrail-analyzer
 
-# Run tests
+# Run tests (Go with -race, plus frontend)
 make test
+
+# Check formatting and run go vet (run before pushing)
+make lint
 ```
 
 ## Configuration
@@ -224,7 +227,7 @@ With streaming indexing, first queryable results appear within ~30 seconds of st
 
 ### Infrastructure Sizing
 
-**ARM64 (Graviton) instances are recommended** — they deliver the same DuckDB query performance as x86 at ~20% lower cost, with 50% higher memory bandwidth (DDR5). The application auto-detects the host architecture at startup and downloads the correct DuckDB CLI binary automatically — no configuration needed.
+**ARM64 (Graviton) instances are recommended** — they deliver comparable DuckDB query performance to x86 at ~20% lower cost, with higher memory bandwidth (DDR5). The application detects the host architecture at startup (`runtime.GOARCH`) and selects the matching DuckDB CLI binary. `deploy.sh` installs the pinned DuckDB CLI during deployment; server-side download of the binary at runtime is off by default and is gated behind an explicit opt-in flag (`allow_auto_install`).
 
 | CloudTrail Volume | Accounts | Duration | Recommended Instance | EBS Disk | Notes |
 |-------------------|----------|----------|---------------------|----------|-------|
@@ -255,11 +258,13 @@ With streaming indexing, first queryable results appear within ~30 seconds of st
 
 **Disk formula:** 3x raw CloudTrail size (compressed `.json.gz` + extracted `.json` + DuckDB index).
 
-**Query performance at scale:** DuckDB processes analytical queries efficiently on 100+ GB datasets. Memory-optimized instances (r7g) provide the bandwidth needed for large-scale aggregations. All queries run with `-readonly` mode, enabling concurrent access during active indexing.
+**Query performance at scale:** DuckDB processes analytical queries efficiently on 100+ GB datasets. Memory-optimized instances (r7g) provide the bandwidth needed for large-scale aggregations. Queries against the indexed store run with the DuckDB `-readonly` flag, which is designed to reject writes (INSERT/UPDATE/DELETE/DDL).
+
+> **Indexing in progress:** DuckDB takes a process-level write lock while the index is being built or a micro-batch is being written. A read query issued during that window can fail with a lock error and is retried; if it does not succeed, the UI surfaces an "indexing in progress" message. Wait for the current index/micro-batch write to finish and retry. The `-readonly` flag does not bypass this lock — it limits the read connection to read-only operations.
 
 ### Multi-Architecture Support
 
-The application supports both ARM64 (Graviton) and AMD64 (Intel/AMD) without any code changes. At startup, it detects the host architecture via `runtime.GOARCH` and auto-downloads the matching DuckDB CLI binary from GitHub releases if one isn't already installed.
+The application supports both ARM64 (Graviton) and AMD64 (Intel/AMD) without any code changes. At startup, it detects the host architecture via `runtime.GOARCH` and selects the matching DuckDB CLI binary. `deploy.sh` installs the pinned DuckDB CLI during deployment. Server-side download of the binary at runtime is off by default and is gated behind an explicit opt-in flag (`allow_auto_install`); when disabled, the application expects the DuckDB CLI to already be present on the host.
 
 ```bash
 # Build for your current platform
@@ -314,9 +319,16 @@ This project is provided as a sample implementation for educational and security
 
 ### LLM Provider Security
 - **Bedrock**: Uses IAM role, no additional credentials.
-- **Ollama**: Fully offline, no data leaves instance.
+- **Ollama**: Runs locally on the instance. When configured to use the local Ollama endpoint, query data is processed on the host and is designed to avoid an external API call for inference. Verify your Ollama configuration and any model-download/telemetry settings against your data-handling policy.
 - **Anthropic/OpenAI**: API keys stored in `config.json` -- treat as secrets.
 - CloudTrail data is sent to the configured LLM for queries. Verify alignment with data classification policies.
+
+#### Binary auto-install (supply-chain trade-off)
+
+The application can install the DuckDB CLI and Ollama on the host, but doing so downloads and runs third-party install scripts/binaries from the network. To reduce supply-chain exposure, this server-side auto-install is **off by default** and is gated behind an explicit opt-in flag (`allow_auto_install`, default `false`).
+
+- **Recommended:** install the DuckDB CLI and Ollama on the host yourself (or let `deploy.sh` install the pinned DuckDB CLI). Leave `allow_auto_install` disabled. The application fails with guidance if a required binary is missing.
+- **If you opt in:** review what the installers fetch and run, and treat the opt-in as a deliberate trade-off. Prefer pinning and verifying the artifacts you install yourself.
 
 ### Natural-Language Query Safety (LLM → SQL)
 
@@ -411,9 +423,14 @@ cd ~/<source-checkout>
 git pull
 sudo ./deploy.sh
 
-# Or, if you only changed Go code or the frontend bundle, a faster path:
+# Or, if you only changed Go code or the frontend bundle, a faster path.
+# Remove the previous embed copy first — copying over an existing dist/
+# would nest the assets at cmd/analyzer/dist/dist/. This matches the
+# embed-assets step in the Makefile (rm -rf, then cp -r, then touch .gitkeep).
 cd /opt/cloudtrail-analyzer
+sudo rm -rf cmd/analyzer/dist
 sudo cp -r web/dist cmd/analyzer/dist
+sudo touch cmd/analyzer/dist/.gitkeep
 sudo /usr/local/go/bin/go build -o cloudtrail-analyzer ./cmd/analyzer
 sudo systemctl restart cloudtrail-analyzer
 ```

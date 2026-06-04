@@ -224,6 +224,7 @@ const resources = {
       'settings.llm.active': 'Active',
       'settings.llm.saving': 'Saving...',
       'settings.llm.saved': 'Saved!',
+      'settings.llm.saveFailed': 'Failed to save settings',
       'settings.llm.bedrockRegion': 'Bedrock Region (API calls go here)',
       'settings.llm.refresh': 'Refresh',
       'settings.llm.loadingModels': 'Loading models from {{region}}...',

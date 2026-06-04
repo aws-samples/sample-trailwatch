@@ -195,10 +195,10 @@ func buildFilteredEventsExpr(rawRead string, f InvestigateFilters) string {
 
 	var conds []string
 	if ts := strings.TrimSpace(f.TimeStart); ts != "" {
-		conds = append(conds, fmt.Sprintf("r.eventTime >= '%s'", strings.ReplaceAll(ts, "'", "''")))
+		conds = append(conds, fmt.Sprintf("r.eventTime >= %s", quoteSQLLiteral(ts)))
 	}
 	if te := strings.TrimSpace(f.TimeEnd); te != "" {
-		conds = append(conds, fmt.Sprintf("r.eventTime <= '%s'", strings.ReplaceAll(te, "'", "''")))
+		conds = append(conds, fmt.Sprintf("r.eventTime <= %s", quoteSQLLiteral(te)))
 	}
 	if len(f.AccountIDs) > 0 {
 		var quoted []string
@@ -207,7 +207,7 @@ func buildFilteredEventsExpr(rawRead string, f InvestigateFilters) string {
 			if !isValidAccountID(id) {
 				continue
 			}
-			quoted = append(quoted, "'"+id+"'")
+			quoted = append(quoted, quoteSQLLiteral(id))
 		}
 		if len(quoted) > 0 {
 			list := strings.Join(quoted, ", ")
@@ -243,9 +243,16 @@ func (h *InvestigateHandler) buildSQL(scenarioID, param, dataPath string, filter
 	// scenario consumes it via `FROM %s` so toolbar context (time window +
 	// account scope) is applied uniformly without each scenario's SQL string
 	// having to know about it.
-	rawRead := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=16777216, auto_detect=true, union_by_name=true)`, dataPath)
+	//
+	// dataPath is assembled from config-derived values (S3 bucket, org_id,
+	// account_id, region) in buildDataPath. Settings accept those with only an
+	// emptiness check, so a single quote in any of them would break out of the
+	// read_json('...') literal and bypass the read-only allowlist. Escape the
+	// final path string before it goes inside the literal (H6). The param is
+	// escaped the same way for consistency with the path.
+	rawRead := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=%d, auto_detect=true, union_by_name=true)`, escapeSQLLiteral(dataPath), maxObjectSize)
 	events := buildFilteredEventsExpr(rawRead, filters)
-	safeParam := strings.ReplaceAll(param, "'", "''")
+	safeParam := escapeSQLLiteral(param)
 
 	switch scenarioID {
 	case "iam-write-ops":

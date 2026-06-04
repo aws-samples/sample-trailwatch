@@ -23,7 +23,7 @@ func TestApproxTokenCount(t *testing.T) {
 		{"", 0},
 		{"   ", 0},
 		{"abcd", 1},
-		{"abcde", 2},        // 5/4 rounds up
+		{"abcde", 2},                      // 5/4 rounds up
 		{strings.Repeat("a", 4000), 1000}, // exact 4-char-per-token boundary
 	}
 	for _, c := range cases {

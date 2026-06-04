@@ -30,7 +30,7 @@ SELECT r.*
 FROM (
   SELECT unnest(Records) as r
   FROM read_json('{data_path}**/*.json',
-    maximum_object_size=16777216,
+    maximum_object_size=268435456,
     auto_detect=true,
     union_by_name=true)
 )
@@ -39,7 +39,7 @@ WHERE r.eventName = 'ConsoleLogin';
 
 ### Key DuckDB Patterns
 - Use ` + "`read_json()`" + ` with ` + "`auto_detect=true, union_by_name=true`" + `
-- Use ` + "`maximum_object_size=16777216`" + ` (CloudTrail files can be large)
+- Use ` + "`maximum_object_size=268435456`" + ` (CloudTrail files can be large)
 - Access nested structs with dot notation: ` + "`r.userIdentity.\"type\"`" + `
 - Note: "type" is a reserved word — always quote it: ` + "`r.userIdentity.\"type\"`" + `
 - Use glob patterns for date ranges: ` + "`{data_path}2026/05/**/*.json`" + `

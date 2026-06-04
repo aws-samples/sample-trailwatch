@@ -21,6 +21,12 @@ import (
 const indexDBName = "cloudtrail_index.duckdb"
 const batchSizeThreshold = 100 * 1024 * 1024 // 100 MB
 
+// maxObjectSize caps read_json's per-object buffer. It is kept in lockstep with
+// the extractor's maxPerFileBytes (processor/extractor.go, 256 MB) — a smaller
+// cap here would abort the whole index batch on any CloudTrail file the
+// extractor was willing to accept.
+const maxObjectSize = 256 * 1024 * 1024 // 256 MB
+
 var ErrAlreadyRunning = errors.New("indexing is already in progress")
 
 type IndexState struct {
@@ -64,6 +70,13 @@ type Indexer struct {
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
+
+	// writeMu serializes every write to the DuckDB index file. DuckDB holds a
+	// process-level write lock, so a micro-batch flush and a manual re-index
+	// writing concurrently would corrupt the file (or fail mid-write). Hold this
+	// across the full read_json/CREATE/INSERT execution, not just the metadata
+	// peek. Distinct from mu, which only guards cancel/IsRunning bookkeeping.
+	writeMu sync.Mutex
 }
 
 func NewIndexer(cfg *config.Config, db *sql.DB) *Indexer {
@@ -219,9 +232,15 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 			"size_bytes", b.Size,
 		)
 
-		// Build and execute DuckDB SQL via temp file (avoids argument list too long)
+		// Build and execute DuckDB SQL via temp file (avoids argument list too long).
+		// writeMu serializes this write against any concurrent micro-batch flush —
+		// see Indexer.writeMu. Taken per batch (not around the whole loop) so the
+		// between-batch cancellation check still runs and a micro-batch can
+		// interleave between our batches.
 		duckSQL := idx.buildBatchSQL(b, dbPath, isFirstBatch && i == 0)
+		idx.writeMu.Lock()
 		out, err := idx.execDuckDB(ctx, dbPath, duckSQL)
+		idx.writeMu.Unlock()
 		if err != nil {
 			slog.Error("batch failed",
 				"component", "cloudtrail-analyzer",
@@ -244,13 +263,16 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 		idx.updateState("building", totalBytes, processedBytes, len(newFiles), processedFiles, b.ID)
 	}
 
-	// Step 7: Create indexes (best effort)
+	// Step 7: Create indexes (best effort). This also writes the DuckDB file, so
+	// serialize it against any concurrent micro-batch flush via writeMu.
 	indexSQL := `
 		CREATE INDEX IF NOT EXISTS idx_event_name ON events ((r.eventName));
 		CREATE INDEX IF NOT EXISTS idx_event_source ON events ((r.eventSource));
 		CREATE INDEX IF NOT EXISTS idx_error_code ON events ((r.errorCode));
 	`
+	idx.writeMu.Lock()
 	idx.execDuckDB(ctx, dbPath, indexSQL)
+	idx.writeMu.Unlock()
 
 	idx.updateState("idle", totalBytes, processedBytes, len(newFiles), processedFiles, "")
 
@@ -353,8 +375,20 @@ func (idx *Indexer) execDuckDB(ctx context.Context, dbPath string, sql string) (
 	}
 	tmpFile.Close()
 
+	// Reopen the temp file read-only as the duckdb subprocess's stdin. Without
+	// closing this handle the index build leaked one file descriptor per batch
+	// (the result was previously discarded). Close it once the command returns.
+	stdin, err := os.Open(tmpFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("opening SQL temp file for duckdb stdin: %w", err)
+	}
+	defer stdin.Close()
+
 	cmd := exec.CommandContext(ctx, "duckdb", dbPath)
-	cmd.Stdin, _ = os.Open(tmpFile.Name())
+	cmd.Stdin = stdin
+	// Strip AWS credentials from the index subprocess environment (N23) — DuckDB
+	// does not need them, and the parent holds live STS tokens in its env.
+	cmd.Env = scrubbedEnv()
 	return cmd.CombinedOutput()
 }
 
@@ -396,10 +430,13 @@ const recordsSchema = `addendum JSON, additionalEventData JSON, apiVersion VARCH
 	`vpcEndpointAccountId VARCHAR, vpcEndpointId VARCHAR`
 
 func (idx *Indexer) buildBatchSQL(b batch, dbPath string, createTable bool) string {
-	// Build file list as DuckDB array literal
+	// Build file list as a DuckDB array literal for read_json. Each path is a
+	// filesystem path under the data dir, but it still flows into a SQL string
+	// literal, so escape it with the shared safesql primitive (H6) rather than
+	// hand-rolling quote-doubling here.
 	var paths []string
 	for _, f := range b.Files {
-		paths = append(paths, "'"+strings.ReplaceAll(f.Path, "'", "''")+"'")
+		paths = append(paths, quoteSQLLiteral(f.Path))
 	}
 	fileList := "[" + strings.Join(paths, ", ") + "]"
 
@@ -407,15 +444,15 @@ func (idx *Indexer) buildBatchSQL(b batch, dbPath string, createTable bool) stri
 		return fmt.Sprintf(`CREATE TABLE events AS
 SELECT unnest(Records) as r
 FROM read_json(%s,
-    maximum_object_size=16777216,
-    columns={Records: 'STRUCT(%s)[]'});`, fileList, recordsSchema)
+    maximum_object_size=%d,
+    columns={Records: 'STRUCT(%s)[]'});`, fileList, maxObjectSize, recordsSchema)
 	}
 
 	return fmt.Sprintf(`INSERT INTO events
 SELECT unnest(Records) as r
 FROM read_json(%s,
-    maximum_object_size=16777216,
-    columns={Records: 'STRUCT(%s)[]'});`, fileList, recordsSchema)
+    maximum_object_size=%d,
+    columns={Records: 'STRUCT(%s)[]'});`, fileList, maxObjectSize, recordsSchema)
 }
 
 func (idx *Indexer) checkpointBatch(b batch) error {
@@ -532,11 +569,15 @@ func (m *MicroBatchIndexer) flushLocked() {
 
 	dbPath := m.idx.IndexPath()
 
-	// Acquire indexer lock to prevent conflict with manual Re-index
-	m.idx.mu.Lock()
-	createTable := !m.dbCreated && !fileExists(dbPath)
-	m.idx.mu.Unlock()
+	// Serialize against a concurrent manual re-index. DuckDB's process-level
+	// write lock means a re-index batch and this micro-batch flush writing the
+	// same file at once would corrupt it. Hold writeMu across the CREATE-vs-
+	// INSERT decision and the execution so the createTable check and the write
+	// are atomic with respect to any other writer.
+	m.idx.writeMu.Lock()
+	defer m.idx.writeMu.Unlock()
 
+	createTable := !m.dbCreated && !fileExists(dbPath)
 	duckSQL := m.idx.buildBatchSQL(b, dbPath, createTable)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

@@ -175,6 +175,11 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// This loop unblocks on three signals: the client disconnecting (ctx.Done),
+	// a new progress event, or the channel closing. On shutdown the service
+	// cancels the pipeline (Service.Shutdown), the StartProcessing goroutine
+	// returns and closes progressCh, and the !ok branch below fires — so this
+	// handler does not pin server.Shutdown for the full timeout.
 	for {
 		select {
 		case <-ctx.Done():
@@ -185,9 +190,9 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 				data, _ := json.Marshal(map[string]string{
 					"event": "done",
 				})
-				w.Write([]byte("event: done\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-				w.Write(data)                            //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-				w.Write([]byte("\n\n"))                   //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write([]byte("event: done\ndata: ")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write(data)                          //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write([]byte("\n\n"))                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 				flusher.Flush()
 				return
 			}
@@ -196,9 +201,9 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			w.Write([]byte("event: progress\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write(data)                                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write([]byte("\n\n"))                       //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("event: progress\ndata: ")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write(data)                              //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("\n\n"))                    //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 			flusher.Flush()
 		}
 	}

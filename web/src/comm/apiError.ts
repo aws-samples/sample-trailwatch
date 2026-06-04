@@ -23,7 +23,16 @@ export async function readApiError(res: Response, fallback = 'Request failed'): 
 
   try {
     const body = JSON.parse(text) as ApiErrorBody
+    // Backend errors (render.Error) carry a user-safe { code, message }. The
+    // message is already redacted server-side (no data-dir / account-id / ARN),
+    // so surface it as-is. This covers the Host-validation 403 (code
+    // "UNTRUSTED_HOST") and every other structured error cleanly.
     if (body && typeof body.message === 'string' && body.message) return body.message
+    // Structured error with a code but no message (rare): surface the code +
+    // status rather than dumping raw JSON at the user.
+    if (body && typeof body.code === 'string' && body.code) {
+      return `${fallback} (HTTP ${res.status}, ${body.code})`
+    }
   } catch {
     // not JSON — fall through to text body
   }
