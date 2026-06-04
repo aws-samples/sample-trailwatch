@@ -20,16 +20,16 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 # GO_VERSION must match the toolchain pinned in go.mod (go 1.26 / toolchain
-# go1.26.2). If go.mod is bumped, update this to match or the EC2 build either
+# go1.26.4). If go.mod is bumped, update this to match or the EC2 build either
 # fails or silently pulls a different toolchain over the network.
-GO_VERSION="1.26.2"
+GO_VERSION="1.26.4"
 NODE_MAJOR=20
 DUCKDB_VERSION="1.2.2"
 
 # Pin the Go toolchain explicitly so a mismatched preinstalled Go does not
 # silently download a different toolchain over the network at build time. This
 # value tracks go.mod's 'toolchain' directive.
-export GOTOOLCHAIN="go1.26.2"
+export GOTOOLCHAIN="go1.26.4"
 
 APP_NAME="cloudtrail-analyzer"
 APP_USER="cloudtrail"

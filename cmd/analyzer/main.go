@@ -297,7 +297,11 @@ func main() {
 			indexData, _ := fs.ReadFile(frontendRoot, "index.html")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			w.Write(indexData)
+			// indexData is the static, build-time-embedded React SPA shell
+			// (go:embed); it carries no user-controlled data, so html/template
+			// escaping does not apply. Matches the suppression convention used at
+			// the SSE write sites in nlquery/processor handlers.
+			w.Write(indexData) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 		})
 	} else {
 		// No embedded frontend — dev mode fallback
