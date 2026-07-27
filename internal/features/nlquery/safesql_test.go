@@ -146,10 +146,38 @@ func TestValidateReadSQL_AllowsBannedWordsInsideStrings(t *testing.T) {
 		`SELECT r.eventName FROM events WHERE r.eventName LIKE '%drop%';`,
 		`SELECT r.errorMessage FROM events WHERE r.errorMessage = 'attach failed';`,
 		`SELECT r.userAgent FROM events WHERE r.userAgent LIKE '%install%';`,
+		`SELECT r.errorMessage FROM events WHERE r.errorMessage = '-- not a comment';`,
+		`SELECT r.errorMessage FROM events WHERE r.errorMessage = '/* not a comment */';`,
+		`SELECT r.errorMessage FROM events WHERE r.errorMessage = 'it''s -- still a string';`,
 	}
 	for _, sql := range cases {
 		if err := ValidateReadSQL(sql); err != nil {
 			t.Errorf("expected allow (banned word inside string): got %v\nsql: %s", err, sql)
+		}
+	}
+}
+
+func TestValidateGeneratedSQLRejectsCommentMarkerLiteralBypasses(t *testing.T) {
+	cases := []string{
+		`SELECT * FROM cloudtrail_events WHERE r.errorMessage = '--'; SELECT * FROM events;`,
+		`SELECT * FROM cloudtrail_events WHERE r.errorMessage = '/*'; SELECT * FROM events; /*'*/`,
+		`SELECT * FROM (SELECT * FROM cloudtrail_events WHERE r.errorMessage = '--') ; SELECT * FROM events --') LIMIT 1000;`,
+	}
+	for _, sql := range cases {
+		if err := ValidateGeneratedSQL(sql); !errors.Is(err, ErrUnsafeSQL) {
+			t.Fatalf("expected comment-marker bypass rejection, got %v for %s", err, sql)
+		}
+	}
+}
+
+func TestValidateReadSQLRejectsUnterminatedLexicalElements(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT 'unterminated`,
+		`SELECT "unterminated`,
+		`SELECT 1 /* unterminated`,
+	} {
+		if err := ValidateReadSQL(sql); !errors.Is(err, ErrUnsafeSQL) {
+			t.Fatalf("expected unterminated SQL rejection, got %v for %s", err, sql)
 		}
 	}
 }
@@ -161,5 +189,119 @@ func TestValidateReadSQL_ErrorIncludesReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "read_csv_auto") {
 		t.Errorf("expected reason to name the banned token, got: %v", err)
+	}
+}
+
+func TestValidateIndexedSQLBlocksRawJSONReaders(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT * FROM read_json('/tmp/secret.json');`,
+		`WITH x AS (SELECT * FROM READ_JSON_AUTO('/tmp/secret.json')) SELECT * FROM x;`,
+	} {
+		if err := ValidateIndexedSQL(sql); !errors.Is(err, ErrUnsafeSQL) {
+			t.Fatalf("expected indexed SQL rejection, got %v for %s", err, sql)
+		}
+	}
+
+	if err := ValidateIndexedSQL(`SELECT r.eventName FROM events WHERE r.errorMessage = 'read_json';`); err != nil {
+		t.Fatalf("string literal should remain allowed: %v", err)
+	}
+}
+
+func TestValidateGeneratedSQLRequiresScopedView(t *testing.T) {
+	if err := ValidateGeneratedSQL(`SELECT r.eventName FROM cloudtrail_events;`); err != nil {
+		t.Fatalf("expected scoped view query to pass: %v", err)
+	}
+	for _, sql := range []string{
+		`SELECT r.eventName FROM events;`,
+		`SELECT * FROM main.events;`,
+		`SELECT * FROM query_table('events');`,
+		`SELECT 1;`,
+	} {
+		if err := ValidateGeneratedSQL(sql); !errors.Is(err, ErrUnsafeSQL) {
+			t.Fatalf("expected generated SQL rejection, got %v for %s", err, sql)
+		}
+	}
+}
+
+// SQL-01: Regression tests for the dynamic-SQL account-scope bypass.
+// The query() function could hide an unscoped SELECT inside a stripped string
+// literal, allowing reads from the unscoped events table while the validator
+// only saw a harmless cloudtrail_events reference.
+func TestSQL01_QueryFunctionBypass(t *testing.T) {
+	exploits := []struct {
+		name string
+		sql  string
+	}{
+		{
+			"exact documented exploit",
+			`SELECT q.* FROM query('SELECT * FROM events') AS q CROSS JOIN (SELECT COUNT(*) FROM cloudtrail_events) AS scoped;`,
+		},
+		{
+			"query with uppercase",
+			`SELECT q.* FROM QUERY('SELECT * FROM events') AS q CROSS JOIN (SELECT 1 FROM cloudtrail_events) AS x;`,
+		},
+		{
+			"query_table variant",
+			`SELECT * FROM query_table('events') CROSS JOIN (SELECT 1 FROM cloudtrail_events);`,
+		},
+		{
+			"query in CTE",
+			`WITH bypass AS (SELECT * FROM query('SELECT * FROM events')) SELECT * FROM bypass, cloudtrail_events;`,
+		},
+		{
+			"mixed case query",
+			`SELECT * FROM Query('SELECT * FROM events'), cloudtrail_events;`,
+		},
+		{
+			"query hidden after newlines",
+			"SELECT *\nFROM\n\tquery\n('SELECT * FROM events'),\n cloudtrail_events;",
+		},
+	}
+	for _, tc := range exploits {
+		t.Run(tc.name, func(t *testing.T) {
+			// Must be caught at the base ValidateReadSQL level.
+			if err := ValidateReadSQL(tc.sql); !errors.Is(err, ErrUnsafeSQL) {
+				t.Errorf("ValidateReadSQL should reject query() bypass, got: %v", err)
+			}
+			// Must also be caught at generated-SQL level.
+			if err := ValidateGeneratedSQL(tc.sql); !errors.Is(err, ErrUnsafeSQL) {
+				t.Errorf("ValidateGeneratedSQL should reject query() bypass, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestSQL01_ReadNdjsonVariantsBlocked(t *testing.T) {
+	cases := []string{
+		`SELECT * FROM read_ndjson('/tmp/x.ndjson');`,
+		`SELECT * FROM read_ndjson_auto('/tmp/x.ndjson');`,
+		`SELECT * FROM read_json_objects('/tmp/x.json');`,
+		`SELECT * FROM READ_NDJSON('/tmp/x.ndjson');`,
+	}
+	for _, sql := range cases {
+		if err := ValidateReadSQL(sql); !errors.Is(err, ErrUnsafeSQL) {
+			t.Errorf("expected ErrUnsafeSQL for %q, got: %v", sql, err)
+		}
+	}
+}
+
+func TestSQL01_QueryInsideStringLiteralIsAllowed(t *testing.T) {
+	// The word "query" inside a string literal must NOT trigger the ban.
+	safe := `SELECT r.eventName FROM cloudtrail_events WHERE r.errorMessage = 'query failed';`
+	if err := ValidateGeneratedSQL(safe); err != nil {
+		t.Errorf("string containing 'query' should be allowed: %v", err)
+	}
+}
+
+func TestSQL01_NormalGeneratedQueriesStillPass(t *testing.T) {
+	cases := []string{
+		`SELECT r.eventName, COUNT(*) as cnt FROM cloudtrail_events GROUP BY r.eventName ORDER BY cnt DESC LIMIT 20;`,
+		`SELECT r.eventTime, r.eventName, r.userIdentity.arn FROM cloudtrail_events WHERE r.eventName = 'AssumeRole' LIMIT 100;`,
+		`WITH top_users AS (SELECT r.userIdentity.arn, COUNT(*) as cnt FROM cloudtrail_events GROUP BY 1) SELECT * FROM top_users ORDER BY cnt DESC LIMIT 10;`,
+	}
+	for _, sql := range cases {
+		if err := ValidateGeneratedSQL(sql); err != nil {
+			t.Errorf("expected normal query to pass: %v\nsql: %s", err, sql)
+		}
 	}
 }

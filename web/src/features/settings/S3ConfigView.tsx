@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Database, CheckCircle2, XCircle, Loader2, Save, ShieldCheck, RefreshCw } from 'lucide-react'
+import { Database, CheckCircle2, XCircle, Loader2, Save, ShieldCheck, RefreshCw, Plus } from 'lucide-react'
 import { useSettings } from './hooks'
 import { AccountNamesSection } from './AccountNamesSection'
 import { StatusBadge } from '../../comm/StatusBadge'
+import { readApiError } from '../../comm/apiError'
 import { endpoints } from '../../config/api'
 import { stableStringify } from '../../utils/json'
 
@@ -14,15 +15,29 @@ const AWS_REGIONS = [
   'ca-central-1', 'sa-east-1',
 ]
 
+export const ORGANIZATION_TRAIL_MODE = {
+  value: 'control_tower',
+  label: 'Organization / Control Tower',
+  description: 'Multi-account trail',
+} as const
+
 interface CallerIdentity {
   account_id: string
   arn: string
   user_id: string
 }
 
+interface BucketStructureResponse {
+  mode: 'single' | 'control_tower'
+  org_id?: string
+  accounts?: unknown
+}
+
+type AccountIdSource = 'caller' | 'saved' | 'detected' | null
+
 export function S3ConfigView() {
   const { t } = useTranslation()
-  const { data: settings, loading: settingsLoading, refetch } = useSettings()
+  const { data: settings, loading: settingsLoading, error: settingsError, refetch } = useSettings()
 
   // Form state
   const [bucket, setBucket] = useState('')
@@ -30,150 +45,283 @@ export function S3ConfigView() {
   const [mode, setMode] = useState<'single' | 'control_tower'>('single')
   const [orgId, setOrgId] = useState('')
   const [accountId, setAccountId] = useState('')
+  const [accountIdSource, setAccountIdSource] = useState<AccountIdSource>(null)
 
   // Discovery state
   const [callerIdentity, setCallerIdentity] = useState<CallerIdentity | null>(null)
   const [callerLoading, setCallerLoading] = useState(false)
   const [callerError, setCallerError] = useState<string | null>(null)
+  const callerRequestRef = useRef(0)
+  const callerAbortRef = useRef<AbortController | null>(null)
   const [discoveredAccounts, setDiscoveredAccounts] = useState<string[]>([])
   const [selectedAccounts, setSelectedAccounts] = useState<string[]>([])
+  const [manualAccountId, setManualAccountId] = useState('')
   const [discoveringAccounts, setDiscoveringAccounts] = useState(false)
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null)
+  const discoveryRequestRef = useRef(0)
+  const discoveryAbortRef = useRef<AbortController | null>(null)
 
   // UI state
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ valid: boolean; message: string } | null>(null)
+  const testRequestRef = useRef(0)
+  const testAbortRef = useRef<AbortController | null>(null)
   const [saving, setSaving] = useState(false)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
-  // Fetch caller identity on mount
-  useEffect(() => {
+  const loadCallerIdentity = useCallback(async () => {
+    callerAbortRef.current?.abort()
+    const requestId = ++callerRequestRef.current
+    const controller = new AbortController()
+    callerAbortRef.current = controller
     setCallerLoading(true)
-    fetch(endpoints.callerIdentity)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data) setCallerIdentity(data) })
-      .catch(e => setCallerError(e.message))
-      .finally(() => setCallerLoading(false))
+    setCallerError(null)
+    setCallerIdentity(null)
+
+    try {
+      const res = await fetch(endpoints.callerIdentity, { signal: controller.signal })
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Failed to load caller identity'))
+      }
+
+      const data = await res.json() as Partial<CallerIdentity>
+      if (requestId !== callerRequestRef.current) return
+      if (
+        typeof data.account_id !== 'string' ||
+        typeof data.arn !== 'string' ||
+        typeof data.user_id !== 'string'
+      ) {
+        throw new Error('Caller identity returned an invalid response')
+      }
+      setCallerIdentity(data as CallerIdentity)
+    } catch (e) {
+      if (controller.signal.aborted || requestId !== callerRequestRef.current) return
+      setCallerError(e instanceof Error ? e.message : 'Failed to load caller identity')
+    } finally {
+      if (requestId === callerRequestRef.current) {
+        setCallerLoading(false)
+        if (callerAbortRef.current === controller) {
+          callerAbortRef.current = null
+        }
+      }
+    }
+  }, [])
+
+  // Fetch caller identity on mount and cancel it if the view is closed.
+  useEffect(() => {
+    void loadCallerIdentity()
+    return () => {
+      callerRequestRef.current += 1
+      callerAbortRef.current?.abort()
+    }
+  }, [loadCallerIdentity])
+
+  const invalidateTest = useCallback(() => {
+    testRequestRef.current += 1
+    testAbortRef.current?.abort()
+    testAbortRef.current = null
+    setTesting(false)
+    setTestResult(null)
   }, [])
 
   // Load saved settings
   useEffect(() => {
     if (settings) {
+      invalidateTest()
       setBucket(settings.s3.bucket || '')
       setRegion(settings.s3.region || 'us-east-1')
       setMode(settings.s3.mode || 'single')
       setOrgId(settings.s3.org_id || '')
       setAccountId(settings.s3.account_id || '')
-      if (settings.s3.member_accounts && settings.s3.member_accounts.length > 0) {
-        setSelectedAccounts(settings.s3.member_accounts)
-      }
+      setAccountIdSource(settings.s3.account_id ? 'saved' : null)
+      const savedAccounts = settings.s3.member_accounts || []
+      setSelectedAccounts(savedAccounts)
+      setDiscoveredAccounts(savedAccounts)
+      setManualAccountId('')
     }
-  }, [settings])
+  }, [settings, invalidateTest])
 
   // Auto-fill account from caller identity for single mode
   useEffect(() => {
-    if (mode === 'single' && callerIdentity?.account_id) {
+    if (
+      mode === 'single' &&
+      callerIdentity?.account_id &&
+      (!accountId || accountIdSource === 'detected')
+    ) {
       setAccountId(callerIdentity.account_id)
+      setAccountIdSource('caller')
     }
-  }, [mode, callerIdentity])
+  }, [mode, callerIdentity, accountId, accountIdSource])
 
-  // Detect bucket structure (auto-detect single vs CT mode)
-  const detectStructure = useCallback(async () => {
-    if (!bucket || !region) return
-    setDiscoveringAccounts(true)
+  const cancelDiscovery = useCallback(() => {
+    discoveryRequestRef.current += 1
+    discoveryAbortRef.current?.abort()
+    discoveryAbortRef.current = null
+    setDiscoveringAccounts(false)
+    setDiscoveryError(null)
+  }, [])
+
+  const invalidateDiscovery = useCallback(() => {
+    cancelDiscovery()
     setDiscoveredAccounts([])
+    setSelectedAccounts([])
+    setManualAccountId('')
+  }, [cancelDiscovery])
+
+  useEffect(() => {
+    return () => {
+      discoveryRequestRef.current += 1
+      discoveryAbortRef.current?.abort()
+    }
+  }, [])
+
+  // Explicitly detect bucket structure and accounts from the current form.
+  const detectStructure = useCallback(async () => {
+    if (!settings || !bucket || !region) return
+
+    discoveryAbortRef.current?.abort()
+    const requestId = ++discoveryRequestRef.current
+    const controller = new AbortController()
+    discoveryAbortRef.current = controller
+    setDiscoveringAccounts(true)
+    setDiscoveryError(null)
+
     try {
       const res = await fetch(endpoints.detectStructure, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: stableStringify({ bucket, region }),
+        signal: controller.signal,
       })
-      if (res.ok) {
-        const data = await res.json()
-        if (data.mode === 'control_tower') {
-          setMode('control_tower')
-          setOrgId(data.org_id || '')
-          if (data.accounts?.length > 0) setDiscoveredAccounts(data.accounts)
-        } else {
-          setMode('single')
-          if (data.accounts?.length > 0) {
-            setDiscoveredAccounts(data.accounts)
-            setAccountId(data.accounts[0])
-          }
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Failed to discover bucket structure'))
+      }
+
+      const data = await res.json() as Partial<BucketStructureResponse>
+      if (requestId !== discoveryRequestRef.current) return
+      if (data.mode !== 'single' && data.mode !== 'control_tower') {
+        throw new Error('Bucket discovery returned an invalid response')
+      }
+
+      const accounts = Array.isArray(data.accounts)
+        ? data.accounts.filter((account): account is string => typeof account === 'string')
+        : []
+
+      setDiscoveredAccounts(accounts)
+      setSelectedAccounts(current => current.filter(account => accounts.includes(account)))
+      if (data.mode === 'control_tower') {
+        setMode('control_tower')
+        setOrgId(data.org_id || '')
+      } else {
+        setMode('single')
+        setOrgId('')
+        setSelectedAccounts([])
+        const detectedAccount = callerIdentity?.account_id || accounts[0] || ''
+        setAccountId(detectedAccount)
+        setAccountIdSource(
+          callerIdentity?.account_id ? 'caller' : detectedAccount ? 'detected' : null,
+        )
+      }
+    } catch (e) {
+      if (controller.signal.aborted || requestId !== discoveryRequestRef.current) return
+      setDiscoveryError((e as Error).message || 'Failed to discover bucket structure')
+    } finally {
+      if (requestId === discoveryRequestRef.current) {
+        setDiscoveringAccounts(false)
+        if (discoveryAbortRef.current === controller) {
+          discoveryAbortRef.current = null
         }
       }
-    } catch { /* silent */ }
-    finally { setDiscoveringAccounts(false) }
-  }, [bucket, region])
-
-  // Discover accounts (uses form values, not saved config)
-  const discoverAccounts = useCallback(async () => {
-    if (!bucket || !region) return
-    setDiscoveringAccounts(true)
-    setDiscoveredAccounts([])
-    try {
-      // Save current form values first so the API can use them
-      await fetch(endpoints.settings, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: stableStringify({ bucket, region, mode, org_id: orgId }),
-      })
-      const res = await fetch(endpoints.accounts)
-      if (res.ok) {
-        const data = await res.json()
-        if (data?.accounts && data.accounts.length > 0) {
-          setDiscoveredAccounts(data.accounts)
-        }
-      }
-    } catch { /* silent */ }
-    finally { setDiscoveringAccounts(false) }
-  }, [bucket, region, mode, orgId])
-
-  // Auto-discover on mount if CT mode with bucket configured
-  useEffect(() => {
-    if (mode === 'control_tower' && bucket && orgId) {
-      discoverAccounts()
     }
-  }, [mode, bucket, orgId, discoverAccounts])
+  }, [settings, bucket, region, callerIdentity])
+
+  const addManualAccount = useCallback(() => {
+    const account = manualAccountId.trim()
+    if (!/^\d{12}$/.test(account)) return
+    setDiscoveredAccounts(current => current.includes(account) ? current : [...current, account])
+    setSelectedAccounts(current => current.includes(account) ? current : [...current, account])
+    setDiscoveryError(null)
+    setManualAccountId('')
+  }, [manualAccountId])
 
   // Test Connection
   const handleTestConnection = useCallback(async () => {
+    testAbortRef.current?.abort()
+    const requestId = ++testRequestRef.current
+    const controller = new AbortController()
+    testAbortRef.current = controller
     setTesting(true)
     setTestResult(null)
+
     try {
       const res = await fetch(endpoints.validateBucket, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: stableStringify({ bucket, region }),
+        signal: controller.signal,
       })
-      setTestResult(await res.json())
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Bucket validation failed'))
+      }
+
+      const result = await res.json() as { valid: boolean; message: string }
+      if (requestId !== testRequestRef.current) return
+      setTestResult(result)
     } catch (e) {
-      setTestResult({ valid: false, message: (e as Error).message })
-    } finally { setTesting(false) }
+      if (controller.signal.aborted || requestId !== testRequestRef.current) return
+      setTestResult({
+        valid: false,
+        message: e instanceof Error ? e.message : 'Bucket validation failed',
+      })
+    } finally {
+      if (requestId === testRequestRef.current) {
+        setTesting(false)
+        if (testAbortRef.current === controller) {
+          testAbortRef.current = null
+        }
+      }
+    }
   }, [bucket, region])
+
+  useEffect(() => {
+    return () => {
+      testRequestRef.current += 1
+      testAbortRef.current?.abort()
+    }
+  }, [])
 
   // Save
   const handleSave = useCallback(async () => {
     setSaving(true)
     setFeedback(null)
     try {
-      const saveBody: Record<string, any> = { bucket, region, mode, org_id: orgId }
-      if (mode === 'control_tower' && selectedAccounts.length > 0) {
-        saveBody.account_id = selectedAccounts[0]
-        saveBody.member_accounts = selectedAccounts
-      } else {
-        saveBody.account_id = accountId
-      }
+      const saveBody = mode === 'control_tower'
+        ? {
+            bucket,
+            region,
+            mode,
+            org_id: orgId,
+            account_id: selectedAccounts[0],
+            member_accounts: selectedAccounts,
+          }
+        : {
+            bucket,
+            region,
+            mode,
+            org_id: '',
+            account_id: accountId,
+            member_accounts: [],
+          }
       const res = await fetch(endpoints.settings, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: stableStringify(saveBody),
       })
       if (!res.ok) {
-        const data = await res.json().catch(() => ({ message: 'Save failed' }))
-        setFeedback({ type: 'error', text: data.message })
+        setFeedback({ type: 'error', text: await readApiError(res, 'Save failed') })
       } else {
         setFeedback({ type: 'success', text: 'Configuration saved' })
-        refetch()
+        await refetch()
       }
     } catch (e) {
       setFeedback({ type: 'error', text: (e as Error).message })
@@ -182,6 +330,22 @@ export function S3ConfigView() {
 
   if (settingsLoading) {
     return <div className="flex items-center justify-center h-full"><Loader2 className="w-5 h-5 animate-spin text-gray-400" /></div>
+  }
+
+  if (settingsError || !settings) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <XCircle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load settings</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{settingsError || 'The settings response was empty.'}</p>
+          <button type="button" onClick={() => void refetch()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20">
+            <RefreshCw className="w-3.5 h-3.5" /> {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -209,7 +373,20 @@ export function S3ConfigView() {
               <span className="text-sm font-medium text-gray-700 dark:text-gray-300">{t('settings.s3config.callerIdentity')}</span>
             </div>
             {callerLoading && <span className="text-sm text-gray-600 dark:text-gray-300">{t('settings.s3config.fetching')}</span>}
-            {callerError && <span className="text-sm text-amber-600 dark:text-amber-400">{callerError}</span>}
+            {callerError && (
+              <div role="alert" className="flex items-center justify-between gap-3">
+                <span className="text-sm text-amber-700 dark:text-amber-400">{callerError}</span>
+                <button
+                  type="button"
+                  onClick={() => void loadCallerIdentity()}
+                  disabled={callerLoading}
+                  className="shrink-0 inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/20 disabled:opacity-50"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  {t('common.retry')}
+                </button>
+              </div>
+            )}
             {callerIdentity && (
               <span className="text-sm"><span className="font-mono font-medium text-gray-900 dark:text-white">{callerIdentity.account_id}</span> <span className="text-xs text-gray-600 dark:text-gray-400">{callerIdentity.arn.split('/').pop()}</span></span>
             )}
@@ -220,12 +397,23 @@ export function S3ConfigView() {
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{t('settings.s3config.accountMode')}</label>
             <div className="grid grid-cols-2 gap-2">
               <label className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${mode === 'single' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'}`}>
-                <input type="radio" name="mode" checked={mode === 'single'} onChange={() => { setMode('single'); setOrgId(''); setDiscoveredAccounts([]) }} className="text-blue-600" />
+                <input type="radio" name="mode" checked={mode === 'single'} onChange={() => {
+                  cancelDiscovery()
+                  setMode('single')
+                  const callerAccount = callerIdentity?.account_id
+                  if (callerAccount) {
+                    setAccountId(callerAccount)
+                    setAccountIdSource('caller')
+                  } else if (!accountId && settings.s3.account_id) {
+                    setAccountId(settings.s3.account_id)
+                    setAccountIdSource('saved')
+                  }
+                }} className="text-blue-600" />
                 <div><span className={`text-sm font-medium block ${mode === 'single' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.singleAccount')}</span><span className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.oneAccount')}</span></div>
               </label>
-              <label className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${mode === 'control_tower' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'}`}>
-                <input type="radio" name="mode" checked={mode === 'control_tower'} onChange={() => setMode('control_tower')} className="text-blue-600" />
-                <div><span className={`text-sm font-medium block ${mode === 'control_tower' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{t('settings.s3config.controlTower')}</span><span className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.multiAccount')}</span></div>
+              <label className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${mode === ORGANIZATION_TRAIL_MODE.value ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'}`}>
+                <input type="radio" name="mode" checked={mode === ORGANIZATION_TRAIL_MODE.value} onChange={() => { cancelDiscovery(); setMode(ORGANIZATION_TRAIL_MODE.value) }} className="text-blue-600" />
+                <div><span className={`text-sm font-medium block ${mode === ORGANIZATION_TRAIL_MODE.value ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>{ORGANIZATION_TRAIL_MODE.label}</span><span className="text-xs text-gray-600 dark:text-gray-300">{ORGANIZATION_TRAIL_MODE.description}</span></div>
               </label>
             </div>
           </div>
@@ -233,18 +421,18 @@ export function S3ConfigView() {
           {/* Bucket */}
           <div>
             <label htmlFor="bucket" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{t('settings.s3config.bucketName')}</label>
-            <input id="bucket" type="text" value={bucket} onChange={(e) => { setBucket(e.target.value); setTestResult(null) }} placeholder="aws-cloudtrail-logs-..." className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            <input id="bucket" type="text" value={bucket} onChange={(e) => { invalidateDiscovery(); invalidateTest(); setBucket(e.target.value) }} placeholder="aws-cloudtrail-logs-..." className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
 
           {/* Bucket Region */}
           <div>
             <label htmlFor="region" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{t('settings.s3config.bucketRegion')}</label>
-            <select id="region" value={region} onChange={(e) => { setRegion(e.target.value); setTestResult(null) }} className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <select id="region" value={region} onChange={(e) => { invalidateDiscovery(); invalidateTest(); setRegion(e.target.value) }} className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
               {AWS_REGIONS.map((r) => <option key={r} value={r}>{r}</option>)}
             </select>
           </div>
 
-          {/* Auto-detect structure */}
+          {/* Explicit structure detection */}
           <button
             type="button"
             onClick={detectStructure}
@@ -254,6 +442,11 @@ export function S3ConfigView() {
             <RefreshCw className={`w-3.5 h-3.5 ${discoveringAccounts ? 'animate-spin' : ''}`} />
             {discoveringAccounts ? t('settings.s3config.detecting') : t('settings.s3config.detectStructure')}
           </button>
+          {discoveryError && (
+            <div role="alert" className="p-3 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10">
+              <p className="text-xs text-red-700 dark:text-red-300">{discoveryError}</p>
+            </div>
+          )}
 
           {/* Org ID — CT only */}
           {mode === 'control_tower' && (
@@ -270,7 +463,7 @@ export function S3ConfigView() {
                 {mode === 'control_tower' ? t('settings.s3config.targetAccounts') : t('data.sync.account')}
               </label>
               {mode === 'control_tower' && (
-                <button type="button" onClick={discoverAccounts} disabled={discoveringAccounts || !bucket}
+                <button type="button" onClick={detectStructure} disabled={discoveringAccounts || !bucket || !region}
                   className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50">
                   <RefreshCw className={`w-3 h-3 ${discoveringAccounts ? 'animate-spin' : ''}`} />
                   {discoveringAccounts ? t('settings.s3config.discovering') : t('settings.s3config.discover')}
@@ -278,11 +471,51 @@ export function S3ConfigView() {
               )}
             </div>
 
+            {mode === 'control_tower' && (
+              <div>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={manualAccountId}
+                    onChange={event => setManualAccountId(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter' && /^\d{12}$/.test(manualAccountId.trim())) {
+                        event.preventDefault()
+                        addManualAccount()
+                      }
+                    }}
+                    aria-label={t('settings.s3config.manualAccount', { defaultValue: 'Add account ID manually' })}
+                    aria-invalid={manualAccountId.length > 0 && !/^\d{12}$/.test(manualAccountId.trim())}
+                    placeholder={t('settings.s3config.manualAccountPlaceholder', { defaultValue: '12-digit account ID' })}
+                    className="min-w-0 flex-1 px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={addManualAccount}
+                    disabled={!/^\d{12}$/.test(manualAccountId.trim())}
+                    aria-label={t('settings.s3config.addAccount', { defaultValue: 'Add account' })}
+                    title={t('settings.s3config.addAccount', { defaultValue: 'Add account' })}
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Plus className="h-4 w-4" />
+                  </button>
+                </div>
+                {manualAccountId.length > 0 && !/^\d{12}$/.test(manualAccountId.trim()) && (
+                  <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
+                    {t('settings.s3config.accountIdFormat', { defaultValue: 'Account ID must contain exactly 12 digits.' })}
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* Single mode: show caller identity account */}
             {mode === 'single' && (
               <div className="text-sm">
                 <span className="font-mono text-gray-900 dark:text-white">{accountId || callerIdentity?.account_id || '—'}</span>
-                <span className="text-xs text-gray-500 ml-2">(from caller identity)</span>
+                {accountIdSource === 'caller' && callerIdentity?.account_id === accountId && (
+                  <span className="text-xs text-gray-500 ml-2">(from caller identity)</span>
+                )}
               </div>
             )}
 
@@ -295,6 +528,7 @@ export function S3ConfigView() {
                     type="checkbox"
                     checked={selectedAccounts.length === discoveredAccounts.length}
                     onChange={(e) => setSelectedAccounts(e.target.checked ? [...discoveredAccounts] : [])}
+                    disabled={discoveringAccounts}
                     className="rounded text-blue-600 focus:ring-blue-500"
                   />
                   <span className="text-xs font-medium text-gray-700 dark:text-gray-300">{t('settings.s3config.selectAll', { count: discoveredAccounts.length })}</span>
@@ -305,6 +539,7 @@ export function S3ConfigView() {
                       <input
                         type="checkbox"
                         checked={selectedAccounts.includes(acct)}
+                        disabled={discoveringAccounts}
                         onChange={(e) => {
                           if (e.target.checked) setSelectedAccounts([...selectedAccounts, acct])
                           else setSelectedAccounts(selectedAccounts.filter(a => a !== acct))
@@ -320,7 +555,7 @@ export function S3ConfigView() {
             )}
 
             {/* CT mode: no accounts discovered yet */}
-            {mode === 'control_tower' && !discoveringAccounts && discoveredAccounts.length === 0 && (
+            {mode === 'control_tower' && !discoveringAccounts && !discoveryError && discoveredAccounts.length === 0 && (
               <p className="text-xs text-gray-600 dark:text-gray-300">{t('settings.s3config.clickDiscover')}</p>
             )}
 
@@ -334,7 +569,7 @@ export function S3ConfigView() {
 
           {/* Test + Save */}
           <div className="flex items-center gap-3 pt-3 border-t border-gray-200 dark:border-gray-700">
-            <button type="button" onClick={handleSave} disabled={saving || !bucket || !region || (mode === 'control_tower' ? selectedAccounts.length === 0 : !accountId)}
+            <button type="button" onClick={handleSave} disabled={saving || discoveringAccounts || !bucket || !region || (mode === 'control_tower' ? !orgId || selectedAccounts.length === 0 : !accountId)}
               className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
               {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               {t('settings.s3config.save')}

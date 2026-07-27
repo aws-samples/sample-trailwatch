@@ -2,6 +2,7 @@ package nlquery
 
 import (
 	"fmt"
+	"strings"
 )
 
 type FindingQuery struct {
@@ -9,8 +10,8 @@ type FindingQuery struct {
 	DetailSQL  string
 }
 
-// Off-hours window for the "human activity at unusual times" compromise
-// indicator (uba-activity-by-hour). These bounds are in UTC because CloudTrail
+// Off-hours window for the "human activity at unusual times" timing
+// observation (uba-activity-by-hour). These bounds are in UTC because CloudTrail
 // eventTime is recorded in UTC and we compare against it directly without a
 // timezone conversion. For an org whose operators work in a single non-UTC
 // timezone this UTC window produces systematic false positives (e.g. a US-East
@@ -20,20 +21,28 @@ type FindingQuery struct {
 // UTC would be "on-hours", so off-hours would be the complement). The bounds
 // are inclusive and the SQL uses BETWEEN, so this covers 00:00:00 through
 // 06:59:59 UTC.
+//
+// NOTE: This query reports observable timing only. It does not establish
+// whether off-hours activity is authorized, malicious, or automated.
 const (
 	offHoursStartUTC = 0 // inclusive: 00:00 UTC
 	offHoursEndUTC   = 6 // inclusive: through 06:59 UTC
 )
 
 func BuildFindingQueries(dataPath string) map[string]FindingQuery {
+	return buildFindingQueries(dataPath, "")
+}
+
+func buildFindingQueries(dataPath, accountScope string) map[string]FindingQuery {
 	// Use the parent CloudTrail directory to capture ALL accounts under the bucket
 	// This enables cross-account correlation when multiple accounts are synced.
 	// dataPath is config-derived, so escape any single quotes before interpolating
 	// it into the read_json('...') literal — an unescaped quote would break out of
 	// the literal and could bypass the read-only SQL allowlist (see safesql.go).
 	read := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=%d, auto_detect=true, union_by_name=true)`, escapeSQLLiteral(dataPath), maxObjectSize)
+	events := fmt.Sprintf("(SELECT unnest(Records) as r FROM %s)", read)
 
-	return map[string]FindingQuery{
+	queries := map[string]FindingQuery{
 		"root-account-usage": {
 			SummarySQL: fmt.Sprintf(`SELECT COUNT(*) as count, COUNT(DISTINCT r.sourceIPAddress) as unique_ips FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity."type" = 'Root';`, read),
 			DetailSQL:  fmt.Sprintf(`SELECT r.eventName, r.sourceIPAddress, r.eventTime, r.userAgent, r.awsRegion, r.errorCode FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity."type" = 'Root' ORDER BY r.eventTime DESC LIMIT 50;`, read),
@@ -113,4 +122,20 @@ func BuildFindingQueries(dataPath string) map[string]FindingQuery {
 			DetailSQL:  fmt.Sprintf(`SELECT r.userIdentity.sessionContext.sessionIssuer.userName as role_name, r.eventName, r.eventSource, r.sourceIPAddress, r.eventTime, r.errorCode FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity."type" = 'AssumedRole' AND r.userIdentity.invokedBy IS NULL AND r.eventName IN ('GetObject', 'PutObject', 'CopyObject', 'GetSecretValue', 'CreateSnapshot', 'CopySnapshot', 'ModifySnapshotAttribute', 'PutBucketPolicy', 'PutObjectAcl') ORDER BY r.eventTime DESC LIMIT 50;`, read),
 		},
 	}
+
+	if accountScope == "" {
+		return queries
+	}
+
+	scopedEvents := fmt.Sprintf(
+		"(SELECT r FROM %s WHERE %s)",
+		events,
+		strings.TrimPrefix(accountScope, " AND "),
+	)
+	for id, query := range queries {
+		query.SummarySQL = strings.ReplaceAll(query.SummarySQL, events, scopedEvents)
+		query.DetailSQL = strings.ReplaceAll(query.DetailSQL, events, scopedEvents)
+		queries[id] = query
+	}
+	return queries
 }

@@ -216,7 +216,7 @@ var Templates = []PromptTemplate{
 		Name:        "Activity by Hour (Anomaly Detection)",
 		Category:    "User Behavior Analytics",
 		Description: "API call distribution by hour — flag off-hours activity",
-		Prompt:      "Using DuckDB, query the CloudTrail JSON logs at {data_path} to analyze activity patterns by hour of day for account {account_id} in region {region} between {start_date} and {end_date}. For each hour (0-23 UTC), show: total API calls, count of distinct human users active, count of write operations, and count of error events. Also separately list any human user activity (userIdentity.\"type\" IN ('IAMUser', 'FederatedUser', 'AssumedRole') AND userIdentity.invokedBy IS NULL) occurring between 00:00-06:00 UTC with full details (user, event, IP, time). Off-hours human activity is a strong indicator of compromise or insider threat.",
+		Prompt:      "Using DuckDB, query the CloudTrail JSON logs at {data_path} to analyze activity patterns by hour of day for account {account_id} in region {region} between {start_date} and {end_date}. For each hour (0-23 UTC), show: total API calls, count of distinct human users active, count of write operations, and count of error events. Also separately list any human user activity (userIdentity.\"type\" IN ('IAMUser', 'FederatedUser', 'AssumedRole') AND userIdentity.invokedBy IS NULL) occurring between 00:00-06:00 UTC with full details (user, event, IP, time). Review human identity activity during 00:00-06:59 UTC. This query reports timing only and does not establish whether the activity is authorized or malicious.",
 		Parameters:  []string{"account_id", "region", "start_date", "end_date", "data_path"},
 	},
 

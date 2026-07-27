@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"testing"
 
 	"cloudtrail-analyzer/internal/config"
@@ -117,6 +119,67 @@ func TestRoutes_MountsExecute(t *testing.T) {
 	// Should not be 404/405 — it should attempt execution (and fail because no real LLM)
 	if w.Code == http.StatusNotFound || w.Code == http.StatusMethodNotAllowed {
 		t.Errorf("route not registered, got %d", w.Code)
+	}
+}
+
+func TestExecute_IndexRequired(t *testing.T) {
+	cfg := testConfig()
+	cfg.DataDir = t.TempDir()
+	h := NewHandler(cfg, testDB(t))
+
+	req := httptest.NewRequest("POST", "/execute", bytes.NewBufferString(`{"prompt":"show failed calls"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Execute(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["code"] != "INDEX_REQUIRED" {
+		t.Fatalf("unexpected response code: %v", resp["code"])
+	}
+}
+
+func TestInvalidateIndexRemovesDerivedData(t *testing.T) {
+	if _, err := exec.LookPath("duckdb"); err != nil {
+		t.Skip("duckdb CLI not installed")
+	}
+	cfg := testConfig()
+	cfg.DataDir = t.TempDir()
+	db := testDB(t)
+	h := NewHandler(cfg, db)
+
+	indexPath := h.indexer.IndexPath()
+	if out, err := exec.Command("duckdb", indexPath, "CREATE TABLE events(i INTEGER);").CombinedOutput(); err != nil {
+		t.Fatalf("creating index: %v: %s", err, out)
+	}
+	if err := os.WriteFile(h.indexer.indexVersionPath(), []byte(indexSchemaVersion+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO indexed_files (file_path, file_size, mod_time, batch_id)
+		VALUES ('event.json', 10, '2026-07-01T00:00:00Z', 'batch')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.InvalidateIndex(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("expected index file removal, stat err = %v", err)
+	}
+	if _, err := os.Stat(h.indexer.indexVersionPath()); !os.IsNotExist(err) {
+		t.Fatalf("expected index version marker removal, stat err = %v", err)
+	}
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM indexed_files").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected checkpoints to be cleared, got %d", count)
 	}
 }
 

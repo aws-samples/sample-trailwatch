@@ -8,9 +8,42 @@ import { readApiError } from '../../comm/apiError'
 import { AccountLabel } from '../../comm/AccountLabel'
 import type { Session, ProgressSnapshot } from '../../types/session'
 
+const SESSION_STATES = new Set([
+  'pending',
+  'downloading',
+  'extracting',
+  'verifying',
+  'query-ready',
+  'partially-verified',
+  'failed',
+  'interrupted',
+  'deleted',
+])
+
+function isSession(value: unknown): value is Session {
+  if (!value || typeof value !== 'object') return false
+  const session = value as Record<string, unknown>
+  return (
+    typeof session.id === 'string' &&
+    typeof session.bucket === 'string' &&
+    typeof session.account_id === 'string' &&
+    typeof session.region === 'string' &&
+    typeof session.log_region === 'string' &&
+    typeof session.mode === 'string' &&
+    typeof session.start_date === 'string' &&
+    typeof session.end_date === 'string' &&
+    typeof session.state === 'string' &&
+    SESSION_STATES.has(session.state) &&
+    typeof session.total_files === 'number' &&
+    typeof session.disk_usage_bytes === 'number' &&
+    typeof session.created_at === 'string' &&
+    typeof session.updated_at === 'string'
+  )
+}
+
 export function S3SyncView() {
   const { t } = useTranslation()
-  const { data: settings, loading: settingsLoading } = useSettings()
+  const { data: settings, loading: settingsLoading, error: settingsError, refetch: refetchSettings } = useSettings()
 
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
@@ -21,37 +54,54 @@ export function S3SyncView() {
   const [syncError, setSyncError] = useState<string | null>(null)
   const [liveProgress, setLiveProgress] = useState<Record<string, ProgressSnapshot>>({})
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const sessionsRequestRef = useRef(0)
 
-  const bucket = settings?.s3?.bucket || ''
-  const mode = settings?.s3?.mode || 'single'
-  const orgId = settings?.s3?.org_id || ''
-  const accountId = settings?.s3?.account_id || ''
-  const memberAccounts = settings?.s3?.member_accounts || []
-  const logRegion = settings?.s3?.log_region || settings?.s3?.region || 'us-east-1'
+  const s3Settings = settings?.s3
+  const bucket = s3Settings?.bucket
+  const mode = s3Settings?.mode
+  const orgId = s3Settings?.org_id
+  const accountId = s3Settings?.account_id
+  const memberAccounts = s3Settings?.member_accounts ?? []
+  const logRegion = s3Settings ? (s3Settings.log_region || s3Settings.region || 'us-east-1') : ''
 
   // Determine which accounts to sync
-  const accountsToSync = mode === 'control_tower' && memberAccounts.length > 0
-    ? memberAccounts
-    : [accountId]
+  const accountsToSync = !s3Settings
+    ? []
+    : mode === 'control_tower'
+      ? memberAccounts
+      : accountId
+        ? [accountId]
+        : []
 
   const fetchSessions = useCallback(async () => {
+    const requestId = ++sessionsRequestRef.current
     try {
       setSessionsError(null)
       const res = await fetch('/api/sessions')
       if (!res.ok) {
-        setSessionsError(await readApiError(res, 'Failed to load sessions'))
-        return
+        throw new Error(await readApiError(res, 'Failed to load sessions'))
       }
-      const data = await res.json()
-      if (Array.isArray(data)) setSessions(data.slice(0, 30))
-    } catch (e: any) {
-      setSessionsError(e?.message || 'Failed to load sessions')
+      const data: unknown = await res.json()
+      if (!Array.isArray(data) || !data.every(isSession)) {
+        throw new Error('Sessions returned an invalid response')
+      }
+      if (requestId === sessionsRequestRef.current) {
+        setSessions(data.slice(0, 30))
+      }
+    } catch (e: unknown) {
+      if (requestId === sessionsRequestRef.current) {
+        setSessions([])
+        setLiveProgress({})
+        setSessionsError(e instanceof Error && e.message ? e.message : 'Failed to load sessions')
+      }
     } finally {
-      setSessionsLoading(false)
+      if (requestId === sessionsRequestRef.current) setSessionsLoading(false)
     }
   }, [])
 
-  useEffect(() => { fetchSessions() }, [fetchSessions])
+  useEffect(() => {
+    if (settings) void fetchSessions()
+  }, [settings, fetchSessions])
 
   // Poll progress snapshots for active sessions every 2 seconds
   useEffect(() => {
@@ -88,9 +138,11 @@ export function S3SyncView() {
 
   // Start sync for all selected accounts
   const handleStartSync = async () => {
-    if (!bucket || !startDate || !endDate || accountsToSync.length === 0) return
+    if (!settings || !bucket || !startDate || !endDate || accountsToSync.length === 0) return
     setSyncing(true)
     setSyncError(null)
+    let confirmedStarted = 0
+    let startRequestAttempted = false
 
     try {
       for (const acct of accountsToSync) {
@@ -105,30 +157,58 @@ export function S3SyncView() {
           }),
         })
         if (!createRes.ok) {
-          const err = await createRes.json().catch(() => ({ message: `Failed to create session for ${acct}` }))
-          throw new Error(err.message)
+          const message = await readApiError(createRes, 'Failed to create session')
+          throw new Error(`Account ${acct}: ${message}`)
         }
         const session: Session = await createRes.json()
 
         // Start processing
+        startRequestAttempted = true
         const startRes = await fetch(endpoints.sessionProcess(session.id), { method: 'POST' })
         if (!startRes.ok) {
-          const err = await startRes.json().catch(() => ({ message: `Failed to start sync for ${acct}` }))
-          throw new Error(err.message)
+          const message = await readApiError(startRes, 'Failed to start sync')
+          throw new Error(`Account ${acct}: ${message}`)
         }
+        confirmedStarted += 1
       }
-      fetchSessions()
     } catch (e) {
-      setSyncError((e as Error).message)
+      const message = (e as Error).message
+      if (confirmedStarted > 0 || startRequestAttempted) {
+        const startStatus = confirmedStarted > 0
+          ? `${confirmedStarted} account sync(s) were confirmed started.`
+          : 'A start request was sent, but no successful response was received.'
+        setSyncError(
+          `${message} ${startStatus} Some accounts may already be running. Review the refreshed session list before retrying.`,
+        )
+      } else {
+        setSyncError(message)
+      }
     } finally {
+      await fetchSessions()
       setSyncing(false)
     }
   }
 
-  const canSubmit = bucket && accountsToSync.length > 0 && startDate && endDate && !syncing
+  const canSubmit = Boolean(bucket && accountsToSync.length > 0 && startDate && endDate && !syncing)
 
   if (settingsLoading) {
     return <div className="flex items-center justify-center h-full"><Loader2 className="w-5 h-5 animate-spin text-gray-400" /></div>
+  }
+
+  if (settingsError || !settings) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <AlertCircle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load settings</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{settingsError || 'The settings response was empty.'}</p>
+          <button type="button" onClick={() => void refetchSettings()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20">
+            <RefreshCw className="w-3.5 h-3.5" /> {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
   }
 
   if (!bucket) {
@@ -195,13 +275,17 @@ export function S3SyncView() {
                 <input id="endDate" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="w-full px-3 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
             </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 -mt-1">
+              <Clock className="inline w-3 h-3 mr-1 -mt-px" />
+              Dates select CloudTrail S3 delivery partitions, not exact event timestamps. Include the adjacent UTC day when boundary completeness matters.
+            </p>
 
             <button type="button" onClick={handleStartSync} disabled={!canSubmit}
               className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-[#0972d3] text-white hover:bg-[#0860b0] disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
               {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
               {syncing ? t('data.sync.syncing', { count: accountsToSync.length }) : t('data.sync.startSync', { count: accountsToSync.length })}
             </button>
-            {syncError && <p className="text-sm text-red-600 dark:text-red-400">{syncError}</p>}
+            {syncError && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{syncError}</p>}
           </div>
 
           {/* Active Downloads */}
@@ -595,7 +679,7 @@ function StatusChip({ state }: { state: string }) {
 // API ownership of file cleanup belongs to the backend.
 function CompletedSessionRow({ session, onDeleted }: { session: Session; onDeleted: () => void }) {
   const { t } = useTranslation()
-  const { deleteSession, loading } = useDeleteSession()
+  const { deleteSession, loading, error } = useDeleteSession()
   const [confirming, setConfirming] = useState(false)
 
   async function handleDelete() {
@@ -619,21 +703,24 @@ function CompletedSessionRow({ session, onDeleted }: { session: Session; onDelet
         <StatusChip state={session.state} />
       </td>
       <td className="px-3 py-2 text-right">
-        <button
-          type="button"
-          onClick={handleDelete}
-          disabled={loading}
-          aria-label={t('data.sync.deleteSession')}
-          title={confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
-          className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] rounded border transition-colors ${
-            confirming
-              ? 'border-red-400 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700'
-              : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-red-50 dark:hover:bg-red-900/20 hover:border-red-300 hover:text-red-700 dark:hover:text-red-300'
-          } disabled:opacity-50 disabled:cursor-not-allowed`}
-        >
-          <Trash2 className="w-3 h-3" />
-          {confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
-        </button>
+        <div className="inline-flex flex-col items-end gap-1">
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={loading}
+            aria-label={t('data.sync.deleteSession')}
+            title={confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
+            className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] rounded border transition-colors ${
+              confirming
+                ? 'border-red-400 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-700'
+                : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-red-50 dark:hover:bg-red-900/20 hover:border-red-300 hover:text-red-700 dark:hover:text-red-300'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
+          >
+            <Trash2 className="w-3 h-3" />
+            {confirming ? t('data.sync.confirmDelete') : t('data.sync.deleteSession')}
+          </button>
+          {error && <span role="alert" className="max-w-48 text-[10px] text-red-700 dark:text-red-300">{error}</span>}
+        </div>
       </td>
     </tr>
   )

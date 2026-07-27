@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"cloudtrail-analyzer/internal/cloudtrailpath"
 	"cloudtrail-analyzer/internal/features/sessions"
 )
 
@@ -32,21 +34,26 @@ const (
 // It is idempotent: if the .json file already exists, the .gz is skipped.
 // A total extraction byte limit is enforced across all files to guard against decompression bombs.
 func extractFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress, onExtracted func(path string, size int64)) error {
-	sessionDir := sessionLocalDir(session, dataDir)
+	sessionDirs, err := sessionDateDirs(session, dataDir)
+	if err != nil {
+		return err
+	}
 
 	// Count total .gz files first for progress reporting
 	var gzFiles []string
-	err := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
+	for _, sessionDir := range sessionDirs {
+		err := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // skip inaccessible files
+			}
+			if !info.IsDir() && strings.HasSuffix(path, ".json.gz") {
+				gzFiles = append(gzFiles, path)
+			}
+			return nil
+		})
 		if err != nil {
-			return nil // skip inaccessible files
+			return fmt.Errorf("walking session directory %s: %w", sessionDir, err)
 		}
-		if !info.IsDir() && strings.HasSuffix(path, ".json.gz") {
-			gzFiles = append(gzFiles, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("walking session directory %s: %w", sessionDir, err)
 	}
 
 	totalFiles := len(gzFiles)
@@ -125,12 +132,14 @@ func extractSingleFileWithLimit(gzPath, jsonPath string, limit int64) (int64, er
 	}
 	defer reader.Close()
 
-	// Write to temp file first, then rename
-	tmpPath := jsonPath + ".tmp"
-	outFile, err := os.Create(tmpPath)
+	// Use a unique staging file so overlapping work cannot truncate or rename a
+	// different extraction attempt's fixed ".tmp" path.
+	outFile, err := os.CreateTemp(filepath.Dir(jsonPath), "."+filepath.Base(jsonPath)+".*.tmp")
 	if err != nil {
 		return 0, fmt.Errorf("creating output file: %w", err)
 	}
+	tmpPath := outFile.Name()
+	defer os.Remove(tmpPath)
 
 	// Limit decompressed size to prevent decompression bombs
 	written, err := io.Copy(outFile, io.LimitReader(reader, limit)) // nosemgrep: potential-dos-via-decompression-bomb
@@ -138,27 +147,61 @@ func extractSingleFileWithLimit(gzPath, jsonPath string, limit int64) (int64, er
 		err = closeErr
 	}
 	if err != nil {
-		os.Remove(tmpPath)
 		return written, fmt.Errorf("decompressing: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, jsonPath); err != nil {
-		os.Remove(tmpPath)
 		return written, fmt.Errorf("renaming temp file: %w", err)
 	}
 
 	return written, nil
 }
 
-// sessionLocalDir returns the base local directory for a session's downloaded files.
+// sessionLocalDir returns the primary local directory retained for callers that
+// only need the original single-account or legacy Control Tower layout.
 func sessionLocalDir(session *sessions.Session, dataDir string) string {
-	if session.Mode == "control_tower" && session.OrgID != "" {
-		return filepath.Join(dataDir, "s3", session.Bucket,
-			session.OrgID, "AWSLogs", session.OrgID, session.AccountID, "CloudTrail", session.LogRegion)
+	return cloudtrailpath.LocalRegionDirs(
+		dataDir,
+		session.Bucket,
+		session.Mode,
+		session.OrgID,
+		session.AccountID,
+		session.LogRegion,
+	)[0]
+}
+
+// sessionDateDirs returns only the S3 delivery-date partitions selected by the
+// session. Walking the account/region root mixes unrelated sessions into
+// verification, extraction, and disk-usage accounting.
+func sessionDateDirs(session *sessions.Session, dataDir string) ([]string, error) {
+	start, err := time.Parse("2006-01-02", session.StartDate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session start_date: %w", err)
+	}
+	end, err := time.Parse("2006-01-02", session.EndDate)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session end_date: %w", err)
+	}
+	if start.After(end) || end.Sub(start) > 90*24*time.Hour {
+		return nil, fmt.Errorf("invalid session date range")
 	}
 
-	return filepath.Join(dataDir, "s3", session.Bucket,
-		"AWSLogs", session.AccountID, "CloudTrail", session.LogRegion)
+	regionDirs := cloudtrailpath.LocalRegionDirs(
+		dataDir,
+		session.Bucket,
+		session.Mode,
+		session.OrgID,
+		session.AccountID,
+		session.LogRegion,
+	)
+	dirs := make([]string, 0, len(regionDirs)*int(end.Sub(start)/(24*time.Hour)+1))
+	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+		for _, regionDir := range regionDirs {
+			dirs = append(dirs, filepath.Join(regionDir,
+				day.Format("2006"), day.Format("01"), day.Format("02")))
+		}
+	}
+	return dirs, nil
 }
 
 // sendExtractProgress sends an extraction progress event.

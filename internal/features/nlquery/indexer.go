@@ -19,7 +19,15 @@ import (
 )
 
 const indexDBName = "cloudtrail_index.duckdb"
+const indexVersionFile = "cloudtrail_index.version"
+const indexSchemaVersion = "2"
 const batchSizeThreshold = 100 * 1024 * 1024 // 100 MB
+
+const secondaryIndexesSQL = `
+	CREATE INDEX IF NOT EXISTS idx_event_name ON events ((r.eventName));
+	CREATE INDEX IF NOT EXISTS idx_event_source ON events ((r.eventSource));
+	CREATE INDEX IF NOT EXISTS idx_error_code ON events ((r.errorCode));
+`
 
 // maxObjectSize caps read_json's per-object buffer. It is kept in lockstep with
 // the extractor's maxPerFileBytes (processor/extractor.go, 256 MB) — a smaller
@@ -28,6 +36,7 @@ const batchSizeThreshold = 100 * 1024 * 1024 // 100 MB
 const maxObjectSize = 256 * 1024 * 1024 // 256 MB
 
 var ErrAlreadyRunning = errors.New("indexing is already in progress")
+var ErrIndexBusy = errors.New("index is being updated")
 
 type IndexState struct {
 	Status         string `json:"status"`
@@ -70,6 +79,7 @@ type Indexer struct {
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	done   chan struct{}
 
 	// writeMu serializes every write to the DuckDB index file. DuckDB holds a
 	// process-level write lock, so a micro-batch flush and a manual re-index
@@ -80,16 +90,38 @@ type Indexer struct {
 }
 
 func NewIndexer(cfg *config.Config, db *sql.DB) *Indexer {
-	return &Indexer{cfg: cfg, db: db}
+	idx := &Indexer{cfg: cfg, db: db}
+	if result, err := db.Exec(
+		`UPDATE index_state SET status = 'idle', updated_at = ?
+		 WHERE id = 1 AND status = 'building'`,
+		time.Now().UTC().Format(time.RFC3339),
+	); err == nil {
+		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows > 0 {
+			slog.Info("recovered stale in-progress index state",
+				"component", "cloudtrail-analyzer")
+		}
+	}
+	if idx.IsIndexed() {
+		if err := idx.refreshIdleStateFromCheckpoints(""); err != nil {
+			slog.Warn("failed to restore index progress from checkpoints",
+				"component", "cloudtrail-analyzer",
+				"error", err.Error())
+		}
+	}
+	return idx
 }
 
 func (idx *Indexer) IndexPath() string {
 	return filepath.Join(idx.cfg.DataDir, indexDBName)
 }
 
+func (idx *Indexer) indexVersionPath() string {
+	return filepath.Join(idx.cfg.DataDir, indexVersionFile)
+}
+
 func (idx *Indexer) IsIndexed() bool {
 	info, err := os.Stat(idx.IndexPath())
-	return err == nil && info.Size() > 0
+	return err == nil && info.Size() > 0 && idx.hasCurrentSchema()
 }
 
 func (idx *Indexer) IndexAge() time.Duration {
@@ -129,7 +161,138 @@ func (idx *Indexer) CancelIndex() error {
 	return nil
 }
 
+func (idx *Indexer) Shutdown(ctx context.Context) error {
+	idx.mu.Lock()
+	cancel := idx.cancel
+	done := idx.done
+	if cancel != nil {
+		cancel()
+	}
+	idx.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for index build to stop: %w", ctx.Err())
+	}
+}
+
+// BeginInvalidation removes the shared index and keeps all index build/write
+// gates held until the returned release function is called.
+func (idx *Indexer) BeginInvalidation() (func(), error) {
+	idx.mu.Lock()
+	if idx.cancel != nil {
+		idx.mu.Unlock()
+		return nil, fmt.Errorf("%w: cancel or wait for the current index build before deleting data", ErrIndexBusy)
+	}
+
+	idx.writeMu.Lock()
+	if err := idx.invalidateLocked(); err != nil {
+		idx.writeMu.Unlock()
+		idx.mu.Unlock()
+		return nil, err
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			idx.writeMu.Unlock()
+			idx.mu.Unlock()
+		})
+	}, nil
+}
+
+// Invalidate performs an immediate invalidation for callers that do not need
+// to keep source-data mutation excluded afterward.
+func (idx *Indexer) Invalidate() error {
+	release, err := idx.BeginInvalidation()
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
+}
+
+// invalidateLocked resets index files and checkpoints. The caller holds both
+// idx.mu and idx.writeMu.
+func (idx *Indexer) invalidateLocked() error {
+	for _, path := range []string{idx.IndexPath(), idx.IndexPath() + ".wal", idx.indexVersionPath()} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing DuckDB index: %w", err)
+		}
+	}
+
+	tx, err := idx.db.Begin()
+	if err != nil {
+		return fmt.Errorf("starting index metadata reset: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM indexed_files"); err != nil {
+		return fmt.Errorf("clearing indexed file checkpoints: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE index_state SET status = 'idle', total_bytes = 0,
+		processed_bytes = 0, total_files = 0, processed_files = 0,
+		last_batch_id = NULL, started_at = NULL, updated_at = ? WHERE id = 1`,
+		time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("resetting index state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing index metadata reset: %w", err)
+	}
+
+	slog.Info("invalidated DuckDB index after source data deletion",
+		"component", "cloudtrail-analyzer")
+	return nil
+}
+
 func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) error {
+	return idx.buildIndexIncremental(ctx, dataPath, nil)
+}
+
+// StartBuildAsync registers the index worker before returning so cancellation,
+// duplicate-start checks, and shutdown cannot miss a newly accepted build.
+func (idx *Indexer) StartBuildAsync(parent context.Context, dataPath string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	ready := make(chan error, 1)
+	go func() {
+		defer cancel()
+		if err := idx.buildIndexIncremental(ctx, dataPath, ready); err != nil {
+			slog.Error("incremental index build failed",
+				"component", "cloudtrail-analyzer",
+				"error", err.Error(),
+			)
+		}
+	}()
+
+	err := <-ready
+	if err != nil {
+		cancel()
+	}
+	return err
+}
+
+func (idx *Indexer) buildIndexIncremental(
+	ctx context.Context,
+	dataPath string,
+	ready chan error,
+) (retErr error) {
+	signalReady := func(err error) {
+		if ready == nil {
+			return
+		}
+		ready <- err
+		close(ready)
+		ready = nil
+	}
+	defer func() {
+		if ready != nil {
+			signalReady(retErr)
+		}
+	}()
+
 	if dataPath == "" {
 		return fmt.Errorf("no data path configured")
 	}
@@ -141,13 +304,18 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	idx.cancel = cancel
+	done := make(chan struct{})
+	idx.done = done
 	idx.mu.Unlock()
+	signalReady(nil)
 
 	defer func() {
 		idx.mu.Lock()
 		idx.cancel = nil
+		idx.done = nil
 		idx.mu.Unlock()
 		cancel()
+		close(done)
 	}()
 
 	// Update state to building
@@ -167,16 +335,12 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 	}
 
 	// Step 2: Check DuckDB consistency
-	dbPath := idx.IndexPath()
-	dbExists := fileExists(dbPath)
-	indexedCount, _ := idx.countIndexedFiles()
-
-	if !dbExists && indexedCount > 0 {
-		slog.Warn("DuckDB index missing but checkpoint records exist, clearing checkpoints",
-			"component", "cloudtrail-analyzer",
-			"orphan_records", indexedCount,
-		)
-		idx.clearIndexedFiles()
+	idx.writeMu.Lock()
+	dbExists, _, err := idx.reconcileIndexLocked()
+	idx.writeMu.Unlock()
+	if err != nil {
+		idx.updateState("error", 0, 0, 0, 0, "")
+		return err
 	}
 
 	// Step 3: Get already-indexed files from SQLite
@@ -214,8 +378,6 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 	// Step 6: Process batches
 	var processedBytes int64
 	var processedFiles int
-	isFirstBatch := !dbExists && indexedCount == 0
-
 	for i, b := range batches {
 		// Check cancellation between batches
 		if ctx.Err() != nil {
@@ -232,15 +394,10 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 			"size_bytes", b.Size,
 		)
 
-		// Build and execute DuckDB SQL via temp file (avoids argument list too long).
-		// writeMu serializes this write against any concurrent micro-batch flush —
-		// see Indexer.writeMu. Taken per batch (not around the whole loop) so the
-		// between-batch cancellation check still runs and a micro-batch can
-		// interleave between our batches.
-		duckSQL := idx.buildBatchSQL(b, dbPath, isFirstBatch && i == 0)
-		idx.writeMu.Lock()
-		out, err := idx.execDuckDB(ctx, dbPath, duckSQL)
-		idx.writeMu.Unlock()
+		// Keep the DuckDB write, SQLite checkpoint, and schema marker serialized
+		// with every other index writer. A retry deletes and replaces rows for the
+		// same source files, so a checkpoint failure cannot duplicate events.
+		out, err := idx.writeBatch(ctx, b)
 		if err != nil {
 			slog.Error("batch failed",
 				"component", "cloudtrail-analyzer",
@@ -252,27 +409,18 @@ func (idx *Indexer) BuildIndexIncremental(ctx context.Context, dataPath string) 
 			return fmt.Errorf("batch %d failed: %s — %w", i+1, string(out), err)
 		}
 
-		// Checkpoint: record indexed files in SQLite
-		if err := idx.checkpointBatch(b); err != nil {
-			idx.updateState("error", totalBytes, processedBytes, len(newFiles), processedFiles, "")
-			return fmt.Errorf("checkpointing batch %d: %w", i+1, err)
-		}
-
 		processedBytes += b.Size
 		processedFiles += len(b.Files)
 		idx.updateState("building", totalBytes, processedBytes, len(newFiles), processedFiles, b.ID)
 	}
 
-	// Step 7: Create indexes (best effort). This also writes the DuckDB file, so
-	// serialize it against any concurrent micro-batch flush via writeMu.
-	indexSQL := `
-		CREATE INDEX IF NOT EXISTS idx_event_name ON events ((r.eventName));
-		CREATE INDEX IF NOT EXISTS idx_event_source ON events ((r.eventSource));
-		CREATE INDEX IF NOT EXISTS idx_error_code ON events ((r.errorCode));
-	`
-	idx.writeMu.Lock()
-	idx.execDuckDB(ctx, dbPath, indexSQL)
-	idx.writeMu.Unlock()
+	// Step 7: Create secondary indexes as a best-effort optimization.
+	if err := idx.EnsureSecondaryIndexes(ctx); err != nil {
+		slog.Warn("failed to create DuckDB secondary indexes",
+			"component", "cloudtrail-analyzer",
+			"error", err.Error(),
+		)
+	}
 
 	idx.updateState("idle", totalBytes, processedBytes, len(newFiles), processedFiles, "")
 
@@ -359,7 +507,17 @@ func (idx *Indexer) groupIntoBatches(files []fileEntry) []batch {
 }
 
 func (idx *Indexer) ExecDuckDB(ctx context.Context, dbPath string, sql string) ([]byte, error) {
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
 	return idx.execDuckDB(ctx, dbPath, sql)
+}
+
+func (idx *Indexer) EnsureSecondaryIndexes(ctx context.Context) error {
+	out, err := idx.ExecDuckDB(ctx, idx.IndexPath(), secondaryIndexesSQL)
+	if err != nil {
+		return fmt.Errorf("creating DuckDB indexes: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (idx *Indexer) execDuckDB(ctx context.Context, dbPath string, sql string) ([]byte, error) {
@@ -429,7 +587,7 @@ const recordsSchema = `addendum JSON, additionalEventData JSON, apiVersion VARCH
 	`mfaAuthenticated VARCHAR)), invokedBy VARCHAR), ` +
 	`vpcEndpointAccountId VARCHAR, vpcEndpointId VARCHAR`
 
-func (idx *Indexer) buildBatchSQL(b batch, dbPath string, createTable bool) string {
+func (idx *Indexer) buildBatchSQL(b batch) string {
 	// Build file list as a DuckDB array literal for read_json. Each path is a
 	// filesystem path under the data dir, but it still flows into a SQL string
 	// literal, so escape it with the shared safesql primitive (H6) rather than
@@ -439,20 +597,42 @@ func (idx *Indexer) buildBatchSQL(b batch, dbPath string, createTable bool) stri
 		paths = append(paths, quoteSQLLiteral(f.Path))
 	}
 	fileList := "[" + strings.Join(paths, ", ") + "]"
+	fileTuple := "(" + strings.Join(paths, ", ") + ")"
 
-	if createTable {
-		return fmt.Sprintf(`CREATE TABLE events AS
-SELECT unnest(Records) as r
+	return fmt.Sprintf(`BEGIN TRANSACTION;
+CREATE TABLE IF NOT EXISTS events (
+	source_file VARCHAR,
+	r STRUCT(%s)
+);
+DELETE FROM events WHERE source_file IN %s;
+INSERT INTO events
+SELECT filename AS source_file, unnest(Records) as r
 FROM read_json(%s,
-    maximum_object_size=%d,
-    columns={Records: 'STRUCT(%s)[]'});`, fileList, maxObjectSize, recordsSchema)
+	    filename=true,
+	    maximum_object_size=%d,
+	    columns={Records: 'STRUCT(%s)[]'});
+COMMIT;`, recordsSchema, fileTuple, fileList, maxObjectSize, recordsSchema)
+}
+
+func (idx *Indexer) writeBatch(ctx context.Context, b batch) ([]byte, error) {
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+
+	if _, _, err := idx.reconcileIndexLocked(); err != nil {
+		return nil, err
 	}
 
-	return fmt.Sprintf(`INSERT INTO events
-SELECT unnest(Records) as r
-FROM read_json(%s,
-    maximum_object_size=%d,
-    columns={Records: 'STRUCT(%s)[]'});`, fileList, maxObjectSize, recordsSchema)
+	out, err := idx.execDuckDB(ctx, idx.IndexPath(), idx.buildBatchSQL(b))
+	if err != nil {
+		return out, err
+	}
+	if err := idx.checkpointBatch(b); err != nil {
+		return out, fmt.Errorf("checkpointing batch: %w", err)
+	}
+	if err := idx.markCurrentSchema(); err != nil {
+		return out, fmt.Errorf("recording index schema version: %w", err)
+	}
+	return out, nil
 }
 
 func (idx *Indexer) checkpointBatch(b batch) error {
@@ -506,13 +686,67 @@ func (idx *Indexer) countIndexedFiles() (int, error) {
 	return count, err
 }
 
-func (idx *Indexer) clearIndexedFiles() {
-	idx.db.Exec("DELETE FROM indexed_files")
+func (idx *Indexer) clearIndexedFiles() error {
+	_, err := idx.db.Exec("DELETE FROM indexed_files")
+	return err
 }
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Size() > 0
+}
+
+func (idx *Indexer) hasCurrentSchema() bool {
+	data, err := os.ReadFile(idx.indexVersionPath())
+	return err == nil && strings.TrimSpace(string(data)) == indexSchemaVersion
+}
+
+func (idx *Indexer) markCurrentSchema() error {
+	return os.WriteFile(idx.indexVersionPath(), []byte(indexSchemaVersion+"\n"), 0600)
+}
+
+func (idx *Indexer) removeIndexArtifacts() error {
+	for _, path := range []string{idx.IndexPath(), idx.IndexPath() + ".wal", idx.indexVersionPath()} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing index artifact %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
+}
+
+// reconcileIndexLocked keeps the DuckDB file and SQLite checkpoints in the
+// same schema generation. The caller must hold writeMu.
+func (idx *Indexer) reconcileIndexLocked() (bool, int, error) {
+	dbExists := fileExists(idx.IndexPath())
+	indexedCount, err := idx.countIndexedFiles()
+	if err != nil {
+		return false, 0, fmt.Errorf("counting indexed file checkpoints: %w", err)
+	}
+
+	if dbExists && !idx.hasCurrentSchema() {
+		slog.Info("rebuilding legacy DuckDB index for source-aware schema",
+			"component", "cloudtrail-analyzer")
+		if err := idx.removeIndexArtifacts(); err != nil {
+			return false, 0, err
+		}
+		if err := idx.clearIndexedFiles(); err != nil {
+			return false, 0, fmt.Errorf("clearing legacy index checkpoints: %w", err)
+		}
+		return false, 0, nil
+	}
+
+	if !dbExists && indexedCount > 0 {
+		slog.Warn("DuckDB index missing but checkpoint records exist, clearing checkpoints",
+			"component", "cloudtrail-analyzer",
+			"orphan_records", indexedCount,
+		)
+		if err := idx.clearIndexedFiles(); err != nil {
+			return false, 0, fmt.Errorf("clearing orphaned index checkpoints: %w", err)
+		}
+		return false, 0, nil
+	}
+
+	return dbExists, indexedCount, nil
 }
 
 // MicroBatchIndexer accumulates extracted file paths and flushes to DuckDB
@@ -525,14 +759,13 @@ type MicroBatchIndexer struct {
 	mu         sync.Mutex
 	buffer     []fileEntry
 	bufferSize int64
-	dbCreated  bool
 }
 
 func NewMicroBatchIndexer(idx *Indexer) *MicroBatchIndexer {
 	return &MicroBatchIndexer{idx: idx}
 }
 
-func (m *MicroBatchIndexer) AddFile(path string, size int64) {
+func (m *MicroBatchIndexer) AddFile(ctx context.Context, path string, size int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -544,21 +777,53 @@ func (m *MicroBatchIndexer) AddFile(path string, size int64) {
 	m.bufferSize += size
 
 	if m.bufferSize >= microBatchSizeThreshold {
-		m.flushLocked()
+		m.flushLocked(ctx)
 	}
 }
 
-func (m *MicroBatchIndexer) Flush() {
+func (m *MicroBatchIndexer) Flush(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.buffer) > 0 {
-		m.flushLocked()
+		return m.flushLocked(ctx)
 	}
+	return nil
 }
 
-func (m *MicroBatchIndexer) flushLocked() {
+// BeginInvalidation serializes invalidation and the caller's subsequent source
+// deletion with AddFile/Flush and all index writers.
+func (m *MicroBatchIndexer) BeginInvalidation() (func(), error) {
+	m.mu.Lock()
+	if len(m.buffer) > 0 {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: a sync has files waiting to be indexed", ErrIndexBusy)
+	}
+	releaseIndex, err := m.idx.BeginInvalidation()
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			releaseIndex()
+			m.mu.Unlock()
+		})
+	}, nil
+}
+
+func (m *MicroBatchIndexer) InvalidateIndex() error {
+	release, err := m.BeginInvalidation()
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
+}
+
+func (m *MicroBatchIndexer) flushLocked(parent context.Context) error {
 	if len(m.buffer) == 0 {
-		return
+		return nil
 	}
 
 	b := batch{
@@ -567,23 +832,10 @@ func (m *MicroBatchIndexer) flushLocked() {
 		Size:  m.bufferSize,
 	}
 
-	dbPath := m.idx.IndexPath()
-
-	// Serialize against a concurrent manual re-index. DuckDB's process-level
-	// write lock means a re-index batch and this micro-batch flush writing the
-	// same file at once would corrupt it. Hold writeMu across the CREATE-vs-
-	// INSERT decision and the execution so the createTable check and the write
-	// are atomic with respect to any other writer.
-	m.idx.writeMu.Lock()
-	defer m.idx.writeMu.Unlock()
-
-	createTable := !m.dbCreated && !fileExists(dbPath)
-	duckSQL := m.idx.buildBatchSQL(b, dbPath, createTable)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
-	out, err := m.idx.execDuckDB(ctx, dbPath, duckSQL)
+	out, err := m.idx.writeBatch(ctx, b)
 	if err != nil {
 		slog.Error("micro-batch index failed",
 			"component", "cloudtrail-analyzer",
@@ -592,29 +844,56 @@ func (m *MicroBatchIndexer) flushLocked() {
 			"error", err.Error(),
 			"output", string(out),
 		)
-	} else {
-		m.dbCreated = true
-		if err := m.idx.checkpointBatch(b); err != nil {
-			slog.Warn("micro-batch checkpoint failed",
-				"component", "cloudtrail-analyzer",
-				"error", err.Error(),
-			)
-		}
-		slog.Info("micro-batch indexed",
+		// Do NOT clear the buffer on failure so the files can be retried.
+		return fmt.Errorf("micro-batch index failed: %w", err)
+	}
+	if err := m.idx.refreshIdleStateFromCheckpoints(b.ID); err != nil {
+		slog.Warn("micro-batch index state refresh failed",
 			"component", "cloudtrail-analyzer",
-			"files", len(b.Files),
-			"size_bytes", b.Size,
+			"error", err.Error(),
 		)
 	}
 
+	slog.Info("micro-batch indexed",
+		"component", "cloudtrail-analyzer",
+		"files", len(b.Files),
+		"size_bytes", b.Size,
+	)
 	m.buffer = nil
 	m.bufferSize = 0
+	return nil
+}
+
+// refreshIdleStateFromCheckpoints publishes aggregate progress for streaming
+// micro-batches. Manual re-indexing owns its own delta-based progress counters,
+// so do not overwrite a state that is actively building.
+func (idx *Indexer) refreshIdleStateFromCheckpoints(lastBatchID string) error {
+	var files int
+	var bytes int64
+	if err := idx.db.QueryRow(
+		"SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM indexed_files",
+	).Scan(&files, &bytes); err != nil {
+		return fmt.Errorf("reading indexed checkpoint totals: %w", err)
+	}
+
+	_, err := idx.db.Exec(`UPDATE index_state SET status = 'idle',
+		total_bytes = ?, processed_bytes = ?, total_files = ?, processed_files = ?,
+		last_batch_id = COALESCE(NULLIF(?, ''), last_batch_id), updated_at = ?
+		WHERE id = 1 AND status <> 'building'`,
+		bytes, bytes, files, files, lastBatchID, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return fmt.Errorf("updating streaming index state: %w", err)
+	}
+	return nil
 }
 
 // BuildIndexedDataSource returns the DuckDB path if indexed, for use by other services.
 func BuildIndexedDataSource(cfg *config.Config) string {
 	indexPath := filepath.Join(cfg.DataDir, indexDBName)
-	if _, err := os.Stat(indexPath); err == nil {
+	versionPath := filepath.Join(cfg.DataDir, indexVersionFile)
+	version, versionErr := os.ReadFile(versionPath)
+	if _, err := os.Stat(indexPath); err == nil &&
+		versionErr == nil && strings.TrimSpace(string(version)) == indexSchemaVersion {
 		return fmt.Sprintf("'%s'", indexPath)
 	}
 	return ""

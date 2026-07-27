@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -44,6 +45,19 @@ func (h *Handler) Indexer() *Indexer {
 
 func (h *Handler) MicroBatch() *MicroBatchIndexer {
 	return h.microBatch
+}
+
+// InvalidateIndex removes derived query data before source files are deleted.
+func (h *Handler) InvalidateIndex() error {
+	return h.microBatch.InvalidateIndex()
+}
+
+func (h *Handler) BeginIndexInvalidation() (func(), error) {
+	return h.microBatch.BeginInvalidation()
+}
+
+func (h *Handler) Shutdown(ctx context.Context) error {
+	return h.indexer.Shutdown(ctx)
 }
 
 func (h *Handler) BuildDataPath() string {
@@ -157,7 +171,12 @@ func (h *Handler) Summarize(w http.ResponseWriter, r *http.Request) {
 	if len(rowsToSend) > MaxSummarizeRows {
 		rowsToSend = rowsToSend[:MaxSummarizeRows]
 	}
-	userPrompt := buildSummarizeUserPrompt(req, rowsToSend, len(req.Rows) > MaxSummarizeRows)
+	totalRows := req.TotalRows
+	if totalRows < len(req.Rows) {
+		totalRows = len(req.Rows)
+	}
+	req.TotalRows = totalRows
+	userPrompt := buildSummarizeUserPrompt(req, rowsToSend, totalRows > len(rowsToSend))
 	est := EstimateCost(h.cfg, summarizeSystemPrompt, userPrompt, 0)
 
 	provider := NewProvider(h.cfg)
@@ -174,8 +193,10 @@ func (h *Handler) Summarize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record spend the same way Execute does.
-	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
+	// Provider responses do not yet expose billed token usage, so actual cost
+	// is unknown. Keep the estimate for the session cap without presenting it
+	// as measured spend.
+	h.sessionSpend.Record(est.EstTotalCostUSD, 0)
 
 	// Carry the estimate the backend actually computed (same rows + same
 	// system prompt that were sent) so the UI can reflect the real cost
@@ -243,18 +264,14 @@ func (h *Handler) BuildIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.indexer.IsRunning() {
-		render.Error(w, http.StatusConflict, "already_running", "Indexing is already in progress")
+	if err := h.indexer.StartBuildAsync(context.Background(), dataPath, 30*time.Minute); err != nil {
+		if errors.Is(err, ErrAlreadyRunning) {
+			render.Error(w, http.StatusConflict, "already_running", "Indexing is already in progress")
+			return
+		}
+		render.Error(w, http.StatusInternalServerError, "index_start_failed", "Unable to start indexing")
 		return
 	}
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-		if err := h.indexer.BuildIndexIncremental(ctx, dataPath); err != nil {
-			slog.Error("incremental index build failed", "component", "cloudtrail-analyzer", "error", err.Error())
-		}
-	}()
 
 	render.JSON(w, http.StatusAccepted, map[string]string{
 		"status":  "building",
@@ -419,14 +436,19 @@ func (h *Handler) Execute(w http.ResponseWriter, r *http.Request) {
 	result, err := h.svc.Execute(r.Context(), req.Prompt)
 	if err != nil {
 		// Errors before the model was billed don't count toward spend.
+		if errors.Is(err, ErrIndexRequired) {
+			render.Error(w, http.StatusConflict, "INDEX_REQUIRED",
+				"Build the local CloudTrail index before running an AI query.")
+			return
+		}
 		render.Error(w, http.StatusInternalServerError, "execution_error", redactErrorString(err.Error(), h.cfg))
 		return
 	}
 
-	// Record the spend. Provider responses don't currently surface usage
-	// counts, so actual ~= estimate. When provider.go starts forwarding token
-	// usage from the response body, swap the second arg to the real cost.
-	h.sessionSpend.Record(est.EstTotalCostUSD, est.EstTotalCostUSD)
+	// Provider responses do not yet surface billed token usage. Record the
+	// estimate for the session cap and leave actual cost unknown (zero) rather
+	// than copying the estimate into both fields.
+	h.sessionSpend.Record(est.EstTotalCostUSD, 0)
 
 	// A DuckDB failure surfaces as a 200 with the error fields populated. The
 	// raw engine output can echo the local data-dir absolute path and the AWS

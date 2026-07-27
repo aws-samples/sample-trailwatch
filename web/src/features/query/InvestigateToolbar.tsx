@@ -181,36 +181,36 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
   }
 
   return (
-    <div className="px-6 py-3 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+    <div className="px-3 sm:px-6 py-3 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
       <div className="flex flex-wrap items-end gap-3">
         {/* Time window */}
-        <div className="flex flex-col gap-1">
+        <div className="flex w-full sm:w-auto flex-col gap-1">
           <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
             <Calendar className="inline w-3 h-3 mr-1" />
             {t('investigateToolbar.timeWindow')}
           </label>
-          <div className="flex items-center gap-1.5">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5 sm:flex">
             <input
               type="date"
               value={dateInputValue(tb.state.timeStart)}
               onChange={(e) => tb.setTimeStart(e.target.value)}
-              className="px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="min-w-0 w-full sm:w-auto px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
             />
             <span className="text-xs text-gray-400">→</span>
             <input
               type="date"
               value={dateInputValue(tb.state.timeEnd)}
               onChange={(e) => tb.setTimeEnd(e.target.value)}
-              className="px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="min-w-0 w-full sm:w-auto px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
             />
-            <div className="relative">
+            <div className="relative col-span-3 sm:col-span-1">
               <button
                 ref={presetsPopover.triggerRef}
                 type="button"
                 onClick={presetsPopover.toggle}
                 aria-haspopup="menu"
                 aria-expanded={presetsPopover.isOpen}
-                className="px-2 py-1 text-[10px] rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-0.5"
+                className="w-full sm:w-auto justify-center px-2 py-1 text-[10px] rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-0.5"
               >
                 {t('investigateToolbar.presets')}
                 <ChevronDown className="w-3 h-3" />
@@ -239,7 +239,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
         </div>
 
         {/* Accounts: chip strip when small, popover when many */}
-        <div className="flex flex-col gap-1 min-w-[200px] flex-1 max-w-[640px]">
+        <div className="flex w-full sm:w-auto flex-none sm:flex-1 flex-col gap-1 min-w-0 sm:min-w-[200px] max-w-[640px]">
           <div className="flex items-center justify-between">
             <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
               <Database className="inline w-3 h-3 mr-1" />
@@ -278,7 +278,7 @@ export function InvestigateToolbar({ onChange, clearSignal, setSeedSignal }: Pro
         </div>
 
         {/* Seed input */}
-        <div className="flex flex-col gap-1 flex-1 min-w-[260px]">
+        <div className="flex w-full sm:w-auto flex-none sm:flex-1 flex-col gap-1 min-w-0 sm:min-w-[260px]">
           <label className="text-[10px] font-medium uppercase tracking-wider text-gray-600 dark:text-gray-300">
             {t('investigateToolbar.seed.label')}
           </label>

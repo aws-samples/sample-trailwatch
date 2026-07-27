@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { endpoints } from '../../config/api'
 import type { AppConfig } from '../../types/config'
 
@@ -14,24 +14,43 @@ export function useSettings() {
     loading: true,
     error: null,
   })
+  const requestIdRef = useRef(0)
+  const controllerRef = useRef<AbortController | null>(null)
 
   const fetchSettings = useCallback(async () => {
+    controllerRef.current?.abort()
+    const requestId = ++requestIdRef.current
+    const controller = new AbortController()
+    controllerRef.current = controller
+
     setState(prev => ({ ...prev, loading: true, error: null }))
     try {
-      const res = await fetch(endpoints.settings)
+      const res = await fetch(endpoints.settings, { signal: controller.signal })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ message: 'Failed to fetch settings' }))
         throw new Error(err.message || `HTTP ${res.status}`)
       }
       const data: AppConfig = await res.json()
-      setState({ data, loading: false, error: null })
+      if (requestId === requestIdRef.current) {
+        setState({ data, loading: false, error: null })
+      }
     } catch (e) {
+      if (controller.signal.aborted || requestId !== requestIdRef.current) return
       setState({ data: null, loading: false, error: (e as Error).message })
+    } finally {
+      if (controllerRef.current === controller) {
+        controllerRef.current = null
+      }
     }
   }, [])
 
   useEffect(() => {
-    fetchSettings()
+    void fetchSettings()
+    return () => {
+      requestIdRef.current += 1
+      controllerRef.current?.abort()
+      controllerRef.current = null
+    }
   }, [fetchSettings])
 
   return { ...state, refetch: fetchSettings }

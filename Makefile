@@ -69,9 +69,7 @@ test:
 	@echo "Running Go tests (with race detector)..."
 	go test -race ./...
 	@echo "Running frontend tests..."
-	@# --passWithNoTests so the suite does not fail with exit 1 when no
-	@# frontend test files exist yet (vitest exits non-zero otherwise).
-	cd web && npx vitest --run --passWithNoTests
+	cd web && npm test
 
 ## test-race: Run Go tests with the race detector only (no frontend)
 test-race:

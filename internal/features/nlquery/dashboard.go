@@ -2,6 +2,7 @@ package nlquery
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -118,7 +119,16 @@ func (h *DashboardHandler) GetDashboard(w http.ResponseWriter, r *http.Request) 
 			cols, rows, err := svc.executeDuckDB(ctx, q)
 			panel := &QueryPanel{Columns: cols, Rows: rows}
 			if err != nil {
-				panel.Error = err.Error()
+				safeMsg, hint := render.ClassifyDuckDBError(err)
+				panel.Error = safeMsg
+				if hint != "" {
+					panel.Error = safeMsg + " " + hint
+				}
+				slog.Warn("dashboard panel query failed",
+					"component", "cloudtrail-analyzer",
+					"panel", k,
+					"error", err.Error(),
+				)
 			}
 			mu.Lock()
 			switch k {
@@ -152,7 +162,7 @@ func (h *DashboardHandler) GetFindings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queries := BuildFindingQueries(dataPath)
+	queries := buildFindingQueries(dataPath, memberAccountScope(h.cfg))
 	svc := NewService(h.cfg)
 
 	type FindingResult struct {
@@ -173,7 +183,13 @@ func (h *DashboardHandler) GetFindings(w http.ResponseWriter, r *http.Request) {
 			cols, rows, err := svc.executeDuckDB(r.Context(), sql)
 			fr := FindingResult{ID: findingID, Columns: cols, Rows: rows}
 			if err != nil {
-				fr.Error = err.Error()
+				safeMsg, _ := render.ClassifyDuckDBError(err)
+				fr.Error = safeMsg
+				slog.Warn("finding query failed",
+					"component", "cloudtrail-analyzer",
+					"finding", findingID,
+					"error", err.Error(),
+				)
 			}
 			mu.Lock()
 			results = append(results, fr)
@@ -193,7 +209,7 @@ func (h *DashboardHandler) GetFindingDetail(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	queries := BuildFindingQueries(dataPath)
+	queries := buildFindingQueries(dataPath, memberAccountScope(h.cfg))
 	fq, exists := queries[findingID]
 	if !exists {
 		render.Error(w, http.StatusNotFound, "not_found", fmt.Sprintf("finding %q not found", findingID))
@@ -210,14 +226,16 @@ func (h *DashboardHandler) GetFindingDetail(w http.ResponseWriter, r *http.Reque
 		"rows":    resp.Rows,
 	}
 	if err != nil {
-		hint, detail := classifyDuckDBError(err)
-		out["error"] = err.Error()
+		safeMsg, hint := render.ClassifyDuckDBError(err)
+		out["error"] = safeMsg
 		if hint != "" {
 			out["error_hint"] = hint
 		}
-		if detail != "" {
-			out["error_detail"] = detail
-		}
+		slog.Warn("finding detail query failed",
+			"component", "cloudtrail-analyzer",
+			"finding", findingID,
+			"error", err.Error(),
+		)
 	}
 	render.JSON(w, http.StatusOK, out)
 }
@@ -242,32 +260,5 @@ func (h *DashboardHandler) buildEventsExpr(dataPath string) string {
 }
 
 func (h *DashboardHandler) buildDataPath() string {
-	if h.cfg.S3.Bucket == "" {
-		return ""
-	}
-
-	// When multiple accounts are selected, query across all account data under the bucket
-	// This enables cross-account correlation
-	if len(h.cfg.S3.MemberAccounts) > 1 {
-		if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-			return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/",
-				h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.OrgID, h.cfg.S3.OrgID)
-		}
-		return fmt.Sprintf("%s/s3/%s/AWSLogs/",
-			h.cfg.DataDir, h.cfg.S3.Bucket)
-	}
-
-	region := h.cfg.S3.LogRegion
-	if region == "" {
-		region = h.cfg.S3.Region
-	}
-
-	if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-		return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/%s/CloudTrail/%s/",
-			h.cfg.DataDir, h.cfg.S3.Bucket,
-			h.cfg.S3.OrgID, h.cfg.S3.OrgID, h.cfg.S3.AccountID, region)
-	}
-
-	return fmt.Sprintf("%s/s3/%s/AWSLogs/%s/CloudTrail/%s/",
-		h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.AccountID, region)
+	return localQueryRoot(h.cfg)
 }

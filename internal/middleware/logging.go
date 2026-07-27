@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"time"
 
@@ -75,9 +76,10 @@ func StructuredLogger(next http.Handler) http.Handler {
 // CORS returns middleware that sets CORS headers for development mode.
 // Allows requests from localhost Vite dev server and the analyzer itself.
 func CORS(next http.Handler) http.Handler {
-	allowedOrigins := map[string]bool{
+	devOrigins := map[string]bool{
 		"http://localhost:5173": true,
-		"http://localhost:7070": true,
+		"http://127.0.0.1:5173": true,
+		"http://[::1]:5173":     true,
 	}
 	allowedMethods := "GET, POST, PUT, DELETE, OPTIONS"
 	allowedHeaders := "Content-Type, Authorization"
@@ -85,10 +87,20 @@ func CORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		if allowedOrigins[origin] {
+		if origin != "" && !corsOriginAllowed(origin, r.Host, devOrigins) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		if isMutation(r.Method) && r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "cross-site request not allowed", http.StatusForbidden)
+			return
+		}
+
+		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
 			w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
+			w.Header().Add("Vary", "Origin")
 		}
 
 		// Handle preflight requests
@@ -99,6 +111,26 @@ func CORS(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func corsOriginAllowed(origin, requestHost string, devOrigins map[string]bool) bool {
+	if devOrigins[origin] {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	return parsed.Host == requestHost
+}
+
+func isMutation(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 // SecurityHeaders returns middleware that sets defensive HTTP response headers.

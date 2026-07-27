@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,26 +16,31 @@ import (
 // each is valid JSON. Returns total count, total bytes on disk for the session
 // (sum of all regular files), and list of failed file paths.
 func verifyFiles(ctx context.Context, session *sessions.Session, dataDir string, progressCh chan<- ProcessingProgress) (int, int64, []string, error) {
-	sessionDir := sessionLocalDir(session, dataDir)
+	sessionDirs, err := sessionDateDirs(session, dataDir)
+	if err != nil {
+		return 0, 0, nil, err
+	}
 
 	// Collect all .json files and accumulate total bytes for the session directory.
 	var jsonFiles []string
 	var diskBytes int64
-	err := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // skip inaccessible files
-		}
-		if info.IsDir() {
+	for _, sessionDir := range sessionDirs {
+		err := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // skip inaccessible files
+			}
+			if info.IsDir() {
+				return nil
+			}
+			diskBytes += info.Size()
+			if strings.HasSuffix(path, ".json") && !strings.HasSuffix(path, ".json.gz") {
+				jsonFiles = append(jsonFiles, path)
+			}
 			return nil
+		})
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("walking session directory %s: %w", sessionDir, err)
 		}
-		diskBytes += info.Size()
-		if strings.HasSuffix(path, ".json") && !strings.HasSuffix(path, ".json.gz") {
-			jsonFiles = append(jsonFiles, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, 0, nil, fmt.Errorf("walking session directory %s: %w", sessionDir, err)
 	}
 
 	totalFiles := len(jsonFiles)
@@ -74,6 +80,13 @@ func validateJSONFile(path string) error {
 	var raw json.RawMessage
 	if err := decoder.Decode(&raw); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("invalid JSON: multiple top-level values")
+		}
+		return fmt.Errorf("invalid JSON: trailing data: %w", err)
 	}
 
 	return nil

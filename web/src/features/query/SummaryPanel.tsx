@@ -12,13 +12,17 @@
 // "Pivot" on an entity behaves exactly like clicking "Use as seed" inside
 // the result table — keeps the UX consistent.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, ArrowRight, Check, Copy, Loader2, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Check, Copy, Info, Loader2, Sparkles, X } from 'lucide-react'
 import { endpoints } from '../../config/api'
 import { CostBanner, formatUSD } from '../../comm/CostBanner'
 import { readApiError } from '../../comm/apiError'
 import type { SeedType } from './seedDetection'
+import {
+  buildInvestigationSummaryPayload,
+  MAX_SUMMARIZE_ROWS,
+} from './investigationTruthfulness'
 
 // Click-to-expand value cell for the summary panel. Collapsed: single-line
 // truncated. Expanded: full value wraps + Copy button. Sized for the 400px
@@ -96,13 +100,12 @@ interface SummarizeResponse {
   // Validator output
   hallucination_warning?: string
   suspicious_tokens?: string[]
+  evidence_notice?: string
+  inference_warning?: string
   rows_sent_to_model: number
   total_rows: number
-  // Authoritative cost of THIS summarize call, computed server-side against
-  // the exact rows + summarize system prompt that were sent (and recorded
-  // against session spend). Omitted (0/undefined) on the legacy text path.
-  // This is the real billed number — prefer it over the pre-flight banner's
-  // approximation, which uses the NL-query system prompt. See P1-14.
+  // Server-side estimate for this summarize call, computed against the exact
+  // rows and summarize prompt sent to the provider. It is not billing data.
   est_cost_usd?: number
 }
 
@@ -114,6 +117,7 @@ interface Props {
   scenarioDescription?: string
   columns: string[] | null
   rows: unknown[][] | null
+  totalRows?: number
   recommended?: boolean
   // Click-to-pivot from an entity row. Same handler used by the table cells.
   onPivot?: (value: string, type: SeedType) => void
@@ -162,6 +166,7 @@ export function SummaryPanel({
   scenarioDescription,
   columns,
   rows,
+  totalRows,
   recommended,
   onPivot,
 }: Props) {
@@ -169,11 +174,45 @@ export function SummaryPanel({
   const [summary, setSummary] = useState<SummarizeResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const requestEpochRef = useRef(0)
+  const requestAbortRef = useRef<AbortController | null>(null)
+  const latestInputsRef = useRef({
+    open,
+    scenarioId,
+    scenarioName,
+    scenarioDescription,
+    columns,
+    rows,
+    totalRows,
+  })
+  latestInputsRef.current = {
+    open,
+    scenarioId,
+    scenarioName,
+    scenarioDescription,
+    columns,
+    rows,
+    totalRows,
+  }
 
+  // Every input participates in summary identity. In particular, the same
+  // scenario can produce different rows after a parameter or filter change.
   useEffect(() => {
+    requestEpochRef.current += 1
+    requestAbortRef.current?.abort()
+    requestAbortRef.current = null
     setSummary(null)
     setError(null)
-  }, [scenarioId])
+    setLoading(false)
+  }, [open, scenarioId, scenarioName, scenarioDescription, columns, rows, totalRows])
+
+  useEffect(() => {
+    return () => {
+      requestEpochRef.current += 1
+      requestAbortRef.current?.abort()
+      requestAbortRef.current = null
+    }
+  }, [])
 
   // Esc closes the panel — keyboard shortcut keeps the keyboard-heavy
   // workflow flowing without needing to reach for the X button.
@@ -186,16 +225,16 @@ export function SummaryPanel({
     return () => document.removeEventListener('keydown', onKey)
   }, [open, onClose])
 
-  // MAX_SUMMARIZE_ROWS mirrors the backend cap (summarize.go::MaxSummarizeRows).
-  // The backend only ever sends this many rows to the model regardless of how
-  // many we POST, so both the pre-flight estimate and the request itself are
-  // bounded to the same slice — keeping the shown cost consistent with what is
-  // actually billed. See P1-14.
-  const MAX_SUMMARIZE_ROWS = 50
+  const effectiveTotalRows = Math.max(
+    rows?.length ?? 0,
+    typeof totalRows === 'number' && Number.isSafeInteger(totalRows) && totalRows >= 0
+      ? totalRows
+      : 0,
+  )
 
   // Pre-flight approximation only. The /estimate endpoint prepends the
   // NL-query system prompt, not the (shorter) summarize one, so this is a
-  // rough upper-bound, not the billed amount. The authoritative figure is
+  // rough upper-bound. The more representative server-side estimate is
   // summary.est_cost_usd, rendered once the call returns.
   const promptPreview = (() => {
     if (!columns || !rows) return ''
@@ -205,6 +244,27 @@ export function SummaryPanel({
 
   async function generate() {
     if (!columns || !rows) return
+    const requestEpoch = ++requestEpochRef.current
+    requestAbortRef.current?.abort()
+    const controller = new AbortController()
+    requestAbortRef.current = controller
+    const requestInputs = latestInputsRef.current
+    const isCurrentRequest = () => {
+      const latest = latestInputsRef.current
+      return (
+        requestEpochRef.current === requestEpoch &&
+        requestAbortRef.current === controller &&
+        !controller.signal.aborted &&
+        latest.open === requestInputs.open &&
+        latest.scenarioId === requestInputs.scenarioId &&
+        latest.scenarioName === requestInputs.scenarioName &&
+        latest.scenarioDescription === requestInputs.scenarioDescription &&
+        latest.columns === requestInputs.columns &&
+        latest.rows === requestInputs.rows &&
+        latest.totalRows === requestInputs.totalRows
+      )
+    }
+
     setLoading(true)
     setError(null)
     setSummary(null)
@@ -212,28 +272,32 @@ export function SummaryPanel({
       const res = await fetch(endpoints.nlquerySummarize, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          // Only the rows the backend will actually use are sent, matching the
-          // pre-flight estimate's slice. total_rows still carries the full
-          // count so the "based on first N of total" note stays accurate. See
-          // P1-14.
-          scenario_id: scenarioId,
-          scenario_name: scenarioName,
-          scenario_description: scenarioDescription,
+        body: JSON.stringify(buildInvestigationSummaryPayload({
+          scenarioId,
+          scenarioName,
+          scenarioDescription,
           columns,
-          rows: rows.slice(0, MAX_SUMMARIZE_ROWS),
-          total_rows: rows.length,
-        }),
+          rows,
+          totalRows: effectiveTotalRows,
+        })),
+        signal: controller.signal,
       })
       if (!res.ok) {
-        setError(await readApiError(res, 'Summary failed'))
+        const message = await readApiError(res, 'Summary failed')
+        if (isCurrentRequest()) setError(message)
         return
       }
-      setSummary(await res.json())
-    } catch (e: any) {
-      setError(e?.message || 'Network error')
+      const data = await res.json()
+      if (isCurrentRequest()) setSummary(data)
+    } catch (e: unknown) {
+      if (isCurrentRequest()) {
+        setError(e instanceof Error ? e.message : 'Network error')
+      }
     } finally {
-      setLoading(false)
+      if (isCurrentRequest()) {
+        requestAbortRef.current = null
+        setLoading(false)
+      }
     }
   }
 
@@ -264,7 +328,13 @@ export function SummaryPanel({
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         <div className="text-[11px] text-gray-600 dark:text-gray-300">
-          {t('summaryPanel.scope', { scenario: scenarioName, rows: rows?.length || 0 })}
+          {effectiveTotalRows > (rows?.length ?? 0)
+            ? t('summaryPanel.scopePartial', {
+                scenario: scenarioName,
+                shown: rows?.length ?? 0,
+                total: effectiveTotalRows,
+              })
+            : t('summaryPanel.scope', { scenario: scenarioName, rows: rows?.length || 0 })}
         </div>
 
         {!summary && !loading && (
@@ -307,6 +377,30 @@ export function SummaryPanel({
 
         {summary && !loading && (
           <div className="space-y-4">
+            <div className="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 p-3">
+              <div className="flex items-start gap-2">
+                <Info className="w-3.5 h-3.5 text-blue-600 mt-0.5 shrink-0" />
+                <div className="text-[11px] text-blue-900 dark:text-blue-200">
+                  <div className="font-semibold">{t('summaryPanel.evidence.title')}</div>
+                  <div className="mt-0.5">
+                    {summary.evidence_notice || t('summaryPanel.evidence.default')}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {summary.inference_warning && (
+              <div className="rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-3">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-600 mt-0.5 shrink-0" />
+                  <div className="text-[11px] text-amber-900 dark:text-amber-200">
+                    <div className="font-semibold">{t('summaryPanel.inference.title')}</div>
+                    <div className="mt-0.5">{summary.inference_warning}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {summary.hallucination_warning && (
               <div className="rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-3">
                 <div className="flex items-start gap-2">
@@ -323,9 +417,9 @@ export function SummaryPanel({
               {summary.rows_sent_to_model < summary.total_rows
                 ? t('summaryPanel.basedOn', { sent: summary.rows_sent_to_model, total: summary.total_rows })
                 : t('summaryPanel.basedOnAll', { count: summary.total_rows })}
-              {/* Authoritative billed cost from the backend (same rows + prompt
-                  actually sent). Supersedes the pre-flight banner approximation.
-                  Only shown when present (>0); the legacy text path omits it. */}
+              {/* Server-side estimate for the exact summarize payload. This is
+                  more representative than the pre-flight approximation, but it
+                  remains an estimate rather than provider billing data. */}
               {typeof summary.est_cost_usd === 'number' && summary.est_cost_usd > 0 && (
                 <span className="ml-1">
                   {t('cost.estTotal')}: ≈ {formatUSD(summary.est_cost_usd)}

@@ -37,6 +37,9 @@ ABSOLUTE RULES:
 5. NEVER reference compliance frameworks, GuardDuty findings, MITRE techniques, or any external knowledge.
 6. If the table is empty, every array is empty and tldr is "No matching events".
 7. If the data is truncated (you will be told), mention it in tldr.
+8. Do not infer AWS resource type, role type, permission configuration, legitimacy, or cause from a name. In particular, do not use phrases such as "consistent with", "suggests", "indicates", "likely", "appears to", "service-linked role", "internal service call", or "lacks permissions" unless those exact words occur in a source row.
+9. A severity is only an attention-ordering hint for the displayed rows, not a confirmed security classification. Prefer "info" or "low" when the rows do not directly establish impact.
+10. Suggested pivot reasons must state only that the exact value occurs in the rows and can be investigated further. Do not predict what the pivot will prove.
 
 OUTPUT FORMAT — RETURN ONLY A SINGLE JSON OBJECT, NO PROSE BEFORE OR AFTER:
 
@@ -116,6 +119,12 @@ type SummarizeResponse struct {
 	// SuspiciousTokens lists the specific values the validator could not
 	// match against the source data.
 	SuspiciousTokens []string `json:"suspicious_tokens,omitempty"`
+	// EvidenceNotice is always shown with an AI summary. The generated prose is
+	// an investigation aid, not source evidence.
+	EvidenceNotice string `json:"evidence_notice"`
+	// InferenceWarning is populated when the generated findings use language
+	// that claims context, cause, or intent beyond the supplied rows.
+	InferenceWarning string `json:"inference_warning,omitempty"`
 	// RowsSentToModel is how many rows we actually included in the prompt
 	// (capped at MaxSummarizeRows).
 	RowsSentToModel int `json:"rows_sent_to_model"`
@@ -133,11 +142,15 @@ type SummarizeResponse struct {
 // system prompt above, then runs the response through validateSummary.
 func Summarize(ctx context.Context, provider LLMProvider, req SummarizeRequest) (*SummarizeResponse, error) {
 	rowsToSend := req.Rows
-	truncated := false
+	totalRows := req.TotalRows
+	if totalRows < len(req.Rows) {
+		totalRows = len(req.Rows)
+	}
 	if len(rowsToSend) > MaxSummarizeRows {
 		rowsToSend = rowsToSend[:MaxSummarizeRows]
-		truncated = true
 	}
+	truncated := totalRows > len(rowsToSend)
+	req.TotalRows = totalRows
 
 	userPrompt := buildSummarizeUserPrompt(req, rowsToSend, truncated)
 
@@ -148,22 +161,24 @@ func Summarize(ctx context.Context, provider LLMProvider, req SummarizeRequest) 
 
 	resp := &SummarizeResponse{
 		RowsSentToModel: len(rowsToSend),
-		TotalRows:       req.TotalRows,
+		TotalRows:       totalRows,
+		EvidenceNotice:  "AI-generated interpretation is not source evidence. Verify every conclusion against the displayed rows and original CloudTrail logs before acting.",
 	}
 
-	// Try to parse as JSON. If parsing succeeds, populate structured fields.
-	// If it fails, keep the raw text in Summary and let the frontend render
-	// it as a plain-text fallback. Both branches feed the validator the
-	// concatenated prose so hallucinated identifiers get flagged either way.
+	// Only structured output can be validated consistently. Returning raw prose
+	// as a successful response bypasses entity/count checks and makes a model
+	// formatting failure look trustworthy to an investigator.
 	parsed, parseErr := parseSummaryJSON(out)
-	if parseErr == nil {
-		resp.TLDR = parsed.TLDR
-		resp.Findings = parsed.Findings
-		resp.Entities = parsed.Entities
-		resp.SuggestedPivots = parsed.SuggestedPivots
-	} else {
-		resp.Summary = strings.TrimSpace(out)
+	if parseErr != nil {
+		return nil, fmt.Errorf("LLM returned invalid structured summary: %w", parseErr)
 	}
+	if err := validateAndNormalizeParsedSummary(parsed, rowsToSend); err != nil {
+		return nil, fmt.Errorf("LLM returned an invalid evidence summary: %w", err)
+	}
+	resp.TLDR = parsed.TLDR
+	resp.Findings = parsed.Findings
+	resp.Entities = parsed.Entities
+	resp.SuggestedPivots = parsed.SuggestedPivots
 
 	// Validate: flag any ARN/IP/account/access-key in the summary that does
 	// not appear in the source rows. Run across all prose fields plus
@@ -177,8 +192,163 @@ func Summarize(ctx context.Context, provider LLMProvider, req SummarizeRequest) 
 			len(suspicious),
 		)
 	}
+	if containsUnsupportedInference(buildClaimsCorpus(resp)) {
+		resp.InferenceWarning = "This summary uses interpretive language that is not directly proven by the supplied rows. Treat those statements as leads, not facts, and verify them against the original CloudTrail events."
+	}
 
 	return resp, nil
+}
+
+var allowedSummarySeverities = map[string]struct{}{
+	"high":   {},
+	"medium": {},
+	"low":    {},
+	"info":   {},
+}
+
+var allowedSummaryEntityKinds = map[string]struct{}{
+	"arn":        {},
+	"ip":         {},
+	"account":    {},
+	"access_key": {},
+	"user":       {},
+	"role":       {},
+	"event":      {},
+}
+
+// validateAndNormalizeParsedSummary enforces the structured response contract
+// and replaces model-supplied entity counts with counts computed from the
+// actual rows. This keeps the model in a descriptive role rather than trusting
+// it as the source of evidence metadata.
+func validateAndNormalizeParsedSummary(parsed *parsedSummary, rows [][]interface{}) error {
+	if parsed == nil {
+		return fmt.Errorf("summary object is missing")
+	}
+	if strings.TrimSpace(parsed.TLDR) == "" {
+		return fmt.Errorf("tldr is required")
+	}
+	if len(rows) > 0 && (len(parsed.Findings) < 1 || len(parsed.Findings) > 4) {
+		return fmt.Errorf("findings must contain between 1 and 4 items")
+	}
+	if len(rows) == 0 && (len(parsed.Findings) > 0 || len(parsed.Entities) > 0 || len(parsed.SuggestedPivots) > 0) {
+		return fmt.Errorf("an empty result cannot contain findings, entities, or pivots")
+	}
+	if len(parsed.Entities) > 8 {
+		return fmt.Errorf("entities must contain at most 8 items")
+	}
+	if len(parsed.SuggestedPivots) > 3 {
+		return fmt.Errorf("suggested_pivots must contain at most 3 items")
+	}
+
+	for i := range parsed.Findings {
+		finding := &parsed.Findings[i]
+		finding.Severity = strings.ToLower(strings.TrimSpace(finding.Severity))
+		if _, ok := allowedSummarySeverities[finding.Severity]; !ok {
+			return fmt.Errorf("finding %d has unsupported severity %q", i+1, finding.Severity)
+		}
+		if strings.TrimSpace(finding.Text) == "" {
+			return fmt.Errorf("finding %d has empty text", i+1)
+		}
+	}
+
+	entityKeys := make(map[string]struct{}, len(parsed.Entities))
+	for i := range parsed.Entities {
+		entity := &parsed.Entities[i]
+		entity.Kind = strings.ToLower(strings.TrimSpace(entity.Kind))
+		entity.Value = strings.TrimSpace(entity.Value)
+		if _, ok := allowedSummaryEntityKinds[entity.Kind]; !ok {
+			return fmt.Errorf("entity %d has unsupported kind %q", i+1, entity.Kind)
+		}
+		if entity.Value == "" {
+			return fmt.Errorf("entity %d has an empty value", i+1)
+		}
+		count := countValueInRows(entity.Value, rows)
+		if count == 0 {
+			return fmt.Errorf("entity %d value %q does not appear in the source rows", i+1, entity.Value)
+		}
+		entity.Count = count
+		entityKeys[entity.Kind+"\x00"+entity.Value] = struct{}{}
+	}
+
+	for i := range parsed.SuggestedPivots {
+		pivot := &parsed.SuggestedPivots[i]
+		pivot.Kind = strings.ToLower(strings.TrimSpace(pivot.Kind))
+		pivot.Value = strings.TrimSpace(pivot.Value)
+		if _, ok := allowedSummaryEntityKinds[pivot.Kind]; !ok {
+			return fmt.Errorf("pivot %d has unsupported kind %q", i+1, pivot.Kind)
+		}
+		if _, ok := entityKeys[pivot.Kind+"\x00"+pivot.Value]; !ok {
+			return fmt.Errorf("pivot %d must reference an entity with the same kind and value", i+1)
+		}
+		if strings.TrimSpace(pivot.Reason) == "" {
+			return fmt.Errorf("pivot %d has an empty reason", i+1)
+		}
+	}
+
+	return nil
+}
+
+func countValueInRows(value string, rows [][]interface{}) int {
+	count := 0
+	for _, row := range rows {
+		found := false
+		for _, cell := range row {
+			if cell == nil {
+				continue
+			}
+			rendered := fmt.Sprint(cell)
+			if rendered == value || strings.Contains(rendered, value) {
+				found = true
+				break
+			}
+		}
+		if found {
+			count++
+		}
+	}
+	return count
+}
+
+// buildClaimsCorpus intentionally excludes suggested pivot reasons. A pivot
+// can explain why another query is useful; the TLDR and findings are the parts
+// presented as observations and therefore need the stricter inference check.
+func buildClaimsCorpus(r *SummarizeResponse) string {
+	var b strings.Builder
+	b.WriteString(r.TLDR)
+	b.WriteString("\n")
+	for _, finding := range r.Findings {
+		b.WriteString(finding.Text)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+var unsupportedInferencePhrases = []string{
+	"consistent with",
+	"suggests",
+	"suggesting",
+	"indicates",
+	"indicating",
+	"likely",
+	"appears to",
+	"service-linked role",
+	"internal service call",
+	"lacks permission",
+	"attacker",
+	"malicious",
+	"compromised",
+	"brute force",
+	"exfiltration",
+}
+
+func containsUnsupportedInference(summary string) bool {
+	lower := strings.ToLower(summary)
+	for _, phrase := range unsupportedInferencePhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseSummaryJSON tolerates ```json fences and leading/trailing whitespace

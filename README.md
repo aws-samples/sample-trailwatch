@@ -2,14 +2,14 @@
 
 Self-hosted security analytics tool that downloads AWS CloudTrail logs from S3, indexes them locally, and provides an interactive investigation dashboard with AI-powered natural language querying.
 
-**Single Go binary. No Docker. No external databases. Deploys to EC2 in one command.**
+**Embedded React UI. No Docker or external database service. Deploys to EC2 in one command.**
 
 ## Quick Start (Amazon Linux 2023)
 
 ```bash
 # On a fresh EC2 instance (c7g.large or larger recommended — ARM64 Graviton)
-git clone https://gitlab.aws.dev/vyakush/cloudtrail-security-insights.git
-cd cloudtrail-security-insights
+git clone https://github.com/aws-samples/sample-trailwatch.git
+cd sample-trailwatch
 sudo ./deploy.sh
 ```
 
@@ -92,7 +92,7 @@ Browse to `http://localhost:7070` on the laptop. Inbound Security Group needs po
 
 Reachable directly from the operator's laptop, but the app has no authentication of its own. Only use this when network controls outside the app are sufficient (private subnet, restrictive Security Group sourced to a single IP, or behind an authenticating reverse proxy such as ALB with Cognito or nginx with OAuth2 Proxy).
 
-1. Edit `/opt/cloudtrail-analyzer/config.json` and set `"host": "0.0.0.0"` at the top level.
+1. Edit `/opt/cloudtrail-analyzer/config.json`, set `"host": "0.0.0.0"`, and add the exact hostname or IP used in the browser to `"trusted_hosts"` (for example, `"trusted_hosts": ["10.0.1.25"]`).
 2. `sudo systemctl restart cloudtrail-analyzer`
 3. Add an inbound Security Group rule for port 7070 sourced to a specific IP/32 (never `0.0.0.0/0`).
 
@@ -130,6 +130,10 @@ Browser (:7070)  →  Go API Server  →  DuckDB (indexed)  →  Local CloudTrai
 
 *Figure 1: Application architecture — browser connects to the Go API, which queries indexed CloudTrail data via DuckDB and optionally routes natural language queries to an LLM provider.*
 
+SQLite stores sync/session metadata. Its numbered migrations are embedded in the
+Go binary and applied transactionally at startup, so a deployed binary does not
+need the source `migrations/` directory.
+
 ## Features
 
 ### Security Dashboard
@@ -164,7 +168,7 @@ Configure your preferred LLM provider in Settings → AI Provider:
 - **AWS Bedrock** (default) — uses existing AWS credentials
 - **Anthropic API** — direct API key
 - **OpenAI / Compatible** — supports Azure OpenAI, corporate proxies
-- **Ollama (local)** — runs locally, no API key needed. Install Ollama yourself before selecting this provider. Server-side auto-install is off by default and is gated behind an explicit opt-in flag (`allow_auto_install`); see [LLM Provider Security](#llm-provider-security).
+- **Ollama (local)** — runs locally, no API key needed. Install Ollama yourself before selecting this provider (https://ollama.com/download). The server does not download or install Ollama automatically.
 
 > ⚠️ **Data Privacy Notice**: When AI queries are enabled, CloudTrail log metadata (event names, IP addresses, IAM identities, timestamps) is sent to the configured LLM provider for natural language processing. Verify this aligns with your organization's data classification policies before enabling. For workloads where keeping data on the host is preferred, consider **Ollama**, which is designed to run locally without external API calls when configured that way.
 
@@ -172,10 +176,13 @@ Configure your preferred LLM provider in Settings → AI Provider:
 
 - **EC2 Instance**: Amazon Linux 2023 (c7g.large+ Graviton recommended; x86 also supported)
 - **IAM Role**: S3 read access to your CloudTrail bucket (`s3:GetObject`, `s3:ListBucket`)
-- **Security Group**: Allow inbound on port 7070 from your IP
-- **Bedrock** (optional): `bedrock:InvokeModel` permission for AI queries
+- **Network access**: SSM port forwarding requires no inbound rule. Direct access requires a narrowly scoped port 7070 rule and matching `trusted_hosts`.
+- **Bedrock** (optional): `bedrock:InvokeModel` and `bedrock:ListFoundationModels`
 
 ## Development
+
+Install Go 1.26+, Node.js 20+, npm, Make, and the DuckDB CLI first. `make install`
+installs project dependencies; it does not install those system tools.
 
 ```bash
 # Install dependencies
@@ -197,6 +204,9 @@ make test
 make lint
 ```
 
+The production binary embeds both `web/dist/` and the SQLite migrations. It can
+therefore run independently of the source checkout once built.
+
 ## Configuration
 
 On first run, a `config.json` is created with defaults. Configure through the UI:
@@ -208,9 +218,19 @@ On first run, a `config.json` is created with defaults. Configure through the UI
 
 All settings are also configurable via environment variables:
 - `PORT` (default: 7070)
+- `HOST` (default: 127.0.0.1)
+- `TRUSTED_HOSTS` (additional allowed Host header values)
 - `DATA_DIR` (default: ./data)
 - `LOG_LEVEL` (debug/info/warn/error)
-- `MAX_DOWNLOAD_CONCURRENCY` (default: 4)
+- `QUERY_TIMEOUT_SECONDS` (default: 60)
+- `MONITOR_INTERVAL_SECONDS` (default: 5)
+- `MAX_DOWNLOAD_CONCURRENCY` (default: 16)
+- `CTA_ALLOW_AUTO_INSTALL` (default: false)
+
+Configuration writes are atomic and use mode `0600`. The application creates its
+data directories with mode `0700` and its SQLite database with mode `0600`.
+`deploy.sh` also runs the service as a dedicated `cloudtrail` user with
+`UMask=0077`.
 
 ## Performance
 
@@ -309,7 +329,9 @@ This project is provided as a sample implementation for educational and security
 - For multi-user environments, add a reverse proxy with authentication.
 
 ### Credential Handling
-- Recommended: Use IMDS v2 (EC2 instance role) -- no credentials on disk.
+- Recommended: Use IMDS v2 (EC2 instance role) -- no credentials on disk. The
+  application uses a token-required IMDS v2 provider, and the deployed systemd
+  service disables SDK fallback to IMDS v1.
 - Static long-lived keys live in `config.json` if configured. **Session (STS) credentials applied via the Credentials view are designed to be kept in the process environment only and are not written to disk by this build**; they are lost on restart and must be re-applied.
 - On startup the app scrubs any session credentials that may have been written to `config.json` by older builds.
 
@@ -319,16 +341,22 @@ This project is provided as a sample implementation for educational and security
 
 ### LLM Provider Security
 - **Bedrock**: Uses IAM role, no additional credentials.
-- **Ollama**: Runs locally on the instance. When configured to use the local Ollama endpoint, query data is processed on the host and is designed to avoid an external API call for inference. Verify your Ollama configuration and any model-download/telemetry settings against your data-handling policy.
+- **Ollama**: Runs locally on the instance. Custom Ollama endpoints are limited
+  to `localhost` or loopback IP addresses. When configured this way, query data
+  is processed on the host and is designed to avoid an external API call for
+  inference. Verify your Ollama configuration and any model-download/telemetry
+  settings against your data-handling policy.
 - **Anthropic/OpenAI**: API keys stored in `config.json` -- treat as secrets.
+  Custom endpoints must use HTTPS; redirects are rejected.
 - CloudTrail data is sent to the configured LLM for queries. Verify alignment with data classification policies.
 
 #### Binary auto-install (supply-chain trade-off)
 
-The application can install the DuckDB CLI and Ollama on the host, but doing so downloads and runs third-party install scripts/binaries from the network. To reduce supply-chain exposure, this server-side auto-install is **off by default** and is gated behind an explicit opt-in flag (`allow_auto_install`, default `false`).
+The application can optionally auto-install the DuckDB CLI on the host. To reduce supply-chain exposure, this is **off by default** and is gated behind an explicit opt-in flag (`allow_auto_install`, default `false`). When enabled, the DuckDB download is verified against pinned SHA-256 checksums before extraction (fail-closed).
 
-- **Recommended:** install the DuckDB CLI and Ollama on the host yourself (or let `deploy.sh` install the pinned DuckDB CLI). Leave `allow_auto_install` disabled. The application fails with guidance if a required binary is missing.
-- **If you opt in:** review what the installers fetch and run, and treat the opt-in as a deliberate trade-off. Prefer pinning and verifying the artifacts you install yourself.
+- **Recommended:** install the DuckDB CLI and Ollama on the host yourself (or let `deploy.sh` install the pinned, checksum-verified DuckDB CLI and Node.js archives). Leave `allow_auto_install` disabled. The application fails with clear guidance if a required binary is missing.
+- **Ollama:** The server never downloads or installs Ollama automatically. If Ollama is not found on PATH, the application returns instructions for manual installation.
+- **deploy.sh:** Installs Go, Node.js, and DuckDB from pinned binary archives with SHA-256 verification. No third-party setup scripts are downloaded or executed.
 
 ### Natural-Language Query Safety (LLM → SQL)
 
@@ -340,18 +368,30 @@ The Investigate / Dashboard / Lookups / NLQ paths build SQL — sometimes from h
 **Mitigations in place:**
 
 - **DuckDB `-readonly`** when querying the indexed database — designed to reject INSERT/UPDATE/DELETE/DDL, providing a layer of defense in addition to the guard.
-- **`ValidateReadSQL` guard** — SQL strings passed to the read path (`internal/features/nlquery/safesql.go`) are validated before execution. The guard:
+- **External access disabled** on indexed DuckDB query processes, blocking
+  filesystem and network readers at execution time.
+- **SQL validation** — SQL strings passed to the read path
+  (`internal/features/nlquery/safesql.go`) are validated before execution:
   - Strips comments and string literals so banned tokens are not hidden inside `/* ... */` or `'foo bar attach'`.
   - Requires the first keyword to be `SELECT` or `WITH`. Rejects anything else.
   - Rejects banned tokens as whole words: `read_csv*`, `read_parquet`, `read_blob`, `read_text*`, `sniff_csv`, `glob`, `list_files`, `directory_contents`, `attach`, `detach`, `install`, `load`, `pragma`, `copy`, `export`, `import`, `create`, `drop`, `alter`, `truncate`, `insert`, `update`, `delete`, `merge`, `replace`, `call`, `vacuum`, `checkpoint`.
   - Rejects multi-statement queries (`SELECT 1; ATTACH ...`).
   - Allows banned words inside quoted strings (so an event named `DeleteUser` or a search for `'%attach%'` continues to work).
+  - Applies a stricter policy to model-generated SQL: it must query the
+    account-scoped temporary `cloudtrail_events` view, cannot reference the
+    unscoped `events` table, and cannot call `read_json` or another external
+    reader.
 - **Test coverage** — see `internal/features/nlquery/safesql_test.go` for happy-path queries plus 9 bypass-attempt regression tests (case folding, comment-hiding, multiline whitespace, schema-qualified calls, WITH-clause smuggling, etc.).
 
 **Residual risk:**
 
-- `read_json` is **intentionally allowed** because the handcoded scenarios depend on it. An LLM that hallucinates a non-data-dir path passed to `read_json('/tmp/secrets.json')` could read a local JSON file. DuckDB's `-readonly` flag is designed to reject writes in this scenario. For a single-user POC analyzing your own logs this is a documented trade-off; for a multi-user deployment, consider gating the read path behind a path-allowlist or running DuckDB in a sandboxed working directory.
-- The guard is a denylist over a string, not a SQL parser. New DuckDB versions may add filesystem functions that are not on the list. Treat the denylist as a maintenance item when upgrading DuckDB.
+- Hand-authored dashboard and investigation queries still use `read_json` before
+  an index is available. Their paths are assembled from validated configuration
+  fields and escaped by the application; model-generated SQL never receives
+  this capability.
+- The guard is a purpose-built lexer and policy layer, not a full DuckDB SQL
+  parser. Treat its regression tests as a required check when upgrading DuckDB
+  or changing query construction.
 
 ### Deployment
 - Deploy on private subnets or with restricted Security Groups.
@@ -372,16 +412,13 @@ The Investigate / Dashboard / Lookups / NLQ paths build SQL — sometimes from h
 To remove all resources deployed by this tool:
 
 ```bash
-# Stop the application
-sudo systemctl stop cloudtrail-analyzer   # if deployed as a service
-# or kill the process directly
-pkill -f cloudtrail-analyzer
-
-# Remove downloaded CloudTrail data and databases
-rm -rf data/
-
-# Remove the application binary and config
-rm -f analyzer config.json
+# Remove an installation created by deploy.sh while retaining the EC2 instance
+sudo systemctl disable --now cloudtrail-analyzer
+sudo rm -f /etc/systemd/system/cloudtrail-analyzer.service
+sudo systemctl daemon-reload
+sudo rm -rf /opt/cloudtrail-analyzer
+sudo rm -rf /var/lib/cloudtrail-analyzer
+sudo userdel cloudtrail 2>/dev/null || true
 
 # If deployed on EC2 — terminate the instance via AWS Console or CLI:
 aws ec2 terminate-instances --instance-ids <instance-id>

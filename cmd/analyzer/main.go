@@ -147,11 +147,18 @@ func main() {
 	// Register /api/health endpoint
 	r.Get("/api/health", func(w http.ResponseWriter, req *http.Request) {
 		uptime := time.Since(startedAt).Seconds()
+		checks := []map[string]string{
+			{"name": "Data directory", "status": startupStatus.DataDir.Status, "message": startupStatus.DataDir.Message},
+			{"name": "SQLite", "status": startupStatus.SQLite.Status, "message": startupStatus.SQLite.Message},
+			{"name": "AWS credentials", "status": startupStatus.Credentials.Status, "message": startupStatus.Credentials.Message},
+			{"name": "DuckDB CLI", "status": startupStatus.DuckDB.Status, "message": startupStatus.DuckDB.Message},
+		}
 		render.JSON(w, http.StatusOK, map[string]interface{}{
 			"status":            "ok",
 			"version":           version,
 			"uptime":            fmt.Sprintf("%.0fs", uptime),
 			"startup":           startupStatus,
+			"checks":            checks,
 			"frontend_embedded": frontendEmbedded,
 		})
 	})
@@ -225,27 +232,35 @@ func main() {
 	// Register /api/nlquery routes (Bedrock-powered NL query execution)
 	nlqueryHandler := nlquery.NewHandler(cfg, db.Conn)
 	r.Mount("/api/nlquery", nlqueryHandler.Routes())
+	sessionsHandler.DataDeleteLease(nlqueryHandler.BeginIndexInvalidation)
 
 	// Wire streaming micro-batch indexing: index files as they are extracted
-	processorHandler.Service().OnFileExtracted = func(path string, size int64) {
-		nlqueryHandler.MicroBatch().AddFile(path, size)
+	processorHandler.Service().OnFileExtracted = func(ctx context.Context, path string, size int64) {
+		nlqueryHandler.MicroBatch().AddFile(ctx, path, size)
 	}
 
 	// Wire sync completion: flush remaining buffer and create B-tree indexes
-	processorHandler.Service().OnSyncComplete = func() {
-		nlqueryHandler.MicroBatch().Flush()
+	processorHandler.Service().OnSyncComplete = func(parent context.Context) {
+		if err := nlqueryHandler.MicroBatch().Flush(parent); err != nil {
+			slog.Error("final index flush failed on sync completion",
+				"component", "cloudtrail-analyzer",
+				"error", err.Error(),
+			)
+			return // Do not create secondary indexes if the flush failed
+		}
 		dbPath := nlqueryHandler.Indexer().IndexPath()
 		if !nlqueryHandler.Indexer().IsIndexed() {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 		defer cancel()
-		indexSQL := `
-			CREATE INDEX IF NOT EXISTS idx_event_name ON events ((r.eventName));
-			CREATE INDEX IF NOT EXISTS idx_event_source ON events ((r.eventSource));
-			CREATE INDEX IF NOT EXISTS idx_error_code ON events ((r.errorCode));
-		`
-		nlqueryHandler.Indexer().ExecDuckDB(ctx, dbPath, indexSQL)
+		if err := nlqueryHandler.Indexer().EnsureSecondaryIndexes(ctx); err != nil {
+			slog.Warn("post-sync DuckDB index creation failed",
+				"component", "cloudtrail-analyzer",
+				"db_path", dbPath,
+				"error", err.Error(),
+			)
+		}
 	}
 
 	// Register /api/dashboard routes (security analytics dashboard)
@@ -363,7 +378,16 @@ func main() {
 	// pipeline's progress channel, which unblocks any in-flight SSE progress
 	// handler — otherwise server.Shutdown would block on that handler for the
 	// full timeout below while it waited on a channel that never closed.
-	processorHandler.Service().Shutdown()
+	pipelineShutdownCtx, pipelineCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := processorHandler.Service().Shutdown(pipelineShutdownCtx); err != nil {
+		slog.Error("pipeline shutdown error", "error", err)
+	}
+	pipelineCancel()
+	indexShutdownCtx, indexCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := nlqueryHandler.Shutdown(indexShutdownCtx); err != nil {
+		slog.Error("index shutdown error", "error", err)
+	}
+	indexCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

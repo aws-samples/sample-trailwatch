@@ -1,6 +1,7 @@
 package nlquery
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,18 @@ const (
 	akiaPrefix = "AK" + "IA"
 	asiaPrefix = "AS" + "IA"
 )
+
+type summaryStubProvider struct {
+	output     string
+	userPrompt string
+}
+
+func (p *summaryStubProvider) GenerateSQL(_ context.Context, _, userPrompt string) (string, error) {
+	p.userPrompt = userPrompt
+	return p.output, nil
+}
+
+func (p *summaryStubProvider) Name() string { return "stub" }
 
 func TestValidateSummary_AllowsCountsAndProse(t *testing.T) {
 	rows := [][]interface{}{
@@ -242,6 +255,104 @@ func TestBuildValidationCorpus_LegacyFallback(t *testing.T) {
 	r := &SummarizeResponse{Summary: "raw bullets"}
 	if got := buildValidationCorpus(r); got != "raw bullets" {
 		t.Errorf("expected legacy summary used, got %q", got)
+	}
+}
+
+func TestSummarizeRejectsUnstructuredOutput(t *testing.T) {
+	provider := &summaryStubProvider{output: "- raw bullet"}
+	_, err := Summarize(context.Background(), provider, SummarizeRequest{
+		Columns:   []string{"eventName"},
+		Rows:      [][]interface{}{{"ListBuckets"}},
+		TotalRows: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid structured summary") {
+		t.Fatalf("expected structured-output error, got %v", err)
+	}
+}
+
+func TestSummarizeNormalizesEntityCountAndAddsEvidenceNotice(t *testing.T) {
+	provider := &summaryStubProvider{output: `{
+		"tldr":"Two rows contain account 123456789012.",
+		"findings":[{"severity":"info","text":"Account 123456789012 occurs in two rows."}],
+		"entities":[{"kind":"account","value":"123456789012","count":99}],
+		"suggested_pivots":[{"kind":"account","value":"123456789012","reason":"The value occurs in the displayed rows and can be investigated further."}]
+	}`}
+	resp, err := Summarize(context.Background(), provider, SummarizeRequest{
+		Columns: []string{"identity", "account"},
+		Rows: [][]interface{}{
+			{"arn:aws:iam::123456789012:role/One", "123456789012"},
+			{"arn:aws:iam::123456789012:role/Two", "123456789012"},
+		},
+		TotalRows: 2,
+	})
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if len(resp.Entities) != 1 || resp.Entities[0].Count != 2 {
+		t.Fatalf("expected row-derived entity count 2, got %+v", resp.Entities)
+	}
+	if resp.EvidenceNotice == "" {
+		t.Fatal("expected an evidence notice")
+	}
+}
+
+func TestSummarizeMarksClientSlicedRowsAsTruncated(t *testing.T) {
+	provider := &summaryStubProvider{output: `{
+		"tldr":"The first two of ten rows contain ListBuckets.",
+		"findings":[{"severity":"info","text":"ListBuckets occurs in both supplied rows."}],
+		"entities":[{"kind":"event","value":"ListBuckets","count":2}],
+		"suggested_pivots":[]
+	}`}
+	resp, err := Summarize(context.Background(), provider, SummarizeRequest{
+		Columns:   []string{"eventName"},
+		Rows:      [][]interface{}{{"ListBuckets"}, {"ListBuckets"}},
+		TotalRows: 10,
+	})
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if !strings.Contains(provider.userPrompt, "TRUNCATED: showing first 2 of 10 total rows") {
+		t.Fatalf("expected truncation marker, prompt=%q", provider.userPrompt)
+	}
+	if resp.RowsSentToModel != 2 || resp.TotalRows != 10 {
+		t.Fatalf("unexpected row metadata: sent=%d total=%d", resp.RowsSentToModel, resp.TotalRows)
+	}
+}
+
+func TestSummarizeFlagsUnsupportedInferenceLanguage(t *testing.T) {
+	provider := &summaryStubProvider{output: `{
+		"tldr":"The event is consistent with internal service calls.",
+		"findings":[{"severity":"low","text":"The role likely lacks permissions."}],
+		"entities":[{"kind":"event","value":"GetMacieSession","count":1}],
+		"suggested_pivots":[]
+	}`}
+	resp, err := Summarize(context.Background(), provider, SummarizeRequest{
+		Columns:   []string{"eventName"},
+		Rows:      [][]interface{}{{"GetMacieSession"}},
+		TotalRows: 1,
+	})
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if resp.InferenceWarning == "" {
+		t.Fatal("expected unsupported inference warning")
+	}
+}
+
+func TestSummarizeRejectsEntityMissingFromRows(t *testing.T) {
+	provider := &summaryStubProvider{output: `{
+		"tldr":"One row was supplied.",
+		"findings":[{"severity":"info","text":"One event is present."}],
+		"entities":[{"kind":"event","value":"DeleteTrail","count":1}],
+		"suggested_pivots":[]
+	}`}
+	_, err := Summarize(context.Background(), provider, SummarizeRequest{
+		Columns:   []string{"eventName"},
+		Rows:      [][]interface{}{{"ListBuckets"}},
+		TotalRows: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not appear in the source rows") {
+		t.Fatalf("expected unknown-entity error, got %v", err)
 	}
 }
 

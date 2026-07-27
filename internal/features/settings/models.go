@@ -8,7 +8,7 @@ type UpdateConfigRequest struct {
 	Region         string   `json:"region"`
 	AccountID      string   `json:"account_id"`
 	Mode           string   `json:"mode"`
-	OrgID          string   `json:"org_id,omitempty"`
+	OrgID          *string  `json:"org_id,omitempty"`
 	LogRegion      string   `json:"log_region,omitempty"`
 	MemberAccounts []string `json:"member_accounts,omitempty"`
 	// Auth fields
@@ -22,11 +22,11 @@ type UpdateConfigRequest struct {
 	StartDate string `json:"start_date,omitempty"`
 	EndDate   string `json:"end_date,omitempty"`
 	// LLM provider
-	LLMProvider   string `json:"llm_provider,omitempty"`
-	LLMAPIKey     string `json:"llm_api_key,omitempty"`
-	LLMModel      string `json:"llm_model,omitempty"`
-	LLMEndpoint   string `json:"llm_endpoint,omitempty"`
-	BedrockRegion string `json:"bedrock_region,omitempty"`
+	LLMProvider   string  `json:"llm_provider,omitempty"`
+	LLMAPIKey     string  `json:"llm_api_key,omitempty"`
+	LLMModel      string  `json:"llm_model,omitempty"`
+	LLMEndpoint   *string `json:"llm_endpoint,omitempty"`
+	BedrockRegion string  `json:"bedrock_region,omitempty"`
 }
 
 // ValidateBucketRequest represents a request to validate S3 bucket accessibility.
@@ -57,7 +57,7 @@ type CredentialAttempt struct {
 	Reason  string `json:"reason"`
 }
 
-// AccountListResponse represents the list of discovered Control Tower member accounts.
+// AccountListResponse represents discovered organization member accounts.
 type AccountListResponse struct {
 	Accounts []string `json:"accounts"`
 }
@@ -77,7 +77,7 @@ type CallerIdentityResponse struct {
 	UserID    string `json:"user_id"`
 }
 
-// DetectStructureRequest represents a request to detect S3 bucket structure.
+// DetectStructureRequest represents a request to detect the CloudTrail S3 layout.
 type DetectStructureRequest struct {
 	Bucket string `json:"bucket"`
 	Region string `json:"region"`

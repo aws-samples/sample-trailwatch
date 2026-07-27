@@ -107,25 +107,18 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, result)
 }
 
-// memberAccountScope returns a SQL fragment that constrains a query to the
-// selected member-account subset (N33). When more than one member account is
-// configured, the dashboard/lookups data path widens to the bucket/org root,
-// so without this predicate the aggregates would span every synced account
-// instead of the user's selection. The returned fragment is prefixed with
-// " AND " and the field reference so it can be appended directly after an
-// existing WHERE clause; it is empty when no subset constraint applies. Each ID
-// is emitted via quoteSQLLiteral as defense in depth on top of the digit-only
-// shape check, matching the H6 escaping discipline used elsewhere.
+// memberAccountScope constrains an organization-root scan to the configured
+// member selection. Organization paths always start at the bucket mirror so
+// they work for both standard Organizations and Control Tower layouts; the
+// predicate is therefore required even when exactly one member is selected.
+// Single-account mode remains scoped by its narrow filesystem path.
 func memberAccountScope(cfg *config.Config) string {
-	if len(cfg.S3.MemberAccounts) <= 1 {
+	if !usesOrganizationQueryRoot(cfg) {
 		return ""
 	}
-	var quoted []string
-	for _, id := range cfg.S3.MemberAccounts {
-		id = strings.TrimSpace(id)
-		if !isValidAccountID(id) {
-			continue
-		}
+	ids := scopeAccountIDs(cfg)
+	quoted := make([]string, 0, len(ids))
+	for _, id := range ids {
 		quoted = append(quoted, quoteSQLLiteral(id))
 	}
 	if len(quoted) == 0 {
@@ -135,29 +128,5 @@ func memberAccountScope(cfg *config.Config) string {
 }
 
 func (h *LookupsHandler) buildDataPath() string {
-	if h.cfg.S3.Bucket == "" {
-		return ""
-	}
-
-	if len(h.cfg.S3.MemberAccounts) > 1 {
-		if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-			return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/",
-				h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.OrgID, h.cfg.S3.OrgID)
-		}
-		return fmt.Sprintf("%s/s3/%s/AWSLogs/", h.cfg.DataDir, h.cfg.S3.Bucket)
-	}
-
-	region := h.cfg.S3.LogRegion
-	if region == "" {
-		region = h.cfg.S3.Region
-	}
-
-	if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-		return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/%s/CloudTrail/%s/",
-			h.cfg.DataDir, h.cfg.S3.Bucket,
-			h.cfg.S3.OrgID, h.cfg.S3.OrgID, h.cfg.S3.AccountID, region)
-	}
-
-	return fmt.Sprintf("%s/s3/%s/AWSLogs/%s/CloudTrail/%s/",
-		h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.AccountID, region)
+	return localQueryRoot(h.cfg)
 }

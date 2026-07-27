@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -49,9 +50,8 @@ func (h *Handler) ListDiscoverable(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.resolver.ListDiscoverable(r.Context(), configured)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list discoverable accounts", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to list discoverable accounts", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list discoverable accounts", nil)
 		return
 	}
 	render.JSON(w, http.StatusOK, map[string]interface{}{"accounts": out})
@@ -62,9 +62,8 @@ func (h *Handler) ListDiscoverable(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	st, err := h.resolver.Status(r.Context())
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to read resolver status", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to read resolver status", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to read resolver status", nil)
 		return
 	}
 	render.JSON(w, http.StatusOK, st)
@@ -86,9 +85,8 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 	ids := splitAndTrim(idsParam, ",")
 	entries, err := h.resolver.ResolveMany(r.Context(), ids)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to resolve account names", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to resolve account names", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to resolve account names", nil)
 		return
 	}
 	if entries == nil {
@@ -109,7 +107,9 @@ func (h *Handler) RefreshOrg(w http.ResponseWriter, r *http.Request) {
 	count, err := h.resolver.RefreshOrganizations(r.Context(), true)
 	resp := refreshResponse{Refreshed: err == nil, Count: count}
 	if err != nil {
-		resp.Error = err.Error()
+		slog.Warn("organizations refresh failed", "component", "cloudtrail-analyzer", "error", err.Error())
+		se := render.ClassifyError(err)
+		resp.Error = se.Message
 	}
 	render.JSON(w, http.StatusOK, resp)
 }
@@ -118,9 +118,8 @@ func (h *Handler) RefreshOrg(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListManual(w http.ResponseWriter, r *http.Request) {
 	entries, err := h.resolver.ListManual(r.Context())
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list manual mappings", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to list manual mappings", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list manual mappings", nil)
 		return
 	}
 	render.JSON(w, http.StatusOK, resolveResponse{Entries: entries})
@@ -147,9 +146,8 @@ func (h *Handler) UpsertManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.resolver.SetManual(r.Context(), id, name); err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to save mapping", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to save manual mapping", "component", "cloudtrail-analyzer", "account", id, "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to save mapping", nil)
 		return
 	}
 	entry, _ := h.resolver.ResolveOne(r.Context(), id)
@@ -166,9 +164,8 @@ func (h *Handler) DeleteManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.resolver.SetManual(r.Context(), id, ""); err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to delete mapping", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to delete manual mapping", "component", "cloudtrail-analyzer", "account", id, "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to delete mapping", nil)
 		return
 	}
 	entry, _ := h.resolver.ResolveOne(r.Context(), id)

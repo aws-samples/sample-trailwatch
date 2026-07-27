@@ -9,27 +9,30 @@
 # binary with embedded frontend, and sets up a systemd service.
 #
 # Dependencies installed:
-#   - Go 1.26+          (build time, stays for future rebuilds; must match go.mod)
+#   - Go 1.26+          (build time, stays for future rebuilds)
 #   - Node.js 20+       (build time only, used for frontend)
 #   - DuckDB CLI        (runtime, for query execution)
-#   - Ollama            (NOT installed here — auto-installed on first use if user picks local LLM)
+#   - Ollama            (optional; install separately for the local LLM provider)
 
 set -euo pipefail
+umask 077
+
+# Capture the checkout before installer functions change directory.
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# GO_VERSION must match the toolchain pinned in go.mod (go 1.26 / toolchain
-# go1.26.4). If go.mod is bumped, update this to match or the EC2 build either
-# fails or silently pulls a different toolchain over the network.
+# Pin the installer for reproducible EC2 builds. go.mod declares the supported
+# language/toolchain minimum (Go 1.26) without forcing every developer to fetch
+# this exact patch release.
 GO_VERSION="1.26.4"
 NODE_MAJOR=20
 DUCKDB_VERSION="1.2.2"
 
-# Pin the Go toolchain explicitly so a mismatched preinstalled Go does not
-# silently download a different toolchain over the network at build time. This
-# value tracks go.mod's 'toolchain' directive.
-export GOTOOLCHAIN="go1.26.4"
+# The script installs/checks Go itself; prohibit go from downloading another
+# toolchain implicitly during the build.
+export GOTOOLCHAIN="local"
 
 APP_NAME="cloudtrail-analyzer"
 APP_USER="cloudtrail"
@@ -58,6 +61,13 @@ require_root() {
 # ---------------------------------------------------------------------------
 require_root
 
+DEPLOY_TMP_DIR="$(mktemp -d /tmp/cloudtrail-analyzer-deploy.XXXXXX)"
+chmod 700 "${DEPLOY_TMP_DIR}"
+cleanup() {
+    rm -rf "${DEPLOY_TMP_DIR}"
+}
+trap cleanup EXIT
+
 info "Starting CloudTrail Analyzer deployment on Amazon Linux 2023"
 info "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -80,7 +90,7 @@ info "Updating system packages..."
 # needed; on systems without the conflict it is a no-op.
 # Stderr is intentionally NOT redirected so failures surface during deploy.
 dnf update -y || fail "dnf update failed; check network/repos"
-dnf install -y --allowerasing git gcc gcc-c++ make unzip tar gzip wget curl \
+dnf install -y --allowerasing git gcc gcc-c++ make unzip tar gzip wget curl rsync \
     || fail "dnf install failed; check the error above"
 ok "System packages up to date"
 
@@ -101,11 +111,12 @@ verify_sha256() {
 }
 
 install_go() {
-    local go_tarball="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
-    local go_url="https://go.dev/dl/${go_tarball}"
+    local go_filename="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
+    local go_tarball="${DEPLOY_TMP_DIR}/${go_filename}"
+    local go_checksum="${go_tarball}.sha256"
+    local go_url="https://go.dev/dl/${go_filename}"
 
     info "Downloading Go ${GO_VERSION}..."
-    cd /tmp
     wget -q "${go_url}" -O "${go_tarball}"
 
     # Supply-chain hardening: verify the tarball against the SHA-256 that Go
@@ -113,19 +124,18 @@ install_go() {
     # published checksum is preferred over hardcoding so this keeps working
     # across GO_VERSION bumps. Fail closed on mismatch.
     info "Verifying Go tarball checksum..."
-    wget -q "${go_url}.sha256" -O "${go_tarball}.sha256" \
+    wget -q "${go_url}.sha256" -O "${go_checksum}" \
         || fail "Could not download Go checksum file ${go_url}.sha256"
     local go_expected
-    go_expected="$(awk '{print $1}' "${go_tarball}.sha256")"
+    go_expected="$(awk '{print $1}' "${go_checksum}")"
     if [[ -z "${go_expected}" ]]; then
-        fail "Go checksum file ${go_tarball}.sha256 was empty or malformed"
+        fail "Go checksum file ${go_checksum} was empty or malformed"
     fi
     verify_sha256 "${go_tarball}" "${go_expected}"
     ok "Go tarball checksum verified"
 
     rm -rf /usr/local/go
     tar -C /usr/local -xzf "${go_tarball}"
-    rm -f "${go_tarball}" "${go_tarball}.sha256"
 }
 
 # Add Go to PATH for this script
@@ -150,20 +160,41 @@ ok "Go ready: $(go version)"
 # ---------------------------------------------------------------------------
 # Step 3: Install Node.js (build-time only)
 # ---------------------------------------------------------------------------
-# Last-resort fallback when the AL2023 repos do not carry Node.js. NodeSource
-# is a trusted vendor and their setup script is downloaded to a file first and
-# only then executed (no pipe-to-bash), so the content can be inspected and is
-# not streamed straight into a shell. We still run it as root, so this path is
-# reached only when the distro packages are unavailable.
-# Wrapped in a function because it uses 'local' — 'local' outside a function
-# aborts the script under 'set -e'.
-install_node_from_nodesource() {
-    local setup_script="/tmp/nodesource_setup_${NODE_MAJOR}.sh"
-    curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" -o "${setup_script}"
-    chmod +x "${setup_script}"
-    bash "${setup_script}"
-    rm -f "${setup_script}"
-    dnf install -y nodejs 2>/dev/null || yum install -y nodejs 2>/dev/null
+# Install Node.js from the official pinned binary archive with SHA-256
+# verification. No third-party setup scripts are downloaded or executed.
+NODE_VERSION="20.18.1"
+declare -A NODE_SHA256=(
+    [amd64]="a9420224cb562e1a4bda2067925e3745e8a22fd59f168e3ad2c6a10e16e4a2f2"
+    [arm64]="8b476ef14ba70a4eb2e5d9c5e618fcda1e2d0e03e86ddf9dd1c88f48c17c2e6c"
+)
+
+install_node_pinned() {
+    local node_arch
+    case "${GOARCH}" in
+        amd64) node_arch="x64" ;;
+        arm64) node_arch="arm64" ;;
+        *)     fail "Unsupported architecture for Node.js: ${GOARCH}" ;;
+    esac
+
+    local node_filename="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"
+    local node_tarball="${DEPLOY_TMP_DIR}/${node_filename}"
+    local node_url="https://nodejs.org/dist/v${NODE_VERSION}/${node_filename}"
+
+    # Get the expected checksum for this architecture
+    local node_expected="${NODE_SHA256[${GOARCH}]:-}"
+    if [[ -z "${node_expected}" ]]; then
+        fail "No pinned SHA-256 for Node.js ${NODE_VERSION} arch ${GOARCH}. Update NODE_SHA256 in this script."
+    fi
+
+    info "Downloading Node.js ${NODE_VERSION} for ${node_arch}..."
+    wget -q "${node_url}" -O "${node_tarball}"
+
+    info "Verifying Node.js tarball checksum..."
+    verify_sha256 "${node_tarball}" "${node_expected}"
+    ok "Node.js tarball checksum verified"
+
+    # Extract to /usr/local and symlink binaries
+    tar -xJf "${node_tarball}" -C /usr/local --strip-components=1
 }
 
 if command -v node &>/dev/null; then
@@ -172,14 +203,13 @@ if command -v node &>/dev/null; then
         ok "Node.js already installed: $(node --version)"
     else
         warn "Node.js too old (v${NODE_VER} < v${NODE_MAJOR}), upgrading..."
-        dnf remove -y nodejs 2>/dev/null || true
-        dnf install -y nodejs 2>/dev/null || yum install -y nodejs 2>/dev/null
+        install_node_pinned
     fi
 else
-    info "Installing Node.js ${NODE_MAJOR}..."
+    info "Installing Node.js ${NODE_VERSION}..."
     # AL2023 has Node 18+ in default repos; try dnf first.
     if ! dnf install -y nodejs npm 2>/dev/null; then
-        install_node_from_nodesource
+        install_node_pinned
     fi
 fi
 ok "Node.js ready: $(node --version)"
@@ -201,8 +231,10 @@ declare -A DUCKDB_SHA256=(
 
 install_duckdb() {
     info "Installing DuckDB ${DUCKDB_VERSION} for ${DUCKDB_ARCH}..."
-    local duckdb_zip="duckdb_cli-linux-${DUCKDB_ARCH}.zip"
-    local duckdb_url="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/${duckdb_zip}"
+    local duckdb_filename="duckdb_cli-linux-${DUCKDB_ARCH}.zip"
+    local duckdb_zip="${DEPLOY_TMP_DIR}/${duckdb_filename}"
+    local duckdb_extract="${DEPLOY_TMP_DIR}/duckdb-extract"
+    local duckdb_url="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/${duckdb_filename}"
 
     # Supply-chain hardening: fail closed if we do not have a pinned checksum
     # for this arch/version pair, then verify the download before extracting.
@@ -211,16 +243,14 @@ install_duckdb() {
         fail "No pinned SHA-256 for DuckDB ${DUCKDB_VERSION} arch ${DUCKDB_ARCH}. Update DUCKDB_SHA256 in this script."
     fi
 
-    cd /tmp
     wget -q "${duckdb_url}" -O "${duckdb_zip}"
     info "Verifying DuckDB zip checksum..."
     verify_sha256 "${duckdb_zip}" "${duckdb_expected}"
     ok "DuckDB zip checksum verified"
 
-    unzip -o -q "${duckdb_zip}" -d /tmp/duckdb_extract
-    mv /tmp/duckdb_extract/duckdb /usr/local/bin/duckdb
-    chmod +x /usr/local/bin/duckdb
-    rm -rf "${duckdb_zip}" /tmp/duckdb_extract
+    mkdir -m 700 "${duckdb_extract}"
+    unzip -q "${duckdb_zip}" -d "${duckdb_extract}"
+    install -m 0755 "${duckdb_extract}/duckdb" /usr/local/bin/duckdb
 }
 
 if command -v duckdb &>/dev/null; then
@@ -243,13 +273,13 @@ else
 fi
 
 mkdir -p "$APP_DIR" "$DATA_DIR"
+chmod 700 "$DATA_DIR"
 ok "Directories created: $APP_DIR, $DATA_DIR"
 
 # ---------------------------------------------------------------------------
 # Step 6: Copy source code to app directory
 # ---------------------------------------------------------------------------
 info "Copying source code to ${APP_DIR}..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Verify the source tree is complete BEFORE rsync. A surprisingly common
 # breakage when teams ship the project as a zip is missing top-level
@@ -341,7 +371,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   "log_level": "info",
   "query_timeout_seconds": 60,
   "monitor_interval_seconds": 5,
-  "max_download_concurrency": 4,
+  "max_download_concurrency": 16,
   "s3": {
     "bucket": "",
     "region": "",
@@ -353,7 +383,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   },
   "bedrock": {
     "region": "us-east-1",
-    "model_id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "model_id": "us.anthropic.claude-sonnet-4-6",
     "enabled": false
   },
   "llm": {
@@ -373,7 +403,9 @@ fi
 info "Setting file ownership..."
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR" "$DATA_DIR"
 chmod 750 "${APP_DIR}/${APP_NAME}"
-chmod 640 "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
+find "$DATA_DIR" -type d -exec chmod 700 {} +
+find "$DATA_DIR" -type f -exec chmod 600 {} +
 ok "Ownership and permissions set"
 
 # ---------------------------------------------------------------------------
@@ -393,10 +425,12 @@ User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/${APP_NAME}
+UMask=0077
 
 # Environment
 Environment=PORT=${PORT}
 Environment=DATA_DIR=${DATA_DIR}
+Environment=AWS_EC2_METADATA_V1_DISABLED=true
 
 # Hardening
 NoNewPrivileges=true
@@ -434,21 +468,22 @@ sleep 2
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
     ok "Service is running"
 else
-    warn "Service may not have started cleanly. Check: journalctl -u ${SERVICE_NAME} -n 50"
+    journalctl -u "${SERVICE_NAME}" -n 50 --no-pager || true
+    fail "Service did not start. Review the journal output above."
 fi
 
 # ---------------------------------------------------------------------------
 # Step 13: Verify
 # ---------------------------------------------------------------------------
 info "Running health check..."
-sleep 1
-if curl -sf "http://localhost:${PORT}/api/health" > /dev/null 2>&1; then
+if curl -sf --retry 10 --retry-delay 1 --retry-connrefused \
+    "http://localhost:${PORT}/api/health" > /dev/null 2>&1; then
     ok "Health check passed"
     HEALTH=$(curl -s "http://localhost:${PORT}/api/health")
     echo "  $HEALTH"
 else
-    warn "Health endpoint not reachable yet — the service may still be starting."
-    warn "Check logs: journalctl -u ${SERVICE_NAME} -f"
+    journalctl -u "${SERVICE_NAME}" -n 50 --no-pager || true
+    fail "Health endpoint did not become ready. Review the journal output above."
 fi
 
 # ---------------------------------------------------------------------------
@@ -459,16 +494,19 @@ echo "============================================================"
 echo "  CloudTrail Analyzer deployed successfully!"
 echo "============================================================"
 echo ""
-echo "  URL:      http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost'):${PORT}"
+echo "  Local URL on the instance: http://localhost:${PORT}"
 echo "  Config:   ${CONFIG_FILE}"
 echo "  Data:     ${DATA_DIR}"
 echo "  Logs:     journalctl -u ${SERVICE_NAME} -f"
 echo "  Service:  systemctl status ${SERVICE_NAME}"
 echo ""
 echo "  Next steps:"
-echo "    1. Edit ${CONFIG_FILE} to set your S3 bucket and credentials"
-echo "    2. Restart: sudo systemctl restart ${SERVICE_NAME}"
-echo "    3. Open the URL above in your browser"
+echo "    1. From your laptop, start an SSM port-forwarding session:"
+echo "       aws ssm start-session --target <instance-id> \\"
+echo "         --document-name AWS-StartPortForwardingSession \\"
+echo "         --parameters '{\"portNumber\":[\"${PORT}\"],\"localPortNumber\":[\"${PORT}\"]}'"
+echo "    2. Open http://localhost:${PORT} in your laptop browser"
+echo "    3. Configure credentials and the CloudTrail S3 bucket in the UI"
 echo ""
 echo "  Useful commands:"
 echo "    sudo systemctl stop ${SERVICE_NAME}"

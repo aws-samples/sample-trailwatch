@@ -38,6 +38,15 @@ CLAUDE.md
 *.csv
 CSR_Fix_Instructions*
 
+# AI review artifacts — never commit
+COMPREHENSIVE-CODE-REVIEW.md
+REUSABLE_DEEP_REVIEW_PROMPT.md
+SDLC-DOCS-PROMPT.md
+codexfindings.md
+docs/DEEP_REVIEW_REPORT.md
+docs/DEVELOPER-REMEDIATION-HANDOFF.md
+docs/PORTABLE_LEARNINGS.md
+
 # Screenshots
 Screenshot*
 
@@ -46,3 +55,13 @@ Screenshot*
 
 # Tests
 tests/
+
+# Go build cache (large, machine-specific)
+/.gocache/
+
+# Historical raw reports (may contain live identifiers)
+/reports/
+
+# Root npm artifacts (accidental; real frontend is web/)
+/package.json
+/package-lock.json

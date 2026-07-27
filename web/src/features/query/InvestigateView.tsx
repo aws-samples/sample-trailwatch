@@ -1,17 +1,23 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Search, Play, Loader2, AlertTriangle, ChevronDown, X as XIcon } from 'lucide-react'
+import { Search, Play, Loader2, AlertTriangle, ChevronDown, RefreshCw, X as XIcon } from 'lucide-react'
 import { endpoints } from '../../config/api'
 import { readApiError } from '../../comm/apiError'
 import { AccountLabel } from '../../comm/AccountLabel'
 import { useAccountNames } from '../../comm/accountNames'
 import { InvestigateToolbar } from './InvestigateToolbar'
 import { SummaryPanel } from './SummaryPanel'
-import { seedTypeLabel, type SeedType } from './seedDetection'
+import {
+  seedTypeForScenarioParam,
+  seedTypeLabel,
+  seedTypeMatchesScenarioParam,
+  type SeedType,
+} from './seedDetection'
 import { ExpandableCell } from '../../comm/ExpandableCell'
 import type { NavigationContext } from '../../arc/Layout'
 import { Sparkles } from 'lucide-react'
 import { exportRowsAsCSV, exportRowsAsJSON } from './tableExport'
+import { resolveInvestigationCounts } from './investigationTruthfulness'
 
 interface Scenario {
   id: string
@@ -37,6 +43,9 @@ interface RunResult {
   sql: string
   columns: string[] | null
   rows: any[][] | null
+  total_rows?: number
+  returned_rows?: number
+  truncated?: boolean
   error?: string
   error_hint?: string
   error_detail?: string
@@ -58,6 +67,37 @@ const SEVERITY_BADGE: Record<string, string> = {
 
 interface InvestigateViewProps {
   navContext?: NavigationContext
+}
+
+function isScenario(value: unknown): value is Scenario {
+  if (!value || typeof value !== 'object') return false
+  const scenario = value as Record<string, unknown>
+  return (
+    typeof scenario.id === 'string' &&
+    typeof scenario.name === 'string' &&
+    typeof scenario.category === 'string' &&
+    typeof scenario.description === 'string' &&
+    typeof scenario.param_type === 'string' &&
+    typeof scenario.severity === 'string' &&
+    (scenario.param_label === undefined || typeof scenario.param_label === 'string')
+  )
+}
+
+function normalizeLookups(value: unknown): LookupValues | null {
+  if (!value || typeof value !== 'object') return null
+  const lookups = value as Record<string, unknown>
+  const strings = (candidate: unknown): string[] =>
+    Array.isArray(candidate)
+      ? candidate.filter((item): item is string => typeof item === 'string')
+      : []
+
+  return {
+    access_keys: strings(lookups.access_keys),
+    source_ips: strings(lookups.source_ips),
+    identities: strings(lookups.identities),
+    accounts: strings(lookups.accounts),
+    roles: strings(lookups.roles),
+  }
 }
 
 // columnMinWidth picks a sensible CSS min-width for a result-table column
@@ -95,6 +135,9 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<RunResult | null>(null)
   const [loading, setLoading] = useState(true)
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null)
+  const bootstrapEpochRef = useRef(0)
+  const bootstrapAbortRef = useRef<AbortController | null>(null)
   // Toolbar context: time + accounts apply to scenario runs as filters; seed
   // is surfaced for the seed-driven scenario reorder (and PR 2's drill-down
   // workbench). Stored in a ref-style state updated by the toolbar's
@@ -102,6 +145,51 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   const [toolbar, setToolbar] = useState<ToolbarSnapshot>({
     timeStart: '', timeEnd: '', accountIds: [], seed: '', seedType: 'unknown',
   })
+  const toolbarRef = useRef(toolbar)
+  toolbarRef.current = toolbar
+
+  // A run may outlive the inputs that produced it. Abort eagerly to avoid
+  // unnecessary backend work, and use an epoch as the authoritative guard
+  // because a response/body parse can still settle after abort().
+  const runEpochRef = useRef(0)
+  const runAbortRef = useRef<AbortController | null>(null)
+  const invalidateScenarioRun = useCallback(() => {
+    runEpochRef.current += 1
+    runAbortRef.current?.abort()
+    runAbortRef.current = null
+    setRunning(false)
+    setResult(null)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      runEpochRef.current += 1
+      runAbortRef.current?.abort()
+      runAbortRef.current = null
+    }
+  }, [])
+
+  const handleToolbarChange = useCallback((next: ToolbarSnapshot) => {
+    const previous = toolbarRef.current
+    const accountsChanged =
+      previous.accountIds.length !== next.accountIds.length ||
+      previous.accountIds.some((id, index) => id !== next.accountIds[index])
+    const queryFiltersChanged =
+      previous.timeStart !== next.timeStart ||
+      previous.timeEnd !== next.timeEnd ||
+      accountsChanged
+
+    toolbarRef.current = next
+    setToolbar(next)
+    if (queryFiltersChanged) invalidateScenarioRun()
+  }, [invalidateScenarioRun])
+
+  const updateParamValue = useCallback((next: string) => {
+    if (next === paramValue) return
+    invalidateScenarioRun()
+    setParamValue(next)
+  }, [invalidateScenarioRun, paramValue])
+
   // clearSignal is a counter-and-kind handshake the active-filters strip
   // uses to ask the toolbar to clear a specific filter. The toolbar owns
   // its state via useToolbarState; rather than lift the whole thing up, we
@@ -152,7 +240,8 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   // Summary side panel: opt-in by default; auto-suggested on large results.
   const [summaryOpen, setSummaryOpen] = useState(false)
   const LARGE_RESULT_THRESHOLD = 500
-  const isLargeResult = !!result?.rows && result.rows.length >= LARGE_RESULT_THRESHOLD
+  const resultCounts = resolveInvestigationCounts(result)
+  const isLargeResult = resultCounts.totalRows >= LARGE_RESULT_THRESHOLD
 
   // Per-row expansion in the result table. Tracks indices of rows the user
   // has clicked to wrap-mode (every cell shows full text on multiple lines).
@@ -224,17 +313,73 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
       setSummaryOpen(true)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result?.scenario_id, result?.rows?.length])
+  }, [result?.scenario_id, result?.rows?.length, result?.total_rows])
+
+  const loadBootstrap = useCallback(async () => {
+    const requestEpoch = ++bootstrapEpochRef.current
+    bootstrapAbortRef.current?.abort()
+    const controller = new AbortController()
+    bootstrapAbortRef.current = controller
+    const isCurrentRequest = () =>
+      bootstrapEpochRef.current === requestEpoch &&
+      bootstrapAbortRef.current === controller &&
+      !controller.signal.aborted
+
+    setLoading(true)
+    setBootstrapError(null)
+    try {
+      const [scenariosResponse, lookupsResponse] = await Promise.all([
+        fetch(endpoints.investigateScenarios, { signal: controller.signal }),
+        fetch(endpoints.lookups, { signal: controller.signal }).catch(error => {
+          if (controller.signal.aborted) throw error
+          return null
+        }),
+      ])
+
+      if (!scenariosResponse.ok) {
+        throw new Error(await readApiError(scenariosResponse, 'Failed to load investigation scenarios'))
+      }
+
+      const scenariosPayload: unknown = await scenariosResponse.json()
+      if (!Array.isArray(scenariosPayload) || !scenariosPayload.every(isScenario)) {
+        throw new Error('The investigation scenarios response was malformed.')
+      }
+
+      let lookupValues: LookupValues | null = null
+      if (lookupsResponse?.ok) {
+        try {
+          lookupValues = normalizeLookups(await lookupsResponse.json())
+        } catch {
+          lookupValues = null
+        }
+      }
+
+      if (isCurrentRequest()) {
+        setScenarios(scenariosPayload)
+        setLookups(lookupValues)
+      }
+    } catch (error: unknown) {
+      if (isCurrentRequest()) {
+        setScenarios([])
+        setLookups(null)
+        setBootstrapError(error instanceof Error ? error.message : 'Failed to load investigation scenarios')
+      }
+    } finally {
+      if (isCurrentRequest()) {
+        bootstrapAbortRef.current = null
+        setLoading(false)
+      }
+    }
+  }, [])
 
   useEffect(() => {
-    Promise.all([
-      fetch(endpoints.investigateScenarios).then(r => r.json()),
-      fetch(endpoints.lookups).then(r => r.ok ? r.json() : null),
-    ]).then(([s, l]) => {
-      setScenarios(s || [])
-      setLookups(l)
-    }).finally(() => setLoading(false))
-  }, [])
+    void loadBootstrap()
+    return () => {
+      bootstrapEpochRef.current += 1
+      bootstrapAbortRef.current?.abort()
+      bootstrapAbortRef.current = null
+    }
+  }, [loadBootstrap])
 
   // Deep-link: when arriving from Dashboard with a scenarioId, auto-select that
   // scenario and switch its category filter so it's visible in the left list.
@@ -244,10 +389,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
     if (!wanted || scenarios.length === 0) return
     const match = scenarios.find(s => s.id === wanted)
     if (!match) return
+    invalidateScenarioRun()
     setSelectedScenario(match)
     setSelectedCategory(match.category)
     setParamValue('')
-    setResult(null)
     if (match.param_type === 'none') {
       void runScenarioById(match)
     }
@@ -255,38 +400,58 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   }, [navContext?.scenarioId, scenarios])
 
   async function runScenarioById(scenario: Scenario, param = '') {
+    const requestEpoch = ++runEpochRef.current
+    runAbortRef.current?.abort()
+    const controller = new AbortController()
+    runAbortRef.current = controller
+    const isCurrentRequest = () =>
+      runEpochRef.current === requestEpoch &&
+      runAbortRef.current === controller &&
+      !controller.signal.aborted
+
     setRunning(true)
     setResult(null)
     try {
       // Build the filters payload from the toolbar context. The backend
       // ignores empty fields, so omitting unset values is fine.
+      const activeToolbar = toolbarRef.current
       const filters: Record<string, unknown> = {}
-      if (toolbar.timeStart) filters.time_start = toolbar.timeStart
-      if (toolbar.timeEnd) filters.time_end = toolbar.timeEnd
-      if (toolbar.accountIds.length > 0) filters.account_ids = toolbar.accountIds
+      if (activeToolbar.timeStart) filters.time_start = activeToolbar.timeStart
+      if (activeToolbar.timeEnd) filters.time_end = activeToolbar.timeEnd
+      if (activeToolbar.accountIds.length > 0) filters.account_ids = activeToolbar.accountIds
       const body: Record<string, unknown> = { scenario_id: scenario.id, param }
       if (Object.keys(filters).length > 0) body.filters = filters
       const res = await fetch(endpoints.investigateRun, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       })
       if (!res.ok) {
         const msg = await readApiError(res, 'Scenario run failed')
-        setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: msg })
+        if (isCurrentRequest()) {
+          setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: msg })
+        }
         return
       }
-      setResult(await res.json())
-    } catch (e: any) {
-      setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: e?.message || 'Network error' })
+      const data = await res.json()
+      if (isCurrentRequest()) setResult(data)
+    } catch (e: unknown) {
+      if (isCurrentRequest()) {
+        const message = e instanceof Error ? e.message : 'Network error'
+        setResult({ scenario_id: scenario.id, param, sql: '', columns: null, rows: null, error: message })
+      }
     } finally {
-      setRunning(false)
+      if (isCurrentRequest()) {
+        runAbortRef.current = null
+        setRunning(false)
+      }
     }
   }
 
   const categories = ['all', ...Array.from(new Set(scenarios.map(s => s.category)))]
   // Seed-driven reorder: when the user has pasted a seed (ARN/IP/access key/
-  // account/user/role), scenarios whose param_type matches the detected
+  // account/user/role), scenarios whose param_type accepts the detected
   // seed type bubble to the top of the list with a "matches your seed"
   // badge. The badge + reorder is purely visual; the param still has to be
   // confirmed by the user before running. This nudges the responder toward
@@ -295,7 +460,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
     if (!toolbar.seed || toolbar.seedType === 'unknown') return new Set<string>()
     const matched = new Set<string>()
     for (const s of scenarios) {
-      if (s.param_type === toolbar.seedType) matched.add(s.id)
+      if (seedTypeMatchesScenarioParam(toolbar.seedType, s.param_type)) matched.add(s.id)
     }
     return matched
   }, [scenarios, toolbar.seed, toolbar.seedType])
@@ -315,13 +480,13 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
   }, [scenarios, selectedCategory, seedMatchedScenarios])
 
   // Top recommendations to surface in the post-pivot banner. We pick from
-  // scenarios whose param_type matches the detected seed type, sort by
+  // scenarios whose param_type accepts the detected seed type, sort by
   // severity (CRITICAL → HIGH → MEDIUM → LOW), and cap at 3 so the banner
   // stays scannable. Deterministic — no LLM, free.
   const recommendations = useMemo(() => {
     if (!toolbar.seed || toolbar.seedType === 'unknown') return []
     const rank: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
-    const matches = scenarios.filter(s => s.param_type === toolbar.seedType)
+    const matches = scenarios.filter(s => seedTypeMatchesScenarioParam(toolbar.seedType, s.param_type))
     matches.sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9))
     return matches.slice(0, 3)
   }, [scenarios, toolbar.seed, toolbar.seedType])
@@ -334,12 +499,13 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
     if (!toolbar.seed) return []
     if (recommendations.length > 0) return []
     // Build the set of param_types that scenarios actually accept (not 'none').
-    const types = new Set<string>()
+    const types = new Set<SeedType>()
     for (const s of scenarios) {
-      if (s.param_type && s.param_type !== 'none') types.add(s.param_type)
+      const type = seedTypeForScenarioParam(s.param_type)
+      if (type) types.add(type)
     }
     // Prefer the most likely useful types first.
-    const preferred = ['arn', 'access_key', 'ip', 'account', 'role', 'identity']
+    const preferred: SeedType[] = ['arn', 'access_key', 'ip', 'account', 'role', 'user']
     return preferred.filter(t => types.has(t) && t !== toolbar.seedType)
   }, [scenarios, toolbar.seed, toolbar.seedType, recommendations.length])
 
@@ -388,10 +554,30 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
     return <div className="flex items-center justify-center h-full"><Loader2 className="w-6 h-6 animate-spin text-gray-400" /></div>
   }
 
+  if (bootstrapError) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <AlertTriangle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load investigations</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{bootstrapError}</p>
+          <button
+            type="button"
+            onClick={() => void loadBootstrap()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="h-full flex flex-col bg-white dark:bg-[#0f1b2d]">
+    <div className="min-h-full lg:h-full flex flex-col bg-white dark:bg-[#0f1b2d]">
       {/* Header */}
-      <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+      <div className="px-3 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
         <div className="flex items-center gap-3">
           <Search className="w-5 h-5 text-[#0972d3]" />
           <div>
@@ -402,7 +588,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
       </div>
 
       {/* Toolbar: time window + account scope + seed for drill-down (PR 2). */}
-      <InvestigateToolbar onChange={setToolbar} clearSignal={clearSignal} setSeedSignal={setSeedSignal} />
+      <InvestigateToolbar onChange={handleToolbarChange} clearSignal={clearSignal} setSeedSignal={setSeedSignal} />
 
       {/* Active filters strip — visible summary of what scenarios will run
           against. Each chip has an X to clear that one filter. Empty when
@@ -422,10 +608,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           not auto-dismiss), since prior auto-clear flashed away before users
           could read it; user dismisses via X or by clearing the seed. */}
       {pivotToast && (
-        <div role="status" aria-live="polite" className="px-6 py-2 bg-blue-600 dark:bg-blue-700 text-white text-[12px] flex items-center gap-2">
+        <div role="status" aria-live="polite" className="px-3 sm:px-6 py-2 bg-blue-600 dark:bg-blue-700 text-white text-[12px] flex flex-wrap items-center gap-2">
           <span className="font-medium">{t('security.investigate.pivotToast.title')}</span>
           <span className="opacity-90 truncate">{pivotToast}</span>
-          <span className="ml-auto text-[11px] opacity-90">
+          <span className="sm:ml-auto text-[11px] opacity-90">
             {recommendations.length > 0
               ? t('security.investigate.pivotToast.hint', { count: recommendations.length })
               : t('security.investigate.pivotToast.noMatchHint')}
@@ -449,7 +635,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           Closes the "click Use as seed → nothing happens" dead end that the
           user reported. */}
       {showSeedCallout && (
-        <div ref={recommendationsRef} className="px-6 py-3 border-b border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-900/10">
+        <div ref={recommendationsRef} className="px-3 sm:px-6 py-3 border-b border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-900/10">
           {recommendations.length > 0 ? (
             <>
               <div className="mb-2">
@@ -498,10 +684,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                       <button
                         key={typeId}
                         type="button"
-                        onClick={() => setSetSeedSignal(s => ({ seq: s.seq + 1, value: toolbar.seed, type: typeId as SeedType }))}
+                        onClick={() => setSetSeedSignal(s => ({ seq: s.seq + 1, value: toolbar.seed, type: typeId }))}
                         className="inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 hover:bg-amber-100 dark:hover:bg-amber-900/30"
                       >
-                        {seedTypeLabel(typeId as SeedType)}
+                        {seedTypeLabel(typeId)}
                       </button>
                     ))}
                   </>
@@ -519,14 +705,15 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
         </div>
       )}
 
-      <div className="flex flex-1 min-h-0">
+      <div className="flex flex-col lg:flex-row lg:flex-1 lg:min-h-0">
         {/* Left: Scenario list */}
-        <div className="w-80 flex-shrink-0 border-r border-gray-200 dark:border-gray-700 flex flex-col bg-gray-50 dark:bg-gray-900">
+        <div className="w-full h-80 lg:h-auto lg:w-80 flex-shrink-0 border-b lg:border-b-0 lg:border-r border-gray-200 dark:border-gray-700 flex flex-col bg-gray-50 dark:bg-gray-900">
           {/* Category filter */}
           <div className="p-3 border-b border-gray-200 dark:border-gray-700">
             <select
               value={selectedCategory}
               onChange={e => setSelectedCategory(e.target.value)}
+              aria-label={t('security.investigate.categoryFilter', { defaultValue: 'Filter scenarios by category' })}
               className="w-full px-2 py-1.5 text-xs rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
             >
               {categories.map(c => (
@@ -543,6 +730,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                 <button
                   key={s.id}
                   onClick={() => {
+                    invalidateScenarioRun()
                     setSelectedScenario(s)
                     // If the user had a seed and this scenario takes the matching
                     // type, auto-fill the param so they can run with one click.
@@ -551,7 +739,6 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                     } else {
                       setParamValue('')
                     }
-                    setResult(null)
                   }}
                   className={`w-full text-left px-4 py-3 border-b border-gray-100 dark:border-gray-800 border-l-3 transition-colors ${
                     selectedScenario?.id === s.id
@@ -583,7 +770,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
         </div>
 
         {/* Right: Parameter input + Results */}
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="min-h-[24rem] flex-1 flex flex-col min-w-0">
           {!selectedScenario ? (
             <div className="flex items-center justify-center h-full text-center">
               <div>
@@ -595,7 +782,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           ) : (
             <>
               {/* Scenario header + param input */}
-              <div className="px-5 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
+              <div className="px-3 sm:px-5 py-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900">
                 <div className="flex items-center gap-2 mb-2">
                   <h3 className="text-sm font-semibold text-gray-900 dark:text-white">{selectedScenario.name}</h3>
                   <span className={`px-1.5 py-0.5 text-[10px] font-bold uppercase rounded ${SEVERITY_BADGE[selectedScenario.severity]}`}>{selectedScenario.severity}</span>
@@ -606,12 +793,18 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                 {/* Parameter input */}
                 {selectedScenario.param_type !== 'none' && (
                   <div className="mb-3">
-                    <label className="block text-[11px] font-medium text-gray-600 dark:text-gray-400 mb-1">{selectedScenario.param_label}</label>
+                    <label
+                      htmlFor={`scenario-param-${selectedScenario.id}`}
+                      className="block text-[11px] font-medium text-gray-600 dark:text-gray-400 mb-1"
+                    >
+                      {selectedScenario.param_label}
+                    </label>
                     <div className="flex gap-2">
                       <div className="relative flex-1">
                         <select
                           value={paramValue}
-                          onChange={e => setParamValue(e.target.value)}
+                          onChange={e => updateParamValue(e.target.value)}
+                          aria-label={`${selectedScenario.param_label} options`}
                           className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white appearance-none pr-8 focus:ring-2 focus:ring-blue-500 focus:outline-none"
                         >
                           <option value="">{t('security.investigate.selectOrType')}</option>
@@ -624,9 +817,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                       </div>
                     </div>
                     <input
+                      id={`scenario-param-${selectedScenario.id}`}
                       type="text"
                       value={paramValue}
-                      onChange={e => setParamValue(e.target.value)}
+                      onChange={e => updateParamValue(e.target.value)}
                       onKeyDown={e => {
                         if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !running && paramValue) {
                           e.preventDefault()
@@ -672,7 +866,10 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                   <div className="p-4">
                     <div className="flex items-center justify-between mb-2 gap-2">
                       <span className="text-[11px] text-gray-500">
-                        {t('security.investigate.resultCount', { count: result.rows?.length || 0 })}
+                        {t('security.investigate.resultCount', {
+                          shown: resultCounts.returnedRows,
+                          total: resultCounts.totalRows,
+                        })}
                       </span>
                       <button
                         type="button"
@@ -688,10 +885,13 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
                         {isLargeResult ? t('security.investigate.summarizeRecommended') : t('security.investigate.summarize')}
                       </button>
                     </div>
-                    {isLargeResult && (
+                    {resultCounts.truncated && (
                       <div className="mb-2 p-2 rounded border border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-900/10">
                         <div className="text-[11px] text-amber-900 dark:text-amber-200">
-                          {t('security.investigate.largeResult', { count: result.rows?.length || 0 })}
+                          {t('security.investigate.largeResult', {
+                            shown: resultCounts.returnedRows,
+                            total: resultCounts.totalRows,
+                          })}
                         </div>
                       </div>
                     )}
@@ -884,6 +1084,7 @@ export function InvestigateView({ navContext }: InvestigateViewProps = {}) {
           scenarioDescription={selectedScenario?.description}
           columns={result?.columns ?? null}
           rows={(result?.rows ?? null) as unknown[][] | null}
+          totalRows={resultCounts.totalRows}
           recommended={isLargeResult}
           onPivot={pivotToSeed}
         />

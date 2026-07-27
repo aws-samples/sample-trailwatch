@@ -2,6 +2,7 @@ package sessions
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -21,6 +22,12 @@ func NewHandler(db *sql.DB, cfg *config.Config) *Handler {
 	return &Handler{
 		service: NewService(db, cfg),
 	}
+}
+
+// DataDeleteLease registers the derived-data lease held while raw session data
+// and metadata are removed.
+func (h *Handler) DataDeleteLease(fn func() (func(), error)) {
+	h.service.SetDataDeleteLease(fn)
 }
 
 // Routes returns a Chi router with all session routes mounted.
@@ -128,7 +135,16 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		// The raw error can carry the local filesystem path of the session's
 		// downloaded files. Log it server-side; return a generic message.
 		slog.Warn("delete session failed", "component", "cloudtrail-analyzer", "session_id", id, "error", err.Error())
-		render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found or could not be deleted", nil)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found", nil)
+		case errors.Is(err, ErrSessionActive):
+			render.Error(w, http.StatusConflict, "SESSION_ACTIVE", "Cancel the active sync before deleting this session", nil)
+		case errors.Is(err, ErrUnsafeSessionPath):
+			render.Error(w, http.StatusBadRequest, "UNSAFE_SESSION_PATH", "Session metadata contains an unsafe data path", nil)
+		default:
+			render.Error(w, http.StatusConflict, "DELETE_FAILED", "Session data could not be deleted safely", nil)
+		}
 		return
 	}
 

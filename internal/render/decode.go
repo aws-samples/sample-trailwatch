@@ -28,16 +28,13 @@ func IsValidUUID(s string) bool {
 // unknown fields and trailing junk. On failure it writes a 400 response and
 // returns false so the caller can `if !DecodeStrictJSON(...) { return }`.
 func DecodeStrictJSON(w http.ResponseWriter, r *http.Request, out interface{}) bool {
-	// Reject non-JSON Content-Type so a stray form post can't be interpreted
-	// as JSON. An empty Content-Type is allowed for compatibility with bodyless
-	// or legacy callers — but anything declared must be application/json.
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		mediaType, _, err := mime.ParseMediaType(ct)
-		if err != nil || mediaType != "application/json" {
-			Error(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE",
-				"Content-Type must be application/json", nil)
-			return false
-		}
+	// Requiring JSON forces browser callers through a CORS preflight and avoids
+	// treating cross-origin "simple" request bodies as API commands.
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		Error(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE",
+			"Content-Type must be application/json", nil)
+		return false
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
@@ -48,8 +45,9 @@ func DecodeStrictJSON(w http.ResponseWriter, r *http.Request, out interface{}) b
 		Error(w, http.StatusBadRequest, "VALIDATION_ERROR", decodeErrorMessage(err), nil)
 		return false
 	}
-	// Reject extra JSON tokens after the first value (e.g. two objects concatenated).
-	if dec.More() {
+	// Reject extra JSON values after the first one while allowing whitespace.
+	var trailing interface{}
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "request body must contain a single JSON value", nil)
 		return false
 	}

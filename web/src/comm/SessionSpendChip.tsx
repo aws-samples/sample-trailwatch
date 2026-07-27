@@ -16,9 +16,9 @@ interface Snapshot {
 
 const POLL_MS = 5_000
 
-// SessionSpendChip is a tiny header indicator showing dollars accrued to the
-// LLM provider in the current process. Polled every 5s — cheap (returns a
-// small JSON struct) and keeps the value warm without the overhead of SSE.
+// SessionSpendChip is a tiny header indicator showing estimated LLM cost in
+// the current process. Polled every 5s — cheap (returns a small JSON struct)
+// and keeps the value warm without the overhead of SSE.
 //
 // Hidden when zero queries have been recorded so the header stays uncluttered
 // for users who do not use NLQ.
