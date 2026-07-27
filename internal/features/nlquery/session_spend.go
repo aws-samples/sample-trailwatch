@@ -5,7 +5,8 @@ import (
 	"time"
 )
 
-// SessionSpend tracks LLM dollars accrued in this process since startup.
+// SessionSpend tracks estimated LLM cost in this process since startup and,
+// when a provider exposes usage data, the separately measured actual cost.
 // Single-user POC; no per-user attribution, no persistence — counter resets
 // when the binary restarts. The point is to give the user a "where am I
 // today" awareness inside one session.
@@ -51,8 +52,8 @@ func (s *SessionSpend) Snapshot() SessionSpendSnapshot {
 	}
 }
 
-// Record adds one query's pre-flight estimate and post-run actual cost to
-// the tracker. Either side can be zero (e.g., when actual is unknown).
+// Record adds one query's pre-flight estimate and post-run actual cost to the
+// tracker. actualUSD is zero when the provider does not expose usage data.
 func (s *SessionSpend) Record(estimatedUSD, actualUSD float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

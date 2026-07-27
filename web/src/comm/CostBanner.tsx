@@ -121,7 +121,12 @@ export function CostBanner({ prompt, debounceMs = 350 }: Props) {
 //   <$0.01 → 4 decimals ($0.0042)
 //   <$1   → 3 decimals ($0.025)
 //   ≥$1   → 2 decimals ($1.23)
-function formatUSD(n: number): string {
+//
+// Guards against NaN/Infinity (e.g. an empty/partial estimate) so the banner
+// never renders "$NaN". Exported for reuse by the summary panel's
+// authoritative est_cost_usd display.
+export function formatUSD(n: number): string {
+  if (!Number.isFinite(n)) return '$0.00'
   if (n < 0.01) return `$${n.toFixed(4)}`
   if (n < 1) return `$${n.toFixed(3)}`
   return `$${n.toFixed(2)}`

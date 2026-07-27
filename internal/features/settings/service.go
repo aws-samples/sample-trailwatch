@@ -6,15 +6,17 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"cloudtrail-analyzer/internal/awsutil"
+	"cloudtrail-analyzer/internal/cloudtrailpath"
 	"cloudtrail-analyzer/internal/config"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -26,8 +28,9 @@ var orgIDPattern = regexp.MustCompile(`^o-[a-z0-9]+$`)
 // Service provides settings-related business logic including bucket validation,
 // credential resolution, and Control Tower account discovery.
 type Service struct {
-	cfg    *config.Config
-	saveFn func(*config.Config) error
+	cfg             *config.Config
+	saveFn          func(*config.Config) error
+	identityCheckFn func(context.Context, *config.Config) (*CallerIdentityResponse, error)
 }
 
 // NewService creates a new settings Service.
@@ -48,7 +51,11 @@ func (s *Service) LoadAWSConfig(ctx context.Context, region string) (aws.Config,
 
 // loadAWSConfig builds an AWS config using ONLY the selected auth method.
 func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
-	switch s.cfg.Auth.Method {
+	return loadAWSConfigFor(ctx, region, s.cfg)
+}
+
+func loadAWSConfigFor(ctx context.Context, region string, cfg *config.Config) (aws.Config, error) {
+	switch cfg.Auth.Method {
 	case "session_credentials":
 		// Session/STS tokens are kept in process env vars only (not in
 		// config.json), so read them from there. Mirrors the contract set in
@@ -64,20 +71,20 @@ func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config,
 	case "imds":
 		return awsconfig.LoadDefaultConfig(ctx,
 			awsconfig.WithRegion(region),
-			awsconfig.WithCredentialsProvider(ec2rolecreds.New()),
+			awsconfig.WithCredentialsProvider(awsutil.NewIMDSv2Provider()),
 		)
 	case "sso":
 		opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-		if s.cfg.Auth.SSOProfile != "" {
-			opts = append(opts, awsconfig.WithSharedConfigProfile(s.cfg.Auth.SSOProfile))
+		if cfg.Auth.SSOProfile != "" {
+			opts = append(opts, awsconfig.WithSharedConfigProfile(cfg.Auth.SSOProfile))
 		}
 		return awsconfig.LoadDefaultConfig(ctx, opts...)
 	case "static":
 		return awsconfig.LoadDefaultConfig(ctx,
 			awsconfig.WithRegion(region),
 			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				s.cfg.Auth.AccessKeyID,
-				s.cfg.Auth.SecretAccessKey,
+				cfg.Auth.AccessKeyID,
+				cfg.Auth.SecretAccessKey,
 				"",
 			)),
 		)
@@ -94,10 +101,12 @@ func (s *Service) loadAWSConfig(ctx context.Context, region string) (aws.Config,
 func (s *Service) ValidateBucket(ctx context.Context, bucket, region string) (*ValidationResult, error) {
 	awsCfg, err := s.loadAWSConfig(ctx, region)
 	if err != nil {
+		slog.Error("failed to load AWS config for bucket validation",
+			"component", "cloudtrail-analyzer", "region", region, "error", err.Error())
 		return &ValidationResult{
 			Valid:   false,
 			Message: "Failed to load AWS configuration",
-			Error:   err.Error(),
+			Error:   "Check credentials and region configuration",
 		}, nil
 	}
 
@@ -106,10 +115,12 @@ func (s *Service) ValidateBucket(ctx context.Context, bucket, region string) (*V
 		Bucket: aws.String(bucket),
 	})
 	if err != nil {
+		slog.Warn("bucket validation failed",
+			"component", "cloudtrail-analyzer", "bucket", bucket, "region", region, "error", err.Error())
 		return &ValidationResult{
 			Valid:   false,
 			Message: fmt.Sprintf("Bucket %q in region %q is not accessible", bucket, region),
-			Error:   err.Error(),
+			Error:   classifyAWSError(err),
 		}, nil
 	}
 
@@ -125,16 +136,28 @@ func (s *Service) ValidateBucket(ctx context.Context, bucket, region string) (*V
 
 // GetCallerIdentity calls STS GetCallerIdentity using the active credentials.
 func (s *Service) GetCallerIdentity(ctx context.Context) (*CallerIdentityResponse, error) {
-	region := s.cfg.S3.Region
+	return s.getCallerIdentity(ctx, s.cfg)
+}
+
+func (s *Service) getCallerIdentity(ctx context.Context, cfg *config.Config) (*CallerIdentityResponse, error) {
+	if s.identityCheckFn != nil {
+		return s.identityCheckFn(ctx, cfg)
+	}
+
+	region := cfg.S3.Region
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	awsCfg, err := s.loadAWSConfig(ctx, region)
+	awsCfg, err := loadAWSConfigFor(ctx, region, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
 
+	return getCallerIdentityWithAWSConfig(ctx, awsCfg)
+}
+
+func getCallerIdentityWithAWSConfig(ctx context.Context, awsCfg aws.Config) (*CallerIdentityResponse, error) {
 	client := sts.NewFromConfig(awsCfg)
 	output, err := client.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
@@ -148,14 +171,36 @@ func (s *Service) GetCallerIdentity(ctx context.Context) (*CallerIdentityRespons
 	}, nil
 }
 
+// ValidateSessionCredentials checks supplied temporary credentials against STS
+// without publishing them to the process environment.
+func (s *Service) ValidateSessionCredentials(
+	ctx context.Context,
+	accessKeyID, secretAccessKey, sessionToken string,
+) (*CallerIdentityResponse, error) {
+	region := s.cfg.S3.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			accessKeyID,
+			secretAccessKey,
+			sessionToken,
+		)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("loading AWS config: %w", err)
+	}
+	return getCallerIdentityWithAWSConfig(ctx, awsCfg)
+}
+
 // ---------------------------------------------------------------------------
-// Control Tower Account Discovery
+// Organization Account Discovery
 // ---------------------------------------------------------------------------
 
-// ListControlTowerAccounts discovers member accounts by listing S3 prefixes.
-//
-// Control Tower path: {org_id}/AWSLogs/{account_id}/...
-// Single account path: AWSLogs/{account_id}/...
+// ListControlTowerAccounts discovers member accounts across supported
+// Organizations and Control Tower prefix layouts.
 func (s *Service) ListControlTowerAccounts(ctx context.Context, bucket, region string) ([]string, error) {
 	awsCfg, err := s.loadAWSConfig(ctx, region)
 	if err != nil {
@@ -164,40 +209,16 @@ func (s *Service) ListControlTowerAccounts(ctx context.Context, bucket, region s
 
 	client := s3.NewFromConfig(awsCfg)
 
-	// Control Tower: org_id is at bucket root, BEFORE AWSLogs/
-	var prefix string
-	if s.cfg.S3.OrgID != "" {
-		prefix = fmt.Sprintf("%s/AWSLogs/%s/", s.cfg.S3.OrgID, s.cfg.S3.OrgID)
-	} else {
-		prefix = "AWSLogs/"
-	}
-
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(100),
-	})
+	prefixes := cloudtrailpath.AccountDiscoveryPrefixes(s.cfg.S3.OrgID)
+	accounts, err := s.listAccountsAtFirstPopulatedPrefix(ctx, client, bucket, prefixes)
 	if err != nil {
-		return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
-	}
-
-	var accounts []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
-			continue
-		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
-			accounts = append(accounts, parts[0])
-		}
+		return nil, err
 	}
 
 	slog.Info("discovered accounts",
 		"component", "cloudtrail-analyzer",
 		"bucket", bucket,
-		"prefix", prefix,
+		"prefixes", prefixes,
 		"count", len(accounts),
 	)
 
@@ -208,14 +229,18 @@ func (s *Service) ListControlTowerAccounts(ctx context.Context, bucket, region s
 // Bucket Structure Detection
 // ---------------------------------------------------------------------------
 
-// DetectBucketStructure lists the bucket root to determine if it uses a
-// single-account or Control Tower (multi-account) structure.
+// DetectBucketStructure determines whether the bucket contains a single
+// account, a standard AWS Organizations trail, or a Control Tower layout.
 //
-// Control Tower buckets have the org_id at the ROOT level (before AWSLogs/):
+// Supported multi-account layouts include both a root organization prefix:
 //
 //	{bucket}/o-hr33oy48b4/AWSLogs/{account_id}/CloudTrail/...
 //
-// Single account buckets have AWSLogs/ at the root:
+// and the standard AWS Organizations trail layout:
+//
+//	{bucket}/AWSLogs/o-hr33oy48b4/{account_id}/CloudTrail/...
+//
+// Single-account buckets have AWSLogs/ at the root:
 //
 //	{bucket}/AWSLogs/{account_id}/CloudTrail/...
 func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region string) (*BucketStructure, error) {
@@ -226,52 +251,59 @@ func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region stri
 
 	client := s3.NewFromConfig(awsCfg)
 
-	// List at bucket root with delimiter to see top-level prefixes
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(bucket),
-		Prefix:    aws.String(""),
-		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(20),
-	})
+	rootEntries, err := s.listChildNames(ctx, client, bucket, "")
 	if err != nil {
 		return nil, fmt.Errorf("listing bucket root: %w", err)
 	}
 
-	if len(output.CommonPrefixes) == 0 {
+	if len(rootEntries) == 0 {
 		return nil, fmt.Errorf("no prefixes found at bucket root in %q", bucket)
 	}
 
-	// Check the first CommonPrefix to determine structure
-	firstPrefix := aws.ToString(output.CommonPrefixes[0].Prefix)
-	firstEntry := strings.TrimSuffix(firstPrefix, "/")
+	var rootOrgIDs []string
+	hasAWSLogs := false
+	for _, entry := range rootEntries {
+		if strings.HasPrefix(entry, "o-") && orgIDPattern.MatchString(entry) {
+			rootOrgIDs = append(rootOrgIDs, entry)
+		}
+		if entry == "AWSLogs" {
+			hasAWSLogs = true
+		}
+	}
 
-	// Control Tower: root entry starts with "o-" (org ID)
-	if strings.HasPrefix(firstEntry, "o-") && orgIDPattern.MatchString(firstEntry) {
-		orgID := firstEntry
-
-		// List accounts at {org_id}/AWSLogs/{org_id}/
-		accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, fmt.Sprintf("%s/AWSLogs/%s/", orgID, orgID))
+	sort.Strings(rootOrgIDs)
+	for _, orgID := range rootOrgIDs {
+		accounts, err := s.listOrganizationAccounts(ctx, client, bucket, orgID)
 		if err != nil {
 			return nil, fmt.Errorf("listing accounts under org %s: %w", orgID, err)
 		}
-
-		slog.Info("detected Control Tower structure",
-			"component", "cloudtrail-analyzer",
-			"bucket", bucket,
-			"org_id", orgID,
-			"account_count", len(accounts),
-		)
-
-		return &BucketStructure{
-			Mode:     "control_tower",
-			OrgID:    orgID,
-			Accounts: accounts,
-			Message:  fmt.Sprintf("Control Tower structure detected (org: %s, %d member accounts)", orgID, len(accounts)),
-		}, nil
+		if len(accounts) > 0 {
+			return organizationBucketStructure(bucket, orgID, accounts, "Control Tower")
+		}
 	}
 
-	// Single account: root entry is "AWSLogs/"
-	if firstEntry == "AWSLogs" {
+	if hasAWSLogs {
+		children, err := s.listChildNames(ctx, client, bucket, "AWSLogs/")
+		if err != nil {
+			return nil, fmt.Errorf("listing prefixes under AWSLogs/: %w", err)
+		}
+		var nestedOrgIDs []string
+		for _, child := range children {
+			if orgIDPattern.MatchString(child) {
+				nestedOrgIDs = append(nestedOrgIDs, child)
+			}
+		}
+		sort.Strings(nestedOrgIDs)
+		for _, orgID := range nestedOrgIDs {
+			accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, fmt.Sprintf("AWSLogs/%s/", orgID))
+			if err != nil {
+				return nil, fmt.Errorf("listing organization accounts under AWSLogs/%s/: %w", orgID, err)
+			}
+			if len(accounts) > 0 {
+				return organizationBucketStructure(bucket, orgID, accounts, "AWS Organizations trail")
+			}
+		}
+
 		accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, "AWSLogs/")
 		if err != nil {
 			return nil, fmt.Errorf("listing accounts under AWSLogs/: %w", err)
@@ -291,30 +323,116 @@ func (s *Service) DetectBucketStructure(ctx context.Context, bucket, region stri
 		}, nil
 	}
 
-	return nil, fmt.Errorf("unrecognized bucket structure — root entry is %q (expected org ID starting with o- or AWSLogs/)", firstEntry)
+	return nil, fmt.Errorf("unrecognized bucket structure — root entries are %q (expected an org ID starting with o- or an AWSLogs/ prefix)", rootEntries)
 }
 
-// listAccountsAtPrefix lists 12-digit account IDs under a given S3 prefix.
-func (s *Service) listAccountsAtPrefix(ctx context.Context, client *s3.Client, bucket, prefix string) ([]string, error) {
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+func organizationBucketStructure(bucket, orgID string, accounts []string, layout string) (*BucketStructure, error) {
+	slog.Info("detected multi-account CloudTrail structure",
+		"component", "cloudtrail-analyzer",
+		"bucket", bucket,
+		"layout", layout,
+		"org_id", orgID,
+		"account_count", len(accounts),
+	)
+	return &BucketStructure{
+		Mode:     "control_tower",
+		OrgID:    orgID,
+		Accounts: accounts,
+		Message:  fmt.Sprintf("%s structure detected (org: %s, %d member accounts)", layout, orgID, len(accounts)),
+	}, nil
+}
+
+func (s *Service) listOrganizationAccounts(
+	ctx context.Context,
+	client s3.ListObjectsV2APIClient,
+	bucket, orgID string,
+) ([]string, error) {
+	return s.listAccountsAtFirstPopulatedPrefix(
+		ctx,
+		client,
+		bucket,
+		cloudtrailpath.AccountDiscoveryPrefixes(orgID),
+	)
+}
+
+func (s *Service) listAccountsAtFirstPopulatedPrefix(
+	ctx context.Context,
+	client s3.ListObjectsV2APIClient,
+	bucket string,
+	prefixes []string,
+) ([]string, error) {
+	var firstErr error
+	listedCandidate := false
+	for _, prefix := range prefixes {
+		accounts, err := s.listAccountsAtPrefix(ctx, client, bucket, prefix)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		listedCandidate = true
+		if len(accounts) == 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(accounts))
+		for _, account := range accounts {
+			seen[account] = struct{}{}
+		}
+		return sortedKeys(seen), nil
+	}
+	if !listedCandidate && firstErr != nil {
+		return nil, firstErr
+	}
+	return []string{}, nil
+}
+
+func (s *Service) listChildNames(ctx context.Context, client s3.ListObjectsV2APIClient, bucket, prefix string) ([]string, error) {
+	var names []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(100),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
-	}
-
-	var accounts []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
-			continue
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
 		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
-			accounts = append(accounts, parts[0])
+		for _, cp := range page.CommonPrefixes {
+			trimmed := strings.TrimPrefix(aws.ToString(cp.Prefix), prefix)
+			if name := strings.TrimSuffix(trimmed, "/"); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names, nil
+}
+
+// listAccountsAtPrefix lists 12-digit account IDs under a given S3 prefix.
+func (s *Service) listAccountsAtPrefix(ctx context.Context, client s3.ListObjectsV2APIClient, bucket, prefix string) ([]string, error) {
+	// Follow the continuation token so orgs with many member accounts are not
+	// silently truncated to the first page of results.
+	var accounts []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing S3 prefixes at %s: %w", prefix, err)
+		}
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
+			parts := strings.Split(trimmed, "/")
+			if len(parts) > 0 && len(parts[0]) == 12 && isNumeric(parts[0]) {
+				accounts = append(accounts, parts[0])
+			}
 		}
 	}
 
@@ -327,7 +445,7 @@ func (s *Service) listAccountsAtPrefix(ctx context.Context, client *s3.Client, b
 
 // DiscoverRegions lists available CloudTrail regions for a given account.
 //
-// Control Tower: {orgID}/AWSLogs/{accountID}/CloudTrail/
+// Multi-account: one of the supported organization account prefixes.
 // Single:        AWSLogs/{accountID}/CloudTrail/
 func (s *Service) DiscoverRegions(ctx context.Context, bucket, region, accountID, orgID string) (*DiscoverRegionsResponse, error) {
 	awsCfg, err := s.loadAWSConfig(ctx, region)
@@ -337,45 +455,49 @@ func (s *Service) DiscoverRegions(ctx context.Context, bucket, region, accountID
 
 	client := s3.NewFromConfig(awsCfg)
 
-	var prefix string
+	// Page through all region prefixes; an account with CloudTrail enabled in
+	// many regions can return more than one page of CommonPrefixes.
+	mode := "single"
 	if orgID != "" {
-		prefix = fmt.Sprintf("%s/AWSLogs/%s/%s/CloudTrail/", orgID, orgID, accountID)
-	} else {
-		prefix = fmt.Sprintf("AWSLogs/%s/CloudTrail/", accountID)
+		mode = cloudtrailpath.MultiAccountMode
 	}
-
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int32(50),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listing regions at %s: %w", prefix, err)
-	}
-
-	var regions []string
-	for _, cp := range output.CommonPrefixes {
-		if cp.Prefix == nil {
+	var firstErr error
+	listedCandidate := false
+	for _, prefix := range cloudtrailpath.CloudTrailPrefixes(mode, orgID, accountID) {
+		regions, err := s.listChildNames(ctx, client, bucket, prefix)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("listing regions at %s: %w", prefix, err)
+			}
 			continue
 		}
-		trimmed := strings.TrimPrefix(*cp.Prefix, prefix)
-		parts := strings.Split(trimmed, "/")
-		if len(parts) > 0 && parts[0] != "" {
-			regions = append(regions, parts[0])
+		listedCandidate = true
+		if len(regions) == 0 {
+			continue
 		}
+		seen := make(map[string]struct{}, len(regions))
+		for _, region := range regions {
+			seen[region] = struct{}{}
+		}
+		regions = sortedKeys(seen)
+		slog.Info("discovered CloudTrail regions",
+			"component", "cloudtrail-analyzer",
+			"bucket", bucket,
+			"account_id", accountID,
+			"region_count", len(regions),
+		)
+		return &DiscoverRegionsResponse{
+			Regions: regions,
+			Message: fmt.Sprintf("Found %d regions with CloudTrail logs", len(regions)),
+		}, nil
+	}
+	if !listedCandidate && firstErr != nil {
+		return nil, firstErr
 	}
 
-	slog.Info("discovered CloudTrail regions",
-		"component", "cloudtrail-analyzer",
-		"bucket", bucket,
-		"account_id", accountID,
-		"region_count", len(regions),
-	)
-
 	return &DiscoverRegionsResponse{
-		Regions: regions,
-		Message: fmt.Sprintf("Found %d regions with CloudTrail logs", len(regions)),
+		Regions: []string{},
+		Message: "Found 0 regions with CloudTrail logs",
 	}, nil
 }
 
@@ -398,26 +520,32 @@ func (s *Service) VerifyLogs(ctx context.Context, req *VerifyLogsRequest) (*Veri
 		return nil, fmt.Errorf("invalid start_date: %w", err)
 	}
 
-	// Build path for sample date
-	dateStr := sampleDate.Format("2006/01/02")
-	var prefix string
+	mode := "single"
 	if req.OrgID != "" {
-		prefix = fmt.Sprintf("%s/AWSLogs/%s/%s/CloudTrail/%s/%s/",
-			req.OrgID, req.OrgID, req.AccountID, req.LogRegion, dateStr)
-	} else {
-		prefix = fmt.Sprintf("AWSLogs/%s/CloudTrail/%s/%s/",
-			req.AccountID, req.LogRegion, dateStr)
+		mode = cloudtrailpath.MultiAccountMode
 	}
-
-	output, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(req.Bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listing objects at %s: %w", prefix, err)
+	fileCount := 0
+	sampleKey := ""
+	var firstErr error
+	listedCandidate := false
+	for _, prefix := range cloudtrailpath.DatePrefixes(mode, req.OrgID, req.AccountID, req.LogRegion, sampleDate) {
+		count, key, err := findCloudTrailLogObjects(ctx, client, req.Bucket, prefix)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("listing objects at %s: %w", prefix, err)
+			}
+			continue
+		}
+		listedCandidate = true
+		if count > 0 {
+			fileCount = count
+			sampleKey = key
+			break
+		}
 	}
-
-	fileCount := len(output.Contents)
+	if !listedCandidate && firstErr != nil {
+		return nil, firstErr
+	}
 
 	if fileCount == 0 {
 		return &VerifyLogsResponse{
@@ -428,12 +556,99 @@ func (s *Service) VerifyLogs(ctx context.Context, req *VerifyLogsRequest) (*Veri
 		}, nil
 	}
 
+	// Listing proves the prefix exists, but not that the caller can decrypt an
+	// SSE-KMS object. Read one byte so setup fails before a sync is started.
+	output, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(req.Bucket),
+		Key:    aws.String(sampleKey),
+		Range:  aws.String("bytes=0-0"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"sample log is not readable; credentials need s3:GetObject and, for SSE-KMS logs, kms:Decrypt: %w",
+			err,
+		)
+	}
+	if output.Body != nil {
+		_ = output.Body.Close()
+	}
+
 	return &VerifyLogsResponse{
 		Found:      true,
 		FileCount:  fileCount,
 		SampleDate: req.StartDate,
-		Message:    fmt.Sprintf("Found %d log files for %s in %s on %s", fileCount, req.AccountID, req.LogRegion, req.StartDate),
+		Message:    fmt.Sprintf("Found and confirmed read access to %d log files for %s in %s on %s", fileCount, req.AccountID, req.LogRegion, req.StartDate),
 	}, nil
+}
+
+func findCloudTrailLogObjects(
+	ctx context.Context,
+	client s3.ListObjectsV2APIClient,
+	bucket, prefix string,
+) (int, string, error) {
+	count := 0
+	sampleKey := ""
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return 0, "", err
+		}
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			if !strings.HasSuffix(key, ".json.gz") {
+				continue
+			}
+			if sampleKey == "" {
+				sampleKey = key
+			}
+			count++
+		}
+	}
+	return count, sampleKey, nil
+}
+
+func verifyLogsFailureMessage(err error) string {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "kms:decrypt"),
+		strings.Contains(message, "kms accessdenied"),
+		strings.Contains(message, "kms access denied"):
+		return "A log was found but cannot be decrypted. Grant kms:Decrypt on the bucket's KMS key."
+	case strings.Contains(message, "s3:getobject"):
+		return "A log was found but cannot be read. Grant s3:GetObject on the selected log prefix."
+	case strings.Contains(message, "listing objects"),
+		strings.Contains(message, "listobjectsv2"):
+		return "Log objects could not be listed. Grant s3:ListBucket for the selected log prefix."
+	default:
+		return "Unable to verify sample log access. Check S3 and KMS permissions in the server log."
+	}
+}
+
+// classifyAWSError maps an AWS SDK error to a client-safe description.
+// Used in ValidationResult.Error fields that are returned in HTTP 200 bodies.
+func classifyAWSError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "accessdenied"), strings.Contains(msg, "access denied"):
+		return "Access denied. Check IAM permissions and bucket policy."
+	case strings.Contains(msg, "nosuchbucket"):
+		return "Bucket does not exist or is not accessible."
+	case strings.Contains(msg, "expiredtoken"), strings.Contains(msg, "expired"):
+		return "Credentials have expired. Refresh in Settings."
+	case strings.Contains(msg, "throttl"), strings.Contains(msg, "rate exceeded"):
+		return "Request was throttled. Try again shortly."
+	case strings.Contains(msg, "no such host"), strings.Contains(msg, "connection refused"):
+		return "Could not reach AWS. Check network connectivity."
+	default:
+		return "An AWS error occurred. Check server logs for details."
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -463,10 +678,17 @@ func (s *Service) ResolveCredentials(ctx context.Context, cfg *config.Config) (*
 	}
 
 	if attempt.Success {
+		if _, err := s.getCallerIdentity(ctx, cfg); err != nil {
+			attempt.Success = false
+			attempt.Reason = fmt.Sprintf("Credentials resolved locally but STS rejected them: %s", err.Error())
+		}
+	}
+
+	if attempt.Success {
 		return &CredentialStatus{
 			Source:   cfg.Auth.Method,
 			Valid:    true,
-			Message:  fmt.Sprintf("Credentials active via %s", cfg.Auth.Method),
+			Message:  fmt.Sprintf("Credentials verified with STS via %s", cfg.Auth.Method),
 			Attempts: []CredentialAttempt{attempt},
 		}, nil
 	}
@@ -481,7 +703,7 @@ func (s *Service) ResolveCredentials(ctx context.Context, cfg *config.Config) (*
 
 // tryIMDS attempts to retrieve credentials from EC2 Instance Metadata Service v2.
 func (s *Service) tryIMDS(ctx context.Context) CredentialAttempt {
-	provider := ec2rolecreds.New()
+	provider := awsutil.NewIMDSv2Provider()
 	_, err := provider.Retrieve(ctx)
 	if err != nil {
 		return CredentialAttempt{
@@ -608,8 +830,10 @@ func (s *Service) tryStatic(ctx context.Context, cfg *config.Config) CredentialA
 // Bedrock Model Discovery
 // ---------------------------------------------------------------------------
 
-// ListBedrockModels returns text-generation models available in the given
-// region. Two AWS calls are merged:
+// ListBedrockModels returns Anthropic text-generation models available in the
+// given region. BedrockProvider sends Anthropic's native request schema, so
+// advertising models from other providers would create configurations that
+// cannot be invoked by this application. Two AWS calls are merged:
 //
 //  1. ListFoundationModels — direct on-demand-eligible models. These show
 //     in the picker without a CRIS badge.
@@ -638,11 +862,14 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 		return nil, fmt.Errorf("listing Bedrock models in %s: %w", region, err)
 	}
 
-	var models []BedrockModel
+	models := make([]BedrockModel, 0)
 	for _, m := range output.ModelSummaries {
 		modelID := aws.ToString(m.ModelId)
 		modelName := aws.ToString(m.ModelName)
 		providerName := aws.ToString(m.ProviderName)
+		if !supportsAnthropicNativeSchema(providerName) {
+			continue
+		}
 
 		// Only include text-generating models useful for SQL generation
 		hasTextOutput := false
@@ -699,13 +926,36 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 		seen[m.ModelID] = struct{}{}
 	}
 	profilesCount := 0
-	if profilesOut, perr := client.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{}); perr == nil {
+	// Page through the inference profiles: ListInferenceProfiles returns a
+	// NextToken when there are more profiles than fit in one response, so a CRIS
+	// model on page 2+ (e.g. Opus when an account has many profiles) would
+	// otherwise vanish from the picker. We follow the token until it is empty.
+	var nextToken *string
+	for {
+		profilesOut, perr := client.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+			NextToken: nextToken,
+		})
+		if perr != nil {
+			// Profiles call may fail with AccessDeniedException on tightly-scoped
+			// roles. Log once and continue with whatever foundation models we
+			// already collected — better to show a partial list than an error.
+			slog.Warn("list inference profiles failed; CRIS variants may be missing from picker",
+				"component", "cloudtrail-analyzer",
+				"region", region,
+				"error", perr.Error(),
+			)
+			break
+		}
 		for _, p := range profilesOut.InferenceProfileSummaries {
 			pid := aws.ToString(p.InferenceProfileId)
 			if pid == "" {
 				continue
 			}
 			if _, dup := seen[pid]; dup {
+				continue
+			}
+			providerName := providerFromProfileID(pid)
+			if !supportsAnthropicNativeSchema(providerName) {
 				continue
 			}
 			pname := aws.ToString(p.InferenceProfileName)
@@ -715,7 +965,7 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 			models = append(models, BedrockModel{
 				ModelID:     pid,
 				ModelName:   pname,
-				Provider:    providerFromProfileID(pid),
+				Provider:    providerName,
 				InputModes:  []string{"TEXT"},
 				OutputModes: []string{"TEXT"},
 				IsCRIS:      true,
@@ -724,15 +974,10 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 			seen[pid] = struct{}{}
 			profilesCount++
 		}
-	} else {
-		// Profiles call may fail with AccessDeniedException on tightly-scoped
-		// roles. Log once and continue with whatever foundation models we
-		// already collected — better to show a partial list than an error.
-		slog.Warn("list inference profiles failed; CRIS variants may be missing from picker",
-			"component", "cloudtrail-analyzer",
-			"region", region,
-			"error", perr.Error(),
-		)
+		if profilesOut.NextToken == nil || aws.ToString(profilesOut.NextToken) == "" {
+			break
+		}
+		nextToken = profilesOut.NextToken
 	}
 
 	slog.Info("listed Bedrock models",
@@ -747,6 +992,10 @@ func (s *Service) ListBedrockModels(ctx context.Context, region string) (*ListBe
 		Region: region,
 		Models: models,
 	}, nil
+}
+
+func supportsAnthropicNativeSchema(providerName string) bool {
+	return strings.EqualFold(strings.TrimSpace(providerName), "Anthropic")
 }
 
 // providerFromProfileID returns the model provider name guessed from the
@@ -804,16 +1053,15 @@ func ValidateDateRange(startDate, endDate string) error {
 
 // ConstructS3Prefix builds the CloudTrail S3 prefix for a given mode, org, account, region, and date.
 //
-// Control Tower: {orgID}/AWSLogs/{accountID}/CloudTrail/{region}/{YYYY}/{MM}/{DD}/
+// Multi-account: the first supported organization layout.
 // Single:        AWSLogs/{accountID}/CloudTrail/{region}/{YYYY}/{MM}/{DD}/
 func ConstructS3Prefix(mode, orgID, accountID, region string, date time.Time) string {
-	dateStr := date.Format("2006/01/02")
+	return ConstructS3Prefixes(mode, orgID, accountID, region, date)[0]
+}
 
-	if mode == "control_tower" && orgID != "" {
-		return fmt.Sprintf("%s/AWSLogs/%s/%s/CloudTrail/%s/%s/", orgID, orgID, accountID, region, dateStr)
-	}
-
-	return fmt.Sprintf("AWSLogs/%s/CloudTrail/%s/%s/", accountID, region, dateStr)
+// ConstructS3Prefixes returns all supported candidate prefixes for a date.
+func ConstructS3Prefixes(mode, orgID, accountID, region string, date time.Time) []string {
+	return cloudtrailpath.DatePrefixes(mode, orgID, accountID, region, date)
 }
 
 // isNumeric checks if a string contains only digits.
@@ -824,4 +1072,13 @@ func isNumeric(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+func sortedKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	sort.Strings(keys)
+	return keys
 }

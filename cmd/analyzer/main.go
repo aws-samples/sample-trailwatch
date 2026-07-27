@@ -82,6 +82,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Detect whether the SPA was actually built into the binary. The go:embed
+	// directive always matches the committed dist/.gitkeep, so a clean build that
+	// skipped `npm run build` produces a binary that silently serves an API-only
+	// placeholder with no build error. Surface that loudly: in a production build
+	// (make build / deploy.sh) this is a broken artifact; in dev mode (make dev /
+	// go run) it is expected because the Vite dev server serves the UI instead.
+	frontendEmbedded := FrontendEmbedded()
+	if !frontendEmbedded {
+		slog.Warn("no frontend assets embedded — serving API-only placeholder. "+
+			"This is expected in dev mode (use the Vite dev server at :5173). "+
+			"In a production build it means `npm run build` did not run before `go build`; "+
+			"rebuild via `make build` or deploy.sh so dist/index.html is embedded.",
+			"component", "cloudtrail-analyzer",
+			"frontend_embedded", false,
+		)
+	}
+
 	// Open SQLite database
 	db, err := database.NewDB(cfg.DataDir)
 	if err != nil {
@@ -96,13 +113,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Recover crashed sync sessions: any session left in an in-flight state
+	// (downloading/extracting/verifying) when the app last stopped cannot resume
+	// on its own and would otherwise be stuck forever. Mark them interrupted so
+	// the user can restart them from the UI. Non-fatal: a recovery failure should
+	// not block startup.
+	if interrupted, err := sessions.MarkInterrupted(db.Conn); err != nil {
+		slog.Warn("failed to recover interrupted sessions at startup",
+			"component", "cloudtrail-analyzer",
+			"error", err.Error(),
+		)
+	} else if interrupted > 0 {
+		slog.Info("marked in-flight sessions interrupted at startup",
+			"component", "cloudtrail-analyzer",
+			"count", interrupted,
+		)
+	}
+
 	// Record startup time for uptime calculation
 	startedAt := time.Now()
 
 	// Set up Chi router
 	r := chi.NewRouter()
 
-	// Apply middleware
+	// Apply middleware. TrustedHost runs first so a DNS-rebinding request is
+	// rejected before any handler (or even logging of a successful path) runs.
+	r.Use(middleware.TrustedHost(cfg))
 	r.Use(middleware.StructuredLogger)
 	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.CORS)
@@ -111,11 +147,19 @@ func main() {
 	// Register /api/health endpoint
 	r.Get("/api/health", func(w http.ResponseWriter, req *http.Request) {
 		uptime := time.Since(startedAt).Seconds()
+		checks := []map[string]string{
+			{"name": "Data directory", "status": startupStatus.DataDir.Status, "message": startupStatus.DataDir.Message},
+			{"name": "SQLite", "status": startupStatus.SQLite.Status, "message": startupStatus.SQLite.Message},
+			{"name": "AWS credentials", "status": startupStatus.Credentials.Status, "message": startupStatus.Credentials.Message},
+			{"name": "DuckDB CLI", "status": startupStatus.DuckDB.Status, "message": startupStatus.DuckDB.Message},
+		}
 		render.JSON(w, http.StatusOK, map[string]interface{}{
-			"status":  "ok",
-			"version": version,
-			"uptime":  fmt.Sprintf("%.0fs", uptime),
-			"startup": startupStatus,
+			"status":            "ok",
+			"version":           version,
+			"uptime":            fmt.Sprintf("%.0fs", uptime),
+			"startup":           startupStatus,
+			"checks":            checks,
+			"frontend_embedded": frontendEmbedded,
 		})
 	})
 
@@ -188,27 +232,35 @@ func main() {
 	// Register /api/nlquery routes (Bedrock-powered NL query execution)
 	nlqueryHandler := nlquery.NewHandler(cfg, db.Conn)
 	r.Mount("/api/nlquery", nlqueryHandler.Routes())
+	sessionsHandler.DataDeleteLease(nlqueryHandler.BeginIndexInvalidation)
 
 	// Wire streaming micro-batch indexing: index files as they are extracted
-	processorHandler.Service().OnFileExtracted = func(path string, size int64) {
-		nlqueryHandler.MicroBatch().AddFile(path, size)
+	processorHandler.Service().OnFileExtracted = func(ctx context.Context, path string, size int64) {
+		nlqueryHandler.MicroBatch().AddFile(ctx, path, size)
 	}
 
 	// Wire sync completion: flush remaining buffer and create B-tree indexes
-	processorHandler.Service().OnSyncComplete = func() {
-		nlqueryHandler.MicroBatch().Flush()
+	processorHandler.Service().OnSyncComplete = func(parent context.Context) {
+		if err := nlqueryHandler.MicroBatch().Flush(parent); err != nil {
+			slog.Error("final index flush failed on sync completion",
+				"component", "cloudtrail-analyzer",
+				"error", err.Error(),
+			)
+			return // Do not create secondary indexes if the flush failed
+		}
 		dbPath := nlqueryHandler.Indexer().IndexPath()
 		if !nlqueryHandler.Indexer().IsIndexed() {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 		defer cancel()
-		indexSQL := `
-			CREATE INDEX IF NOT EXISTS idx_event_name ON events ((r.eventName));
-			CREATE INDEX IF NOT EXISTS idx_event_source ON events ((r.eventSource));
-			CREATE INDEX IF NOT EXISTS idx_error_code ON events ((r.errorCode));
-		`
-		nlqueryHandler.Indexer().ExecDuckDB(ctx, dbPath, indexSQL)
+		if err := nlqueryHandler.Indexer().EnsureSecondaryIndexes(ctx); err != nil {
+			slog.Warn("post-sync DuckDB index creation failed",
+				"component", "cloudtrail-analyzer",
+				"db_path", dbPath,
+				"error", err.Error(),
+			)
+		}
 	}
 
 	// Register /api/dashboard routes (security analytics dashboard)
@@ -228,14 +280,10 @@ func main() {
 
 	// Serve embedded frontend assets in production, or fallback dev page.
 	// The frontendFS embed.FS is rooted at "dist/" inside cmd/analyzer/.
+	// frontendEmbedded (computed at startup via FrontendEmbedded) already
+	// confirmed whether dist/index.html is present in the embed.
 	frontendRoot, embErr := fs.Sub(frontendFS, "dist")
-	hasFrontend := embErr == nil
-	if hasFrontend {
-		// Check that index.html actually exists in the embed (build was run)
-		if _, err := fs.Stat(frontendRoot, "index.html"); err != nil {
-			hasFrontend = false
-		}
-	}
+	hasFrontend := frontendEmbedded && embErr == nil
 
 	if hasFrontend {
 		fileServer := http.FileServer(http.FS(frontendRoot))
@@ -264,7 +312,11 @@ func main() {
 			indexData, _ := fs.ReadFile(frontendRoot, "index.html")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			w.Write(indexData)
+			// indexData is the static, build-time-embedded React SPA shell
+			// (go:embed); it carries no user-controlled data, so html/template
+			// escaping does not apply. Matches the suppression convention used at
+			// the SSE write sites in nlquery/processor handlers.
+			w.Write(indexData) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 		})
 	} else {
 		// No embedded frontend — dev mode fallback
@@ -319,6 +371,23 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down", "component", "cloudtrail-analyzer")
+
+	// Cancel detached sync pipelines BEFORE server.Shutdown. This stops
+	// download/extract goroutines from writing mid-batch and marks their
+	// sessions interrupted (recoverable on the next start). It also closes each
+	// pipeline's progress channel, which unblocks any in-flight SSE progress
+	// handler — otherwise server.Shutdown would block on that handler for the
+	// full timeout below while it waited on a channel that never closed.
+	pipelineShutdownCtx, pipelineCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := processorHandler.Service().Shutdown(pipelineShutdownCtx); err != nil {
+		slog.Error("pipeline shutdown error", "error", err)
+	}
+	pipelineCancel()
+	indexShutdownCtx, indexCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := nlqueryHandler.Shutdown(indexShutdownCtx); err != nil {
+		slog.Error("index shutdown error", "error", err)
+	}
+	indexCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -2,6 +2,8 @@ package sessions
 
 import (
 	"database/sql"
+	"errors"
+	"log/slog"
 	"net/http"
 
 	"cloudtrail-analyzer/internal/config"
@@ -22,6 +24,12 @@ func NewHandler(db *sql.DB, cfg *config.Config) *Handler {
 	}
 }
 
+// DataDeleteLease registers the derived-data lease held while raw session data
+// and metadata are removed.
+func (h *Handler) DataDeleteLease(fn func() (func(), error)) {
+	h.service.SetDataDeleteLease(fn)
+}
+
 // Routes returns a Chi router with all session routes mounted.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
@@ -38,9 +46,10 @@ func (h *Handler) Routes() chi.Router {
 func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := h.service.ListSessions(r.Context())
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list sessions", map[string]string{
-			"reason": err.Error(),
-		})
+		// The raw error can carry DB-internal or filesystem detail. Log it
+		// server-side and return a generic message rather than echoing it.
+		slog.Error("list sessions failed", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to list sessions", nil)
 		return
 	}
 
@@ -103,9 +112,9 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 
 	session, err := h.service.GetSession(r.Context(), id)
 	if err != nil {
-		render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found", map[string]string{
-			"reason": err.Error(),
-		})
+		// Don't echo the raw lookup error (DB internals); log it server-side.
+		slog.Warn("get session failed", "component", "cloudtrail-analyzer", "session_id", id, "error", err.Error())
+		render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found", nil)
 		return
 	}
 
@@ -123,9 +132,19 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.service.DeleteSession(r.Context(), id); err != nil {
-		render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found or could not be deleted", map[string]string{
-			"reason": err.Error(),
-		})
+		// The raw error can carry the local filesystem path of the session's
+		// downloaded files. Log it server-side; return a generic message.
+		slog.Warn("delete session failed", "component", "cloudtrail-analyzer", "session_id", id, "error", err.Error())
+		switch {
+		case errors.Is(err, ErrNotFound):
+			render.Error(w, http.StatusNotFound, "NOT_FOUND", "Session not found", nil)
+		case errors.Is(err, ErrSessionActive):
+			render.Error(w, http.StatusConflict, "SESSION_ACTIVE", "Cancel the active sync before deleting this session", nil)
+		case errors.Is(err, ErrUnsafeSessionPath):
+			render.Error(w, http.StatusBadRequest, "UNSAFE_SESSION_PATH", "Session metadata contains an unsafe data path", nil)
+		default:
+			render.Error(w, http.StatusConflict, "DELETE_FAILED", "Session data could not be deleted safely", nil)
+		}
 		return
 	}
 

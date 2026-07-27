@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/kelseyhightower/envconfig"
@@ -16,13 +20,31 @@ const (
 	envPrefix         = ""
 )
 
+// DefaultBedrockModelID is the Anthropic CRIS profile used when no model is configured.
+const DefaultBedrockModelID = "us.anthropic.claude-sonnet-4-6"
+
 // Config holds all application configuration.
 type Config struct {
 	Port int `json:"port" envconfig:"PORT"`
 	// Host is the bind address. Defaults to 127.0.0.1 (loopback only) so a
 	// single-user local tool isn't reachable from the LAN. Set to "0.0.0.0"
 	// to expose the API on all interfaces.
-	Host                   string        `json:"host" envconfig:"HOST"`
+	Host string `json:"host" envconfig:"HOST"`
+	// TrustedHosts is the allowlist of Host header values the server accepts.
+	// It defends against DNS-rebinding: a website the user visits cannot make
+	// their browser send authenticated requests to the loopback server unless
+	// the Host header matches an entry here. localhost / 127.0.0.1 / [::1] (with
+	// or without the configured port) are always accepted; add extra hostnames
+	// here when fronting the app with an authenticating reverse proxy. Set a
+	// single entry "*" to disable the check (not recommended).
+	TrustedHosts []string `json:"trusted_hosts,omitempty" envconfig:"TRUSTED_HOSTS"`
+	// AllowAutoInstall gates the convenience auto-download of third-party
+	// binaries (DuckDB CLI, Ollama) by the running server. It defaults to
+	// false: the server will NOT fetch-and-execute installers on its own.
+	// When the binary is missing, startup reports an error with setup
+	// guidance instead. Set to true (or env CTA_ALLOW_AUTO_INSTALL=true) to
+	// opt back into the verified, checksum-pinned auto-install path.
+	AllowAutoInstall       bool          `json:"allow_auto_install,omitempty" envconfig:"CTA_ALLOW_AUTO_INSTALL"`
 	DataDir                string        `json:"data_dir" envconfig:"DATA_DIR"`
 	LogLevel               string        `json:"log_level" envconfig:"LOG_LEVEL"`
 	QueryTimeoutSeconds    int           `json:"query_timeout_seconds" envconfig:"QUERY_TIMEOUT_SECONDS"`
@@ -33,6 +55,146 @@ type Config struct {
 	Bedrock                BedrockConfig `json:"bedrock"`
 	LLM                    LLMConfig     `json:"llm"`
 }
+
+// TrustedHostAllowed reports whether the given Host header (which may include a
+// port) is permitted. Loopback names are always allowed; configured
+// TrustedHosts add to that set. A TrustedHosts entry of "*" disables the check.
+// This is the single source of truth used by the trusted-host middleware.
+func (c *Config) TrustedHostAllowed(hostHeader string) bool {
+	if hostHeader == "" {
+		// No Host header at all (HTTP/1.0 or a raw client). Reject — every
+		// real browser sends one, and an empty value can't be matched safely.
+		return false
+	}
+
+	// Split host:port if present. net.SplitHostPort fails on a bare host, so
+	// fall back to the raw value in that case.
+	host := hostHeader
+	if h, _, err := splitHostPort(hostHeader); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+
+	// Always-allowed loopback identities.
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+
+	for _, t := range c.TrustedHosts {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		if t == "*" {
+			return true
+		}
+		// Allow either a bare hostname or a host:port entry to match.
+		if th, _, err := splitHostPort(t); err == nil {
+			t = th
+		}
+		if t == host {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSafePathSegment reports whether v can be used as one filesystem path
+// segment. S3 configuration values flow into local download paths, so callers
+// must reject separators, traversal markers, and control characters before
+// joining them under DataDir.
+func IsSafePathSegment(v string) bool {
+	if v == "" || v == ".." || strings.HasPrefix(v, ".") || strings.Contains(v, "..") {
+		return false
+	}
+	for _, r := range v {
+		if r == '/' || r == '\\' || r == 0 || r < 0x20 {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateLLMEndpoint constrains custom provider endpoints to the transport
+// expected by each provider. Paid-provider API keys must never be sent over
+// plaintext HTTP; the local Ollama integration is intentionally loopback-only.
+func ValidateLLMEndpoint(provider, endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" {
+		return fmt.Errorf("llm.endpoint must be an absolute HTTP(S) URL")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("llm.endpoint must not contain URL credentials")
+	}
+
+	switch provider {
+	case "anthropic", "openai":
+		if parsed.Scheme != "https" {
+			return fmt.Errorf("llm.endpoint must use HTTPS for provider %s", provider)
+		}
+		if ip := net.ParseIP(parsed.Hostname()); ip != nil &&
+			(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+			return fmt.Errorf("llm.endpoint for provider %s must not use a private or local IP address", provider)
+		}
+	case "ollama":
+		host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("ollama endpoint must use localhost or a loopback IP address")
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("ollama endpoint must use HTTP or HTTPS")
+		}
+	case "bedrock":
+		// Bedrock ignores this field. Allow a stale value so switching providers
+		// does not make an otherwise valid existing config fail at startup.
+		return nil
+	default:
+		return fmt.Errorf("unsupported llm.provider %q", provider)
+	}
+	return nil
+}
+
+// splitHostPort is a thin wrapper that only treats a value as host:port when it
+// genuinely parses as one, so IPv6 literals and bare hostnames are handled
+// without pulling the net import into every caller.
+func splitHostPort(hostport string) (host, port string, err error) {
+	// Reuse strconv to detect a trailing :port cheaply for the common case,
+	// but defer to net.SplitHostPort semantics via a minimal reimplementation
+	// to correctly handle bracketed IPv6 ([::1]:7070).
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
+		if end < 0 {
+			return "", "", errNoPort
+		}
+		host = hostport[1:end]
+		rest := hostport[end+1:]
+		if strings.HasPrefix(rest, ":") {
+			port = rest[1:]
+		}
+		return host, port, nil
+	}
+	i := strings.LastIndexByte(hostport, ':')
+	if i < 0 {
+		return "", "", errNoPort
+	}
+	// Guard against unbracketed IPv6 (multiple colons) being misread.
+	if strings.IndexByte(hostport, ':') != i {
+		return "", "", errNoPort
+	}
+	host = hostport[:i]
+	port = hostport[i+1:]
+	if _, convErr := strconv.Atoi(port); convErr != nil {
+		return "", "", errNoPort
+	}
+	return host, port, nil
+}
+
+var errNoPort = errors.New("no port in host header")
 
 // S3Config holds S3 bucket configuration.
 type S3Config struct {
@@ -112,7 +274,7 @@ func DefaultConfig() Config {
 		},
 		Bedrock: BedrockConfig{
 			Region:  "us-east-1",
-			ModelID: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+			ModelID: DefaultBedrockModelID,
 			Enabled: false,
 		},
 		LLM: LLMConfig{
@@ -187,11 +349,37 @@ func SaveConfig(cfg *Config) error {
 		}
 	}
 
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
-		return fmt.Errorf("writing config file: %w", err)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary config file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("securing temporary config file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temporary config file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("syncing temporary config file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temporary config file: %w", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		return fmt.Errorf("replacing config file: %w", err)
 	}
 
 	return nil
+}
+
+// Validate checks a complete runtime configuration.
+func Validate(cfg *Config) error {
+	return validateConfig(cfg)
 }
 
 // validateConfig validates the configuration using struct tag validation.
@@ -230,6 +418,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.MaxDownloadConcurrency < 1 {
 		return fmt.Errorf("max_download_concurrency must be at least 1, got %d", cfg.MaxDownloadConcurrency)
 	}
+	if cfg.MaxDownloadConcurrency > 64 {
+		return fmt.Errorf("max_download_concurrency must be at most 64, got %d", cfg.MaxDownloadConcurrency)
+	}
 
 	// S3 mode validation
 	if cfg.S3.Mode != "" {
@@ -239,11 +430,43 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
+	// These values become path segments below DataDir. Validate config loaded
+	// from disk and environment as well as values accepted by the settings API,
+	// so an older or hand-edited config cannot bypass request-time validation.
+	pathFields := map[string]string{
+		"s3.bucket":     cfg.S3.Bucket,
+		"s3.account_id": cfg.S3.AccountID,
+		"s3.org_id":     cfg.S3.OrgID,
+		"s3.log_region": cfg.S3.LogRegion,
+	}
+	for field, value := range pathFields {
+		if value != "" && !IsSafePathSegment(value) {
+			return fmt.Errorf("%s contains characters not allowed in a path segment", field)
+		}
+	}
+	for _, accountID := range cfg.S3.MemberAccounts {
+		if accountID != "" && !IsSafePathSegment(accountID) {
+			return fmt.Errorf("s3.member_accounts contains a value not allowed in a path segment")
+		}
+	}
+
 	// Auth method validation
 	if cfg.Auth.Method != "" {
 		validMethods := map[string]bool{"imds": true, "session_credentials": true, "sso": true, "static": true}
 		if !validMethods[cfg.Auth.Method] {
 			return fmt.Errorf("auth.method must be one of: imds, session_credentials, sso, static; got %q", cfg.Auth.Method)
+		}
+	}
+
+	if cfg.LLM.Provider != "" {
+		validProviders := map[string]bool{"bedrock": true, "anthropic": true, "openai": true, "ollama": true}
+		if !validProviders[cfg.LLM.Provider] {
+			return fmt.Errorf("llm.provider must be one of: bedrock, anthropic, openai, ollama; got %q", cfg.LLM.Provider)
+		}
+		if cfg.LLM.Endpoint != "" {
+			if err := ValidateLLMEndpoint(cfg.LLM.Provider, cfg.LLM.Endpoint); err != nil {
+				return err
+			}
 		}
 	}
 

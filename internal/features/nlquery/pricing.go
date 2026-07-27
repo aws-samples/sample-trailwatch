@@ -33,18 +33,18 @@ type Rate struct {
 var defaultRates = map[string]Rate{
 	// --- Anthropic on Bedrock ---
 	// Opus tier: $15/M input, $75/M output across versions.
-	"anthropic.claude-opus-4-20250514-v1:0":     {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
-	"anthropic.claude-opus-4-6":                 {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
-	"anthropic.claude-opus-4-7":                 {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
-	"anthropic.claude-3-opus-20240229-v1:0":     {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
+	"anthropic.claude-opus-4-20250514-v1:0": {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
+	"anthropic.claude-opus-4-6":             {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
+	"anthropic.claude-opus-4-7":             {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
+	"anthropic.claude-3-opus-20240229-v1:0": {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},
 	// Sonnet tier: $3/M input, $15/M output.
 	"anthropic.claude-sonnet-4-20250514-v1:0":   {InputPerMillionUSD: 3.00, OutputPerMillionUSD: 15.00},
 	"anthropic.claude-sonnet-4-6":               {InputPerMillionUSD: 3.00, OutputPerMillionUSD: 15.00},
 	"anthropic.claude-3-5-sonnet-20241022-v2:0": {InputPerMillionUSD: 3.00, OutputPerMillionUSD: 15.00},
 	// Haiku tier: $1/M input, $5/M output (Claude 4 generation); 3.5 Haiku is cheaper.
-	"anthropic.claude-haiku-4-20250514-v1:0":    {InputPerMillionUSD: 1.00, OutputPerMillionUSD: 5.00},
-	"anthropic.claude-haiku-4-5-20251001":       {InputPerMillionUSD: 1.00, OutputPerMillionUSD: 5.00},
-	"anthropic.claude-3-5-haiku-20241022-v1:0":  {InputPerMillionUSD: 0.80, OutputPerMillionUSD: 4.00},
+	"anthropic.claude-haiku-4-20250514-v1:0":   {InputPerMillionUSD: 1.00, OutputPerMillionUSD: 5.00},
+	"anthropic.claude-haiku-4-5-20251001":      {InputPerMillionUSD: 1.00, OutputPerMillionUSD: 5.00},
+	"anthropic.claude-3-5-haiku-20241022-v1:0": {InputPerMillionUSD: 0.80, OutputPerMillionUSD: 4.00},
 
 	// --- Anthropic API (no Bedrock provider prefix) ---
 	"claude-opus-4":     {InputPerMillionUSD: 15.00, OutputPerMillionUSD: 75.00},

@@ -1,12 +1,43 @@
 // Table export helpers for result grids. CSV uses RFC 4180 quoting (double
-// any embedded quote, wrap fields containing commas/quotes/newlines).
-// JSON exports an array of {column: value} objects so the file is usable
-// directly in jq, spreadsheets, or SIEM ingest.
+// any embedded quote, wrap fields containing commas/quotes/newlines) and
+// neutralizes CSV/formula injection: attacker-influenced CloudTrail fields
+// (userAgent, ARNs, errorMessage) can begin with = + - @ TAB or CR, which
+// Excel/Sheets/LibreOffice interpret as formulas. Such string cells are
+// prefixed with a single quote (') before RFC-4180 quoting. JSON exports an
+// array of {column: value} objects so the file is usable directly in jq,
+// spreadsheets, or SIEM ingest.
 
 type Cell = string | number | boolean | null | undefined
 
+// Leading characters that a spreadsheet treats as the start of a formula.
+// TAB (0x09) and CR (0x0D) are included because some parsers strip leading
+// whitespace before evaluating the first significant character.
+const FORMULA_TRIGGERS = ['=', '+', '-', '@', '\t', '\r']
+
+// neutralizeFormula prefixes a single quote (') to any string that begins
+// with a formula trigger so spreadsheet apps render it as literal text
+// instead of evaluating it. Non-dangerous strings are returned unchanged.
+// Exported so a unit test can cover the neutralization in isolation.
+export function neutralizeFormula(s: string): string {
+  if (s.length > 0 && FORMULA_TRIGGERS.includes(s.charAt(0))) {
+    return `'${s}`
+  }
+  return s
+}
+
 function csvEscape(v: unknown): string {
-  const s = v === null || v === undefined ? '' : String(v)
+  if (v === null || v === undefined) return ''
+  // Only string cells carry attacker-influenced content; numbers/booleans are
+  // emitted verbatim and cannot start a formula. Neutralize before quoting so
+  // the leading ' is part of the quoted field.
+  if (typeof v === 'string') {
+    const s = neutralizeFormula(v)
+    if (/[",\r\n]/.test(s)) {
+      return `"${s.replace(/"/g, '""')}"`
+    }
+    return s
+  }
+  const s = String(v)
   if (/[",\r\n]/.test(s)) {
     return `"${s.replace(/"/g, '""')}"`
   }

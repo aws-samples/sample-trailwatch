@@ -2,9 +2,13 @@ package sessions
 
 import (
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrNotFound = errors.New("session not found")
 
 // Create inserts a new session into the database.
 func Create(db *sql.DB, session *Session) error {
@@ -101,6 +105,166 @@ func UpdateState(db *sql.DB, id string, state SessionState) error {
 	return nil
 }
 
+// ClaimForProcessing atomically transitions a resumable session to downloading
+// and returns its persisted configuration. A concurrent start or deletion can
+// win the state transition, but never both.
+func ClaimForProcessing(db *sql.DB, id string) (*Session, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("starting processing claim: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(
+		`UPDATE sessions SET state = ?, updated_at = ?
+		 WHERE id = ? AND state IN (?, ?)`,
+		StateDownloading, time.Now().UTC().Format(time.RFC3339), id,
+		StatePending, StateInterrupted,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claiming session for processing: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("checking processing claim: %w", err)
+	}
+	if rows != 1 {
+		session, getErr := scanSession(tx.QueryRow(`
+			SELECT id, bucket, account_id, org_id, region, log_region, mode,
+			       start_date, end_date, state, total_files, disk_usage_bytes,
+			       failed_files, created_at, updated_at
+			FROM sessions WHERE id = ?`, id))
+		if getErr != nil {
+			return nil, getErr
+		}
+		return nil, fmt.Errorf("session is in %q state, must be pending or interrupted", session.State)
+	}
+
+	session, err := scanSession(tx.QueryRow(`
+		SELECT id, bucket, account_id, org_id, region, log_region, mode,
+		       start_date, end_date, state, total_files, disk_usage_bytes,
+		       failed_files, created_at, updated_at
+		FROM sessions WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing processing claim: %w", err)
+	}
+	return session, nil
+}
+
+// MarkInterruptedIfActive records a cancellation without overwriting a terminal
+// state that may already have committed.
+func MarkInterruptedIfActive(db *sql.DB, id string) error {
+	_, err := db.Exec(
+		`UPDATE sessions SET state = ?, updated_at = ?
+		 WHERE id = ? AND state IN (?, ?, ?)`,
+		StateInterrupted, time.Now().UTC().Format(time.RFC3339), id,
+		StateDownloading, StateExtracting, StateVerifying,
+	)
+	if err != nil {
+		return fmt.Errorf("marking active session interrupted: %w", err)
+	}
+	return nil
+}
+
+// CompleteProcessing atomically publishes verification results and the final
+// state. It refuses to overwrite cancellation/deletion state.
+func CompleteProcessing(
+	db *sql.DB,
+	id string,
+	totalFiles int,
+	diskBytes int64,
+	failedFiles []string,
+	finalState SessionState,
+) error {
+	failedJSON, err := json.Marshal(failedFiles)
+	if err != nil {
+		return fmt.Errorf("encoding failed files: %w", err)
+	}
+	result, err := db.Exec(
+		`UPDATE sessions
+		 SET total_files = ?, disk_usage_bytes = ?, failed_files = ?,
+		     state = ?, updated_at = ?
+		 WHERE id = ? AND state = ?`,
+		totalFiles, diskBytes, string(failedJSON), finalState,
+		time.Now().UTC().Format(time.RFC3339), id, StateVerifying,
+	)
+	if err != nil {
+		return fmt.Errorf("completing session: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking session completion: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("session completion lost its verifying-state claim")
+	}
+	return nil
+}
+
+// ClaimForDeletion atomically marks a non-active session deleted and returns
+// both its metadata and prior state so callers can restore it after cleanup
+// failure.
+func ClaimForDeletion(db *sql.DB, id string) (*Session, SessionState, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, "", fmt.Errorf("starting deletion claim: %w", err)
+	}
+	defer tx.Rollback()
+
+	session, err := scanSession(tx.QueryRow(`
+		SELECT id, bucket, account_id, org_id, region, log_region, mode,
+		       start_date, end_date, state, total_files, disk_usage_bytes,
+		       failed_files, created_at, updated_at
+		FROM sessions WHERE id = ?`, id))
+	if err != nil {
+		return nil, "", err
+	}
+	switch session.State {
+	case StateDownloading, StateExtracting, StateVerifying:
+		return nil, "", ErrSessionActive
+	case StateDeleted:
+		return nil, "", fmt.Errorf("session deletion is already in progress")
+	}
+
+	priorState := session.State
+	result, err := tx.Exec(
+		`UPDATE sessions SET state = ?, updated_at = ?
+		 WHERE id = ? AND state = ?`,
+		StateDeleted, time.Now().UTC().Format(time.RFC3339), id, priorState,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("claiming session for deletion: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, "", fmt.Errorf("checking deletion claim: %w", err)
+	}
+	if rows != 1 {
+		return nil, "", fmt.Errorf("session state changed while claiming deletion")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "", fmt.Errorf("committing deletion claim: %w", err)
+	}
+	session.State = StateDeleted
+	return session, priorState, nil
+}
+
+// RestoreDeletionClaim makes a failed deletion retryable without overwriting a
+// later state transition.
+func RestoreDeletionClaim(db *sql.DB, id string, priorState SessionState) error {
+	_, err := db.Exec(
+		`UPDATE sessions SET state = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		priorState, time.Now().UTC().Format(time.RFC3339), id, StateDeleted,
+	)
+	if err != nil {
+		return fmt.Errorf("restoring deletion claim: %w", err)
+	}
+	return nil
+}
+
 // Delete removes a session from the database.
 func Delete(db *sql.DB, id string) error {
 	query := `DELETE FROM sessions WHERE id = ?`
@@ -118,20 +282,73 @@ func Delete(db *sql.DB, id string) error {
 	return nil
 }
 
-// MarkInterrupted marks all sessions in downloading or extracting state as interrupted.
-// This is called on startup to handle sessions that were in progress when the app stopped.
-func MarkInterrupted(db *sql.DB) error {
-	query := `UPDATE sessions SET state = ?, updated_at = ? WHERE state IN (?, ?)`
-	_, err := db.Exec(query,
+// MarkInterrupted marks all sessions left in an in-flight state as interrupted.
+// It is called on startup to recover sessions that were mid-pipeline when the
+// app stopped (crash, SIGTERM, or a shutdown that cancelled the pipeline). The
+// in-flight states are downloading, extracting, and verifying — the pipeline
+// transitions downloading -> verifying -> query-ready, so a crash during the
+// verify phase would otherwise leave the session stuck forever.
+func MarkInterrupted(db *sql.DB) (int64, error) {
+	query := `UPDATE sessions SET state = ?, updated_at = ? WHERE state IN (?, ?, ?)`
+	result, err := db.Exec(query,
 		StateInterrupted,
 		time.Now().UTC().Format(time.RFC3339),
 		StateDownloading,
 		StateExtracting,
+		StateVerifying,
 	)
 	if err != nil {
-		return fmt.Errorf("marking interrupted sessions: %w", err)
+		return 0, fmt.Errorf("marking interrupted sessions: %w", err)
 	}
-	return nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("checking rows affected: %w", err)
+	}
+	return rows, nil
+}
+
+// HasOverlappingSession reports whether another session owns any date in the
+// same bucket/account/region scope.
+func HasOverlappingSession(db *sql.DB, session *Session, excludeID string) (bool, error) {
+	var exists int
+	err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM sessions
+		WHERE id <> ?
+		  AND bucket = ? AND account_id = ? AND org_id = ?
+		  AND log_region = ? AND mode = ?
+		  AND start_date <= ? AND end_date >= ?
+	)`,
+		excludeID,
+		session.Bucket, session.AccountID, session.OrgID,
+		session.LogRegion, session.Mode,
+		session.EndDate, session.StartDate,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("checking overlapping sessions: %w", err)
+	}
+	return exists != 0, nil
+}
+
+// DateReferencedByOtherSession reports whether another session in the same
+// storage scope references a delivery-date partition.
+func DateReferencedByOtherSession(db *sql.DB, session *Session, date string) (bool, error) {
+	var exists int
+	err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM sessions
+		WHERE id <> ?
+		  AND bucket = ? AND account_id = ? AND org_id = ?
+		  AND log_region = ? AND mode = ?
+		  AND start_date <= ? AND end_date >= ?
+	)`,
+		session.ID,
+		session.Bucket, session.AccountID, session.OrgID,
+		session.LogRegion, session.Mode,
+		date, date,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("checking session date references: %w", err)
+	}
+	return exists != 0, nil
 }
 
 // scanSession scans a single row into a Session struct.
@@ -145,7 +362,7 @@ func scanSession(row *sql.Row) (*Session, error) {
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("session not found")
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("scanning session: %w", err)
 	}

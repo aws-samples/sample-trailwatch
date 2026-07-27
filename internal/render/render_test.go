@@ -1,6 +1,7 @@
 package render
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -161,5 +162,36 @@ func TestError_AllErrorCodes(t *testing.T) {
 				t.Errorf("expected message 'test message', got %q", apiErr.Message)
 			}
 		})
+	}
+}
+
+func TestDecodeStrictJSONRequiresContentType(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"value":"ok"}`))
+	w := httptest.NewRecorder()
+	var body struct {
+		Value string `json:"value"`
+	}
+
+	if DecodeStrictJSON(w, req, &body) {
+		t.Fatal("request without application/json should be rejected")
+	}
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415, got %d", w.Code)
+	}
+}
+
+func TestDecodeStrictJSONRejectsTrailingValue(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"value":"ok"} {"value":"extra"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	var body struct {
+		Value string `json:"value"`
+	}
+
+	if DecodeStrictJSON(w, req, &body) {
+		t.Fatal("request with a trailing JSON value should be rejected")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
 	}
 }

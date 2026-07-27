@@ -44,28 +44,17 @@ func (h *Handler) StartProcess(w http.ResponseWriter, r *http.Request) {
 	// Create a buffered progress channel
 	progressCh := make(chan ProcessingProgress, 100)
 
-	// Register the progress channel before starting the goroutine
-	h.service.mu.Lock()
-	if _, exists := h.service.active[sessionID]; exists {
-		h.service.mu.Unlock()
-		render.Error(w, http.StatusConflict, "CONFLICT", "Session already has an active pipeline", nil)
+	// The pipeline is detached from the request, but registration and the
+	// SQLite state claim complete before this endpoint reports acceptance.
+	if err := h.service.StartProcessingAsync(context.Background(), sessionID, progressCh); err != nil {
+		slog.Warn("processing start rejected",
+			"component", "cloudtrail-analyzer",
+			"session_id", sessionID,
+			"error", err.Error(),
+		)
+		render.Error(w, http.StatusConflict, "CONFLICT", "Session cannot be started in its current state", nil)
 		return
 	}
-	h.service.mu.Unlock()
-
-	// Start processing in a background goroutine
-	// Use a detached context since the HTTP request context will be cancelled
-	// after we send the 202 response.
-	go func() {
-		defer close(progressCh)
-		if err := h.service.StartProcessing(context.Background(), sessionID, progressCh); err != nil {
-			slog.Error("processing pipeline failed",
-				"component", "cloudtrail-analyzer",
-				"session_id", sessionID,
-				"error", err.Error(),
-			)
-		}
-	}()
 
 	render.JSON(w, http.StatusAccepted, map[string]string{
 		"message":    "Processing started",
@@ -84,7 +73,7 @@ func (h *Handler) CancelProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.service.CancelProcessing(sessionID); err != nil {
+	if err := h.service.CancelProcessing(r.Context(), sessionID); err != nil {
 		render.Error(w, http.StatusNotFound, "NOT_FOUND", err.Error(), nil)
 		return
 	}
@@ -175,6 +164,11 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// This loop unblocks on three signals: the client disconnecting (ctx.Done),
+	// a new progress event, or the channel closing. On shutdown the service
+	// cancels the pipeline (Service.Shutdown), the StartProcessing goroutine
+	// returns and closes progressCh, and the !ok branch below fires — so this
+	// handler does not pin server.Shutdown for the full timeout.
 	for {
 		select {
 		case <-ctx.Done():
@@ -185,9 +179,9 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 				data, _ := json.Marshal(map[string]string{
 					"event": "done",
 				})
-				w.Write([]byte("event: done\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-				w.Write(data)                            //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-				w.Write([]byte("\n\n"))                   //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write([]byte("event: done\ndata: ")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write(data)                          //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+				w.Write([]byte("\n\n"))                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 				flusher.Flush()
 				return
 			}
@@ -196,9 +190,9 @@ func (h *Handler) StreamProgress(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			w.Write([]byte("event: progress\ndata: "))  //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write(data)                                //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
-			w.Write([]byte("\n\n"))                       //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("event: progress\ndata: ")) //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write(data)                              //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
+			w.Write([]byte("\n\n"))                    //nolint:errcheck // nosemgrep: no-direct-write-to-responsewriter
 			flusher.Flush()
 		}
 	}

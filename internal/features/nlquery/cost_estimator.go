@@ -19,20 +19,20 @@ const MaxOutputTokens = 2048
 // estimated as the configured assumption × output rate, plus an absolute cap
 // based on MaxOutputTokens so the UI can communicate the worst-case bill.
 type CostEstimate struct {
-	ModelID            string  `json:"model_id"`
-	RateSource         string  `json:"rate_source"` // "default" | "override" | "fallback"
-	InputTokens        int     `json:"input_tokens"`
-	EstOutputTokens    int     `json:"est_output_tokens"`
-	MaxOutputTokens    int     `json:"max_output_tokens"`
-	InputCostUSD       float64 `json:"input_cost_usd"`
-	EstOutputCostUSD   float64 `json:"est_output_cost_usd"`
-	EstTotalCostUSD    float64 `json:"est_total_cost_usd"`
-	MaxOutputCostUSD   float64 `json:"max_output_cost_usd"`
-	MaxTotalCostUSD    float64 `json:"max_total_cost_usd"`
-	InputRatePerMUSD   float64 `json:"input_rate_per_million_usd"`
-	OutputRatePerMUSD  float64 `json:"output_rate_per_million_usd"`
-	WarnThresholdUSD   float64 `json:"warn_threshold_usd"`
-	ExceedsWarnThresh  bool    `json:"exceeds_warn_threshold"`
+	ModelID           string  `json:"model_id"`
+	RateSource        string  `json:"rate_source"` // "default" | "override" | "fallback"
+	InputTokens       int     `json:"input_tokens"`
+	EstOutputTokens   int     `json:"est_output_tokens"`
+	MaxOutputTokens   int     `json:"max_output_tokens"`
+	InputCostUSD      float64 `json:"input_cost_usd"`
+	EstOutputCostUSD  float64 `json:"est_output_cost_usd"`
+	EstTotalCostUSD   float64 `json:"est_total_cost_usd"`
+	MaxOutputCostUSD  float64 `json:"max_output_cost_usd"`
+	MaxTotalCostUSD   float64 `json:"max_total_cost_usd"`
+	InputRatePerMUSD  float64 `json:"input_rate_per_million_usd"`
+	OutputRatePerMUSD float64 `json:"output_rate_per_million_usd"`
+	WarnThresholdUSD  float64 `json:"warn_threshold_usd"`
+	ExceedsWarnThresh bool    `json:"exceeds_warn_threshold"`
 }
 
 // DefaultWarnThresholdUSD is the per-query estimate above which the UI

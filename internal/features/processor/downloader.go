@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudtrail-analyzer/internal/cloudtrailpath"
 	"cloudtrail-analyzer/internal/features/sessions"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,9 +21,22 @@ import (
 
 // listObjects lists all .json.gz files in S3 for the session's path and date range.
 // Returns the list of objects and total size in bytes.
-func listObjects(ctx context.Context, client *s3.Client, session *sessions.Session) ([]S3Object, int64, error) {
+//
+// IMPORTANT — delivery date vs event time: CloudTrail partitions log files by
+// the UTC *delivery* date (the day CloudTrail wrote the file to S3), which is
+// encoded in the S3 prefix as .../CloudTrail/{region}/{YYYY}/{MM}/{DD}/. The
+// session's StartDate/EndDate select that delivery-date partition, NOT the
+// eventTime of the records inside. Because CloudTrail can batch and deliver an
+// event up to ~15 minutes (occasionally longer) after it occurs, an event that
+// happened just before a UTC midnight boundary may be delivered into the next
+// day's partition. As a result, a single-day sync can miss a few records near
+// the day boundary, and event-time filtering applied later (in queries) should
+// be paired with a slightly wider sync window when boundary completeness
+// matters. This is a known limitation of partitioning by delivery date.
+func listObjects(ctx context.Context, client s3.ListObjectsV2APIClient, session *sessions.Session) ([]S3Object, int64, error) {
 	var objects []S3Object
 	var totalSize int64
+	seenObjects := make(map[string]struct{})
 
 	// Parse date range
 	startDate, err := time.Parse("2006-01-02", session.StartDate)
@@ -36,44 +50,68 @@ func listObjects(ctx context.Context, client *s3.Client, session *sessions.Sessi
 
 	// Iterate over each day in the range
 	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
-		prefix := constructS3Prefix(session, d)
-
-		input := &s3.ListObjectsV2Input{
-			Bucket: aws.String(session.Bucket),
-			Prefix: aws.String(prefix),
-		}
-
-		paginator := s3.NewListObjectsV2Paginator(client, input)
-		for paginator.HasMorePages() {
-			if ctx.Err() != nil {
-				return nil, 0, ctx.Err()
-			}
-
-			page, err := paginator.NextPage(ctx)
+		var firstErr error
+		listedCandidate := false
+		for _, prefix := range constructS3Prefixes(session, d) {
+			prefixObjects, err := listObjectsAtPrefix(ctx, client, session.Bucket, prefix)
 			if err != nil {
-				return nil, 0, fmt.Errorf("listing objects at %s: %w", prefix, err)
+				if ctx.Err() != nil {
+					return nil, 0, ctx.Err()
+				}
+				if firstErr == nil {
+					firstErr = fmt.Errorf("listing objects at %s: %w", prefix, err)
+				}
+				continue
 			}
-
-			for _, obj := range page.Contents {
-				if obj.Key == nil {
+			listedCandidate = true
+			if len(prefixObjects) == 0 {
+				continue
+			}
+			for _, object := range prefixObjects {
+				if _, exists := seenObjects[object.Key]; exists {
 					continue
 				}
-				key := *obj.Key
-				// Only include .json.gz files
-				if strings.HasSuffix(key, ".json.gz") {
-					size := obj.Size
-					if size != nil {
-						objects = append(objects, S3Object{Key: key, Size: *size})
-						totalSize += *size
-					} else {
-						objects = append(objects, S3Object{Key: key, Size: 0})
-					}
-				}
+				seenObjects[object.Key] = struct{}{}
+				objects = append(objects, object)
+				totalSize += object.Size
 			}
+			// A trail writes one layout at a time. Prefer the standard
+			// Organizations layout and use legacy layouts only as fallbacks so
+			// migrated copies are not indexed twice.
+			break
+		}
+		if !listedCandidate && firstErr != nil {
+			return nil, 0, firstErr
 		}
 	}
 
 	return objects, totalSize, nil
+}
+
+func listObjectsAtPrefix(
+	ctx context.Context,
+	client s3.ListObjectsV2APIClient,
+	bucket, prefix string,
+) ([]S3Object, error) {
+	var objects []S3Object
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			if key == "" || !strings.HasSuffix(key, ".json.gz") {
+				continue
+			}
+			objects = append(objects, S3Object{Key: key, Size: aws.ToInt64(obj.Size)})
+		}
+	}
+	return objects, nil
 }
 
 // downloadFiles downloads S3 objects concurrently using a worker pool.
@@ -151,7 +189,17 @@ func downloadFiles(ctx context.Context, client *s3.Client, session *sessions.Ses
 }
 
 // downloadSingleFile downloads a single S3 object to the local filesystem.
+//
+// This is the single write chokepoint for both the download-only and the
+// pipelined download+extract paths, so the zip-slip / path-traversal guard
+// (N25) lives here: an S3 key containing a ".." segment or an absolute path
+// could otherwise resolve to a localPath OUTSIDE the data dir. We reject such
+// keys before creating any directory or file.
 func downloadSingleFile(ctx context.Context, client *s3.Client, bucket, key, localPath string) error {
+	if hasUnsafeKeySegment(key) {
+		return fmt.Errorf("refusing to write S3 key with unsafe path segment: %q", key)
+	}
+
 	// Ensure directory exists
 	dir := filepath.Dir(localPath)
 	if err := os.MkdirAll(dir, 0700); err != nil { // nosemgrep: incorrect-default-permission
@@ -168,48 +216,77 @@ func downloadSingleFile(ctx context.Context, client *s3.Client, bucket, key, loc
 	}
 	defer output.Body.Close()
 
-	// Write to temporary file first, then rename (atomic write)
-	tmpPath := localPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	// Write to a unique temporary file first, then rename atomically. A fixed
+	// ".tmp" path lets overlapping syncs truncate or rename each other's work.
+	f, err := os.CreateTemp(dir, "."+filepath.Base(localPath)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
 
 	_, err = io.Copy(f, output.Body)
 	if closeErr := f.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("writing file: %w", err)
 	}
 
 	// Rename temp file to final path
 	if err := os.Rename(tmpPath, localPath); err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("renaming temp file: %w", err)
 	}
 
 	return nil
 }
 
-// constructS3Prefix builds the S3 prefix for a given session and date.
+// constructS3Prefixes builds every supported S3 prefix for a session and date.
+func constructS3Prefixes(session *sessions.Session, date time.Time) []string {
+	return cloudtrailpath.DatePrefixes(
+		session.Mode,
+		session.OrgID,
+		session.AccountID,
+		session.LogRegion,
+		date,
+	)
+}
+
+// constructS3Prefix returns the primary prefix retained for callers that only
+// need the original single-account or legacy Control Tower layout.
 func constructS3Prefix(session *sessions.Session, date time.Time) string {
-	dateStr := date.Format("2006/01/02")
-
-	if session.Mode == "control_tower" && session.OrgID != "" {
-		return fmt.Sprintf("%s/AWSLogs/%s/%s/CloudTrail/%s/%s/",
-			session.OrgID, session.OrgID, session.AccountID, session.LogRegion, dateStr)
-	}
-
-	return fmt.Sprintf("AWSLogs/%s/CloudTrail/%s/%s/",
-		session.AccountID, session.LogRegion, dateStr)
+	return constructS3Prefixes(session, date)[0]
 }
 
 // constructLocalPath builds the local filesystem path for a downloaded S3 object.
 // Pattern: {dataDir}/s3/{bucket}/{s3Key}
+//
+// The returned path is NOT yet validated for containment: the S3 object key is
+// attacker-influenceable (a malicious or misconfigured bucket can return keys
+// containing ".." segments), so callers MUST route the actual write through
+// downloadSingleFile, which validates the key against path traversal before
+// touching the filesystem (zip-slip guard, N25). filepath.Join cleans the
+// joined path, so a key like "../../etc/x" would otherwise resolve OUTSIDE the
+// data dir — hence the guard at the single write chokepoint.
 func constructLocalPath(dataDir, bucket, s3Key string) string {
 	return filepath.Join(dataDir, "s3", bucket, s3Key)
+}
+
+// hasUnsafeKeySegment reports whether the slash-separated S3 key is unsafe to
+// join under the data dir: an absolute key, or one containing a ".." parent
+// segment, would let the local write escape {dataDir}/s3/{bucket} (zip-slip /
+// path traversal). S3 uses "/" as its key separator independent of the host
+// OS, so we split on "/" regardless of platform.
+func hasUnsafeKeySegment(key string) bool {
+	if strings.HasPrefix(key, "/") {
+		return true
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // sendDownloadProgress sends a download progress event.

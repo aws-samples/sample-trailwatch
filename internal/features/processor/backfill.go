@@ -26,19 +26,28 @@ func BackfillDiskUsage(db *sql.DB, dataDir string) error {
 			continue
 		}
 
-		dir := sessionLocalDir(s, dataDir)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
+		dirs, err := sessionDateDirs(s, dataDir)
+		if err != nil {
 			continue
 		}
 
 		var bytes int64
-		walkErr := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
-				return nil
+		var walkErr error
+		for _, dir := range dirs {
+			if _, err := os.Stat(dir); os.IsNotExist(err) {
+				continue
 			}
-			bytes += info.Size()
-			return nil
-		})
+			walkErr = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+				if err != nil || info == nil || info.IsDir() {
+					return nil
+				}
+				bytes += info.Size()
+				return nil
+			})
+			if walkErr != nil {
+				break
+			}
+		}
 		if walkErr != nil || bytes == 0 {
 			continue
 		}

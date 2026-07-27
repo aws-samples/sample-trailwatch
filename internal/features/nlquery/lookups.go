@@ -3,6 +3,7 @@ package nlquery
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
@@ -32,13 +33,24 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 	}
 
 	svc := NewService(h.cfg)
-	read := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=16777216, auto_detect=true, union_by_name=true)`, dataPath)
+	// dataPath is assembled from config-derived values (S3 bucket, org_id,
+	// account_id, region) which settings accept with only an emptiness check.
+	// Escape the assembled path before it lands inside the read_json('...')
+	// literal so a single quote in any component cannot break out of the
+	// literal and bypass the read-only allowlist (H6).
+	read := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=%d, auto_detect=true, union_by_name=true)`, escapeSQLLiteral(dataPath), maxObjectSize)
+
+	// When a member-account subset is selected, scope the lookups to those
+	// accounts (N33). buildDataPath points at the bucket/org root in that case,
+	// so without this filter the lookups would aggregate over every synced
+	// account. The subset is appended as an AND clause to each query's WHERE.
+	scope := memberAccountScope(h.cfg)
 
 	result := &LookupValues{}
 
 	// Access Keys
 	cols, rows, err := svc.executeDuckDB(r.Context(), fmt.Sprintf(
-		`SELECT DISTINCT r.userIdentity.accessKeyId as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.accessKeyId IS NOT NULL ORDER BY val LIMIT 100;`, read))
+		`SELECT DISTINCT r.userIdentity.accessKeyId as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.accessKeyId IS NOT NULL%s ORDER BY val LIMIT 100;`, read, scope))
 	if err == nil {
 		for _, row := range rows {
 			if len(row) > 0 && row[0] != nil {
@@ -50,7 +62,7 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 
 	// Source IPs
 	_, rows, err = svc.executeDuckDB(r.Context(), fmt.Sprintf(
-		`SELECT r.sourceIPAddress as val, COUNT(*) as cnt FROM (SELECT unnest(Records) as r FROM %s) WHERE r.sourceIPAddress IS NOT NULL GROUP BY val ORDER BY cnt DESC LIMIT 50;`, read))
+		`SELECT r.sourceIPAddress as val, COUNT(*) as cnt FROM (SELECT unnest(Records) as r FROM %s) WHERE r.sourceIPAddress IS NOT NULL%s GROUP BY val ORDER BY cnt DESC LIMIT 50;`, read, scope))
 	if err == nil {
 		for _, row := range rows {
 			if len(row) > 0 && row[0] != nil {
@@ -61,7 +73,7 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 
 	// Identities (ARNs)
 	_, rows, err = svc.executeDuckDB(r.Context(), fmt.Sprintf(
-		`SELECT r.userIdentity.arn as val, COUNT(*) as cnt FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.arn IS NOT NULL GROUP BY val ORDER BY cnt DESC LIMIT 50;`, read))
+		`SELECT r.userIdentity.arn as val, COUNT(*) as cnt FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.arn IS NOT NULL%s GROUP BY val ORDER BY cnt DESC LIMIT 50;`, read, scope))
 	if err == nil {
 		for _, row := range rows {
 			if len(row) > 0 && row[0] != nil {
@@ -72,7 +84,7 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 
 	// Accounts
 	_, rows, err = svc.executeDuckDB(r.Context(), fmt.Sprintf(
-		`SELECT DISTINCT r.recipientAccountId as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.recipientAccountId IS NOT NULL ORDER BY val;`, read))
+		`SELECT DISTINCT r.recipientAccountId as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.recipientAccountId IS NOT NULL%s ORDER BY val;`, read, scope))
 	if err == nil {
 		for _, row := range rows {
 			if len(row) > 0 && row[0] != nil {
@@ -83,7 +95,7 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 
 	// Roles
 	_, rows, err = svc.executeDuckDB(r.Context(), fmt.Sprintf(
-		`SELECT DISTINCT r.userIdentity.sessionContext.sessionIssuer.userName as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.sessionContext.sessionIssuer.userName IS NOT NULL ORDER BY val LIMIT 50;`, read))
+		`SELECT DISTINCT r.userIdentity.sessionContext.sessionIssuer.userName as val FROM (SELECT unnest(Records) as r FROM %s) WHERE r.userIdentity.sessionContext.sessionIssuer.userName IS NOT NULL%s ORDER BY val LIMIT 50;`, read, scope))
 	if err == nil {
 		for _, row := range rows {
 			if len(row) > 0 && row[0] != nil {
@@ -95,30 +107,26 @@ func (h *LookupsHandler) GetLookups(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, result)
 }
 
-func (h *LookupsHandler) buildDataPath() string {
-	if h.cfg.S3.Bucket == "" {
+// memberAccountScope constrains an organization-root scan to the configured
+// member selection. Organization paths always start at the bucket mirror so
+// they work for both standard Organizations and Control Tower layouts; the
+// predicate is therefore required even when exactly one member is selected.
+// Single-account mode remains scoped by its narrow filesystem path.
+func memberAccountScope(cfg *config.Config) string {
+	if !usesOrganizationQueryRoot(cfg) {
 		return ""
 	}
-
-	if len(h.cfg.S3.MemberAccounts) > 1 {
-		if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-			return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/",
-				h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.OrgID, h.cfg.S3.OrgID)
-		}
-		return fmt.Sprintf("%s/s3/%s/AWSLogs/", h.cfg.DataDir, h.cfg.S3.Bucket)
+	ids := scopeAccountIDs(cfg)
+	quoted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		quoted = append(quoted, quoteSQLLiteral(id))
 	}
-
-	region := h.cfg.S3.LogRegion
-	if region == "" {
-		region = h.cfg.S3.Region
+	if len(quoted) == 0 {
+		return ""
 	}
+	return fmt.Sprintf(" AND r.recipientAccountId IN (%s)", strings.Join(quoted, ", "))
+}
 
-	if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-		return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/%s/CloudTrail/%s/",
-			h.cfg.DataDir, h.cfg.S3.Bucket,
-			h.cfg.S3.OrgID, h.cfg.S3.OrgID, h.cfg.S3.AccountID, region)
-	}
-
-	return fmt.Sprintf("%s/s3/%s/AWSLogs/%s/CloudTrail/%s/",
-		h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.AccountID, region)
+func (h *LookupsHandler) buildDataPath() string {
+	return localQueryRoot(h.cfg)
 }

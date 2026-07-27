@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Brain, CheckCircle2, Loader2, AlertTriangle, RefreshCw, Shield, Play } from 'lucide-react'
 import { useSettings } from './hooks'
@@ -7,9 +7,9 @@ import { CostBanner } from '../../comm/CostBanner'
 import { ExpandableCell } from '../../comm/ExpandableCell'
 import { readApiError } from '../../comm/apiError'
 
-type Provider = 'bedrock' | 'anthropic' | 'openai' | 'ollama'
+export type Provider = 'bedrock' | 'anthropic' | 'openai' | 'ollama'
 
-interface BedrockModel {
+export interface BedrockModel {
   model_id: string
   model_name: string
   provider: string
@@ -23,16 +23,19 @@ const PROVIDERS: { value: Provider; label: string; description: string }[] = [
   { value: 'bedrock', label: 'AWS Bedrock', description: 'Uses your configured AWS credentials. No additional API key needed.' },
   { value: 'anthropic', label: 'Anthropic API', description: 'Direct API access via api.anthropic.com. Requires an API key.' },
   { value: 'openai', label: 'OpenAI / Compatible', description: 'OpenAI, Azure OpenAI, or any OpenAI-compatible endpoint. Requires API key.' },
-  { value: 'ollama', label: 'Ollama (Local)', description: 'Runs locally on your machine. Auto-installs and pulls codellama:7b. No API key needed.' },
+  { value: 'ollama', label: 'Ollama (Local)', description: 'Runs locally on your machine. Install Ollama and the selected model before use. No API key needed.' },
 ]
 
-const BEDROCK_REGIONS = [
+export const DEFAULT_BEDROCK_MODEL_ID = 'us.anthropic.claude-sonnet-4-6'
+
+export const BEDROCK_REGIONS = [
   { value: 'ap-south-1', label: 'Asia Pacific (Mumbai)' },
   { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)' },
   { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)' },
   { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)' },
   { value: 'ap-northeast-2', label: 'Asia Pacific (Seoul)' },
   { value: 'us-east-1', label: 'US East (N. Virginia)' },
+  { value: 'us-east-2', label: 'US East (Ohio)' },
   { value: 'us-west-2', label: 'US West (Oregon)' },
   { value: 'eu-west-1', label: 'Europe (Ireland)' },
   { value: 'eu-west-2', label: 'Europe (London)' },
@@ -41,9 +44,22 @@ const BEDROCK_REGIONS = [
   { value: 'sa-east-1', label: 'South America (Sao Paulo)' },
 ]
 
+export function isAnthropicBedrockModel(model: BedrockModel): boolean {
+  return model.provider.trim().toLowerCase() === 'anthropic'
+}
+
+export function defaultModel(provider: Provider): string {
+  switch (provider) {
+    case 'bedrock': return DEFAULT_BEDROCK_MODEL_ID
+    case 'anthropic': return 'claude-sonnet-4-20250514'
+    case 'openai': return 'gpt-4o'
+    case 'ollama': return 'codellama:7b'
+  }
+}
+
 export function LLMConfigView() {
   const { t } = useTranslation()
-  const { data: settings, loading: settingsLoading, refetch } = useSettings()
+  const { data: settings, loading: settingsLoading, error: settingsError, refetch } = useSettings()
 
   const [provider, setProvider] = useState<Provider>('bedrock')
   const [apiKey, setApiKey] = useState('')
@@ -52,6 +68,7 @@ export function LLMConfigView() {
   const [bedrockRegion, setBedrockRegion] = useState('ap-south-1')
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   // Bedrock model discovery
   const [bedrockModels, setBedrockModels] = useState<BedrockModel[]>([])
@@ -59,6 +76,8 @@ export function LLMConfigView() {
   const [modelsError, setModelsError] = useState('')
   const [crisAcknowledged, setCrisAcknowledged] = useState(false)
   const [selectedModelId, setSelectedModelId] = useState('')
+  const modelRequestEpochRef = useRef(0)
+  const modelAbortRef = useRef<AbortController | null>(null)
 
   // Test-this-model state. Lives in this view because Settings → AI Provider
   // is where users naturally validate their LLM is reachable.
@@ -66,6 +85,8 @@ export function LLMConfigView() {
   const [testRunning, setTestRunning] = useState(false)
   const [testError, setTestError] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ sql: string; columns: string[] | null; rows: unknown[][] | null } | null>(null)
+  const testRequestEpochRef = useRef(0)
+  const testAbortRef = useRef<AbortController | null>(null)
 
   // Search filter for the Bedrock model lists. Matches against model_id +
   // model_name + provider so users can type "opus", "claude-3-5", "us.",
@@ -74,15 +95,24 @@ export function LLMConfigView() {
 
   useEffect(() => {
     if (settings) {
-      setProvider((settings as any).llm?.provider || 'bedrock')
-      setModel((settings as any).llm?.model || '')
-      setEndpoint((settings as any).llm?.endpoint || '')
-      setBedrockRegion((settings as any).bedrock?.region || 'ap-south-1')
-      setSelectedModelId((settings as any).bedrock?.model_id || '')
+      setProvider((settings.llm?.provider as Provider) || 'bedrock')
+      setModel(settings.llm?.model || '')
+      setEndpoint(settings.llm?.endpoint || '')
+      setBedrockRegion(settings.bedrock?.region || 'ap-south-1')
+      setSelectedModelId(settings.bedrock?.model_id || '')
     }
   }, [settings])
 
   const fetchModels = useCallback(async (region: string) => {
+    const requestEpoch = ++modelRequestEpochRef.current
+    modelAbortRef.current?.abort()
+    const controller = new AbortController()
+    modelAbortRef.current = controller
+    const isCurrentRequest = () =>
+      modelRequestEpochRef.current === requestEpoch &&
+      modelAbortRef.current === controller &&
+      !controller.signal.aborted
+
     setModelsLoading(true)
     setModelsError('')
     try {
@@ -90,31 +120,73 @@ export function LLMConfigView() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ region }),
+        signal: controller.signal,
       })
       if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.message || `HTTP ${res.status}`)
+        throw new Error(await readApiError(res, 'Failed to fetch models'))
       }
-      const data = await res.json()
-      setBedrockModels(data.models || [])
-    } catch (err: any) {
-      setModelsError(err.message || 'Failed to fetch models')
-      setBedrockModels([])
+      const data: unknown = await res.json()
+      if (!data || typeof data !== 'object' || !Array.isArray((data as Record<string, unknown>).models)) {
+        throw new Error('Model discovery returned a malformed response.')
+      }
+      if (isCurrentRequest()) {
+        setBedrockModels((data as { models: BedrockModel[] }).models.filter(isAnthropicBedrockModel))
+      }
+    } catch (err: unknown) {
+      if (isCurrentRequest()) {
+        setModelsError(err instanceof Error ? err.message : 'Failed to fetch models')
+        setBedrockModels([])
+      }
     } finally {
-      setModelsLoading(false)
+      if (isCurrentRequest()) {
+        modelAbortRef.current = null
+        setModelsLoading(false)
+      }
     }
   }, [])
 
   // Fetch models when Bedrock is selected and region changes
   useEffect(() => {
-    if (provider === 'bedrock' && bedrockRegion) {
-      fetchModels(bedrockRegion)
+    if (settings && provider === 'bedrock' && bedrockRegion) {
+      void fetchModels(bedrockRegion)
     }
-  }, [provider, bedrockRegion, fetchModels])
+    return () => {
+      modelRequestEpochRef.current += 1
+      modelAbortRef.current?.abort()
+      modelAbortRef.current = null
+    }
+  }, [settings, provider, bedrockRegion, fetchModels])
+
+  useEffect(() => {
+    testRequestEpochRef.current += 1
+    testAbortRef.current?.abort()
+    testAbortRef.current = null
+    setTestRunning(false)
+    setTestError(null)
+    setTestResult(null)
+  }, [testPrompt, provider, apiKey, model, endpoint, bedrockRegion, selectedModelId])
+
+  useEffect(() => {
+    return () => {
+      testRequestEpochRef.current += 1
+      testAbortRef.current?.abort()
+      testAbortRef.current = null
+    }
+  }, [])
 
   async function runTest() {
     const prompt = testPrompt.trim()
     if (!prompt) return
+
+    testAbortRef.current?.abort()
+    const requestEpoch = ++testRequestEpochRef.current
+    const controller = new AbortController()
+    testAbortRef.current = controller
+    const isCurrentRequest = () =>
+      testRequestEpochRef.current === requestEpoch &&
+      testAbortRef.current === controller &&
+      !controller.signal.aborted
+
     setTestRunning(true)
     setTestError(null)
     setTestResult(null)
@@ -123,31 +195,33 @@ export function LLMConfigView() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
+        signal: controller.signal,
       })
       if (!res.ok) {
-        setTestError(await readApiError(res, 'Test query failed'))
-        return
+        throw new Error(await readApiError(res, 'Test query failed'))
       }
-      setTestResult(await res.json())
-    } catch (e: any) {
-      setTestError(e?.message || 'Test query failed')
+      const result: unknown = await res.json()
+      if (!result || typeof result !== 'object') {
+        throw new Error('Test query returned an invalid response')
+      }
+      if (isCurrentRequest()) {
+        setTestResult(result as { sql: string; columns: string[] | null; rows: unknown[][] | null })
+      }
+    } catch (e: unknown) {
+      if (!isCurrentRequest()) return
+      setTestError(e instanceof Error && e.message ? e.message : 'Test query failed')
     } finally {
-      setTestRunning(false)
+      if (testRequestEpochRef.current === requestEpoch && testAbortRef.current === controller) {
+        testAbortRef.current = null
+        setTestRunning(false)
+      }
     }
   }
 
-  const defaultModel = (p: Provider) => {
-    switch (p) {
-      case 'bedrock': return 'us.anthropic.claude-sonnet-4-20250514-v1:0'
-      case 'anthropic': return 'claude-sonnet-4-20250514'
-      case 'openai': return 'gpt-4o'
-      case 'ollama': return 'codellama:7b'
-    }
-  }
-
-  const save = useCallback(async () => {
+  const save = useCallback(async (): Promise<boolean> => {
     setSaving(true)
     setSaved(false)
+    setSaveError(null)
     try {
       const body: Record<string, string> = { llm_provider: provider }
       if (apiKey) body.llm_api_key = apiKey
@@ -158,22 +232,30 @@ export function LLMConfigView() {
         if (model) body.llm_model = model
         else body.llm_model = defaultModel(provider)
       }
-      if (endpoint) body.llm_endpoint = endpoint
+      // Empty is meaningful: it clears a previously configured custom endpoint.
+      body.llm_endpoint = endpoint
 
       const res = await fetch(endpoints.settings, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (res.ok) {
-        setSaved(true)
-        refetch()
-        setTimeout(() => setSaved(false), 3000)
+      if (!res.ok) {
+        setSaveError(await readApiError(res, t('settings.llm.saveFailed', { defaultValue: 'Failed to save settings' })))
+        return false
       }
+      setApiKey('')
+      setSaved(true)
+      void refetch()
+      setTimeout(() => setSaved(false), 3000)
+      return true
+    } catch (e) {
+      setSaveError((e as Error)?.message || t('settings.llm.saveFailed', { defaultValue: 'Failed to save settings' }))
+      return false
     } finally {
       setSaving(false)
     }
-  }, [provider, apiKey, model, endpoint, bedrockRegion, selectedModelId, refetch])
+  }, [provider, apiKey, model, endpoint, bedrockRegion, selectedModelId, refetch, t])
 
   if (settingsLoading) {
     return (
@@ -183,7 +265,35 @@ export function LLMConfigView() {
     )
   }
 
-  const activeProvider = (settings as any)?.llm?.provider || 'bedrock'
+  if (settingsError || !settings) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <AlertTriangle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load settings</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{settingsError || 'The settings response was empty.'}</p>
+          <button type="button" onClick={() => void refetch()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20">
+            <RefreshCw className="w-3.5 h-3.5" /> {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  const activeProvider = settings.llm?.provider ?? 'bedrock'
+  const desiredModel = provider === 'bedrock'
+    ? selectedModelId || defaultModel('bedrock')
+    : model || defaultModel(provider)
+  const activeModel = activeProvider === 'bedrock'
+    ? settings.bedrock?.model_id || settings.llm?.model || defaultModel('bedrock')
+    : settings.llm?.model || defaultModel(activeProvider)
+  const activeConfigMatchesForm =
+    activeProvider === provider &&
+    activeModel === desiredModel &&
+    (settings.llm?.endpoint || '').trim() === endpoint.trim() &&
+    apiKey === '' &&
+    (provider !== 'bedrock' || (settings.bedrock?.region || 'ap-south-1') === bedrockRegion)
 
   const matchesSearch = (m: BedrockModel) => {
     if (!modelSearch.trim()) return true
@@ -247,10 +357,11 @@ export function LLMConfigView() {
           <div className="pl-7 space-y-4">
             {/* Region selector */}
             <div>
-              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+              <label htmlFor="bedrock-region" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                 {t('settings.llm.bedrockRegion')}
               </label>
               <select
+                id="bedrock-region"
                 value={bedrockRegion}
                 onChange={e => { setBedrockRegion(e.target.value); setSelectedModelId('') }}
                 className="w-full px-3 py-2 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
@@ -305,9 +416,11 @@ export function LLMConfigView() {
                       having to scroll. */}
                   <div className="relative">
                     <input
+                      id="bedrock-model-search"
                       type="text"
                       value={modelSearch}
                       onChange={e => setModelSearch(e.target.value)}
+                      aria-label={t('settings.llm.searchPlaceholder')}
                       placeholder={t('settings.llm.searchPlaceholder')}
                       className="w-full px-3 py-2 pr-8 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
                     />
@@ -465,21 +578,23 @@ export function LLMConfigView() {
         {(provider === 'anthropic' || provider === 'openai') && (
           <div className="space-y-3 pl-7">
             <div>
-              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.apiKey')}</label>
+              <label htmlFor="llm-api-key" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.apiKey')}</label>
               <input
+                id="llm-api-key"
                 type="password"
                 value={apiKey}
                 onChange={e => setApiKey(e.target.value)}
                 placeholder={provider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
                 className="w-full px-3 py-2 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500 focus:outline-none"
               />
-              {(settings as any)?.llm?.has_key && !apiKey && (
+              {settings?.llm?.has_key && !apiKey && (
                 <p className="text-[10px] text-green-600 mt-1">{t('settings.llm.apiKeyConfigured')}</p>
               )}
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.model')}</label>
+              <label htmlFor="llm-model" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.model')}</label>
               <input
+                id="llm-model"
                 type="text"
                 value={model}
                 onChange={e => setModel(e.target.value)}
@@ -489,10 +604,11 @@ export function LLMConfigView() {
             </div>
             {provider === 'openai' && (
               <div>
-                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                <label htmlFor="llm-custom-endpoint" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                   {t('settings.llm.customEndpoint')} <span className="text-gray-500 dark:text-gray-400">{t('settings.llm.optional')}</span>
                 </label>
                 <input
+                  id="llm-custom-endpoint"
                   type="text"
                   value={endpoint}
                   onChange={e => setEndpoint(e.target.value)}
@@ -513,8 +629,9 @@ export function LLMConfigView() {
               </p>
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.model')}</label>
+              <label htmlFor="ollama-model" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">{t('settings.llm.model')}</label>
               <input
+                id="ollama-model"
                 type="text"
                 value={model}
                 onChange={e => setModel(e.target.value)}
@@ -523,10 +640,11 @@ export function LLMConfigView() {
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+              <label htmlFor="ollama-endpoint" className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
                 {t('settings.llm.ollamaEndpoint')} <span className="text-gray-500 dark:text-gray-400">{t('settings.llm.optional')}</span>
               </label>
               <input
+                id="ollama-endpoint"
                 type="text"
                 value={endpoint}
                 onChange={e => setEndpoint(e.target.value)}
@@ -540,8 +658,8 @@ export function LLMConfigView() {
         {/* Save button */}
         <div className="pt-2">
           <button
-            onClick={save}
-            disabled={saving}
+            onClick={() => { void save() }}
+            disabled={saving || testRunning}
             className={`inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
               saved
                 ? 'bg-green-600 text-white'
@@ -551,6 +669,11 @@ export function LLMConfigView() {
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Brain className="w-4 h-4" />}
             {saving ? t('settings.llm.saving') : saved ? t('settings.llm.saved') : t('settings.llm.saveActivate')}
           </button>
+          {saveError && (
+            <div className="mt-2 p-2.5 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+              <p className="text-xs text-red-700 dark:text-red-300">{saveError}</p>
+            </div>
+          )}
         </div>
 
         {/* Test this model — sends one NLQ to validate the model is reachable
@@ -563,20 +686,31 @@ export function LLMConfigView() {
           </div>
 
           <textarea
+            id="llm-test-prompt"
             value={testPrompt}
             onChange={(e) => setTestPrompt(e.target.value)}
+            aria-label={t('settings.llm.testTitle')}
             placeholder={t('settings.llm.testPlaceholder')}
             rows={2}
             className="w-full px-3 py-2 text-sm rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
           />
 
-          <CostBanner prompt={testPrompt} />
+          {activeConfigMatchesForm && <CostBanner prompt={testPrompt} />}
 
           <div className="flex items-center gap-3">
+            {!activeConfigMatchesForm && (
+              <span id="llm-test-save-first" className="sr-only">
+                {t('settings.llm.testSaveFirst', { defaultValue: 'Save and activate this configuration before testing.' })}
+              </span>
+            )}
             <button
               type="button"
               onClick={runTest}
-              disabled={!testPrompt.trim() || testRunning}
+              disabled={!testPrompt.trim() || testRunning || !activeConfigMatchesForm}
+              aria-describedby={!activeConfigMatchesForm ? 'llm-test-save-first' : undefined}
+              title={!activeConfigMatchesForm
+                ? t('settings.llm.testSaveFirst', { defaultValue: 'Save and activate this configuration before testing.' })
+                : undefined}
               className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded border border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-900/20 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {testRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
@@ -606,7 +740,7 @@ export function LLMConfigView() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(testResult.rows as unknown[][] || []).slice(0, 20).map((row, ri) => (
+                      {testResult.rows.slice(0, 20).map((row, ri) => (
                         <tr key={ri} className="border-b border-gray-100 dark:border-gray-800">
                           {row.map((cell, ci) => (
                             <td key={ci} className="px-2 py-1 align-top text-gray-900 dark:text-gray-100 max-w-[260px]">

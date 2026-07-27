@@ -43,19 +43,21 @@ func TestCORS_AllowedOrigin(t *testing.T) {
 	}))
 
 	tests := []struct {
-		name   string
-		origin string
-		want   string
+		name        string
+		origin      string
+		requestHost string
+		want        string
 	}{
-		{"vite dev server", "http://localhost:5173", "http://localhost:5173"},
-		{"analyzer itself", "http://localhost:7070", "http://localhost:7070"},
-		{"disallowed origin", "http://evil.com", ""},
+		{"vite dev server", "http://localhost:5173", "localhost:7070", "http://localhost:5173"},
+		{"analyzer itself", "http://localhost:7070", "localhost:7070", "http://localhost:7070"},
+		{"ipv4 analyzer", "http://127.0.0.1:7070", "127.0.0.1:7070", "http://127.0.0.1:7070"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
 			req.Header.Set("Origin", tt.origin)
+			req.Host = tt.requestHost
 			rec := httptest.NewRecorder()
 
 			handler.ServeHTTP(rec, req)
@@ -65,6 +67,44 @@ func TestCORS_AllowedOrigin(t *testing.T) {
 				t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCORS_RejectsDisallowedOrigin(t *testing.T) {
+	called := false
+	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/api/settings", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	if called {
+		t.Fatal("disallowed cross-origin request reached the handler")
+	}
+}
+
+func TestCORS_RejectsCrossSiteMutationWithoutOrigin(t *testing.T) {
+	called := false
+	handler := CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/api/nlquery/execute", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	if called {
+		t.Fatal("cross-site mutation reached the handler")
 	}
 }
 

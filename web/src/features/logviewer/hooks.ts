@@ -238,36 +238,67 @@ export function useIndexStatus() {
   return { status, loading, refresh }
 }
 
+// Reconnect backoff for the index-progress SSE stream. A long index build can
+// keep the connection open for minutes and the browser/proxy may drop it; we
+// reconnect with exponential backoff (capped) instead of hammering the endpoint
+// in a tight loop. Backoff resets to the floor after a successful message.
+const INDEX_SSE_BACKOFF_MIN_MS = 1000
+const INDEX_SSE_BACKOFF_MAX_MS = 15000
+
 export function useIndexProgress() {
   const [data, setData] = useState<IndexProgress | null>(null)
   const [done, setDone] = useState(false)
   const [active, setActive] = useState(false)
   const sourceRef = useRef<EventSource | null>(null)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backoffRef = useRef(INDEX_SSE_BACKOFF_MIN_MS)
+  // Set once the consumer wants a live stream; cleared on disconnect/done so a
+  // dropped connection only reconnects while a build is genuinely in progress.
+  const wantStreamRef = useRef(false)
+  const openStreamRef = useRef<() => void>(() => {})
+
+  const clearRetry = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
+    }
+  }, [])
 
   const disconnect = useCallback(() => {
+    wantStreamRef.current = false
+    clearRetry()
+    backoffRef.current = INDEX_SSE_BACKOFF_MIN_MS
     if (sourceRef.current) {
       sourceRef.current.close()
       sourceRef.current = null
     }
     setActive(false)
-  }, [])
+  }, [clearRetry])
 
-  const connect = useCallback(() => {
-    disconnect()
-    setData(null)
-    setDone(false)
+  const openStream = useCallback(() => {
+    // Tear down any prior connection/timer before opening a new one.
+    clearRetry()
+    if (sourceRef.current) {
+      sourceRef.current.close()
+      sourceRef.current = null
+    }
     setActive(true)
 
     const source = new EventSource(endpoints.indexProgress)
     sourceRef.current = source
 
     source.addEventListener('progress', (e) => {
+      // A successful message means the stream is healthy again — reset backoff.
+      backoffRef.current = INDEX_SSE_BACKOFF_MIN_MS
       try {
         setData(JSON.parse((e as MessageEvent).data))
       } catch { /* ignore */ }
     })
 
     source.addEventListener('done', () => {
+      wantStreamRef.current = false
+      clearRetry()
+      backoffRef.current = INDEX_SSE_BACKOFF_MIN_MS
       setDone(true)
       setActive(false)
       source.close()
@@ -275,11 +306,33 @@ export function useIndexProgress() {
     })
 
     source.onerror = () => {
-      setActive(false)
       source.close()
       sourceRef.current = null
+      setActive(false)
+      // Only reconnect if the consumer still wants the stream (build ongoing)
+      // and we have not already scheduled a retry.
+      if (!wantStreamRef.current || retryTimerRef.current) return
+      const delay = backoffRef.current
+      backoffRef.current = Math.min(delay * 2, INDEX_SSE_BACKOFF_MAX_MS)
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null
+        if (wantStreamRef.current) openStreamRef.current()
+      }, delay)
     }
-  }, [disconnect])
+  }, [clearRetry])
+
+  // Keep a stable ref to the latest openStream so the backoff timer can call it
+  // without capturing a stale closure.
+  openStreamRef.current = openStream
+
+  const connect = useCallback(() => {
+    wantStreamRef.current = true
+    clearRetry()
+    backoffRef.current = INDEX_SSE_BACKOFF_MIN_MS
+    setData(null)
+    setDone(false)
+    openStream()
+  }, [clearRetry, openStream])
 
   useEffect(() => {
     return () => { disconnect() }

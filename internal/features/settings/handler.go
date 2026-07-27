@@ -1,9 +1,12 @@
 package settings
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
@@ -11,20 +14,27 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+var sessionAccessKeyIDPattern = regexp.MustCompile(`^[A-Z0-9]{16,128}$`)
+
 // Handler provides HTTP handlers for settings endpoints.
 type Handler struct {
-	cfg              *config.Config
-	saveFn           func(*config.Config) error
-	service          *Service
-	onAuthChangedFns []func() // observers notified when the user applies new credentials
+	cfg                          *config.Config
+	saveFn                       func(*config.Config) error
+	service                      *Service
+	onAuthChangedFns             []func() // observers notified when the user applies new credentials
+	validateSessionCredentialsFn func(
+		context.Context, string, string, string,
+	) (*CallerIdentityResponse, error)
 }
 
 // NewHandler creates a new settings Handler.
 func NewHandler(cfg *config.Config, saveFn func(*config.Config) error) *Handler {
+	service := NewService(cfg, saveFn)
 	return &Handler{
-		cfg:     cfg,
-		saveFn:  saveFn,
-		service: NewService(cfg, saveFn),
+		cfg:                          cfg,
+		saveFn:                       saveFn,
+		service:                      service,
+		validateSessionCredentialsFn: service.ValidateSessionCredentials,
 	}
 }
 
@@ -169,79 +179,133 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Apply updates to config
-	if req.Bucket != "" {
-		h.cfg.S3.Bucket = req.Bucket
+	// Validate path-bearing fields against path traversal (N91). bucket,
+	// account_id, org_id, log_region, and each member account ID are
+	// interpolated into local filesystem paths (constructLocalPath,
+	// sessionLocalDir) and into S3 prefixes. A value containing a slash, a
+	// ".." segment, a null byte, or a leading "." could redirect a write
+	// outside the data dir or escape the intended prefix. Reject them here so
+	// the values that reach the path-construction code are already sanitized.
+	orgID := ""
+	if req.OrgID != nil {
+		orgID = *req.OrgID
 	}
-	if req.Region != "" {
-		h.cfg.S3.Region = req.Region
+	pathFields := map[string]string{
+		"bucket":     req.Bucket,
+		"account_id": req.AccountID,
+		"org_id":     orgID,
+		"log_region": req.LogRegion,
 	}
-	if req.AccountID != "" {
-		h.cfg.S3.AccountID = req.AccountID
-	}
-	if req.Mode != "" {
-		h.cfg.S3.Mode = req.Mode
-	}
-	if req.AuthMethod != "" {
-		h.cfg.Auth.Method = req.AuthMethod
-	}
-	if req.AccessKeyID != "" {
-		h.cfg.Auth.AccessKeyID = req.AccessKeyID
-	}
-	if req.SecretAccessKey != "" {
-		h.cfg.Auth.SecretAccessKey = req.SecretAccessKey
-	}
-	if req.RoleARN != "" {
-		h.cfg.Auth.RoleARN = req.RoleARN
-	}
-	if req.ExternalID != "" {
-		h.cfg.Auth.ExternalID = req.ExternalID
-	}
-	if req.SSOProfile != "" {
-		h.cfg.Auth.SSOProfile = req.SSOProfile
-	}
-	if req.StartDate != "" {
-		h.cfg.S3.StartDate = req.StartDate
-	}
-	if req.EndDate != "" {
-		h.cfg.S3.EndDate = req.EndDate
-	}
-	if req.OrgID != "" {
-		h.cfg.S3.OrgID = req.OrgID
-	}
-	if req.MemberAccounts != nil {
-		h.cfg.S3.MemberAccounts = req.MemberAccounts
-	}
-	if req.LogRegion != "" {
-		h.cfg.S3.LogRegion = req.LogRegion
-	}
-	if req.LLMProvider != "" {
-		h.cfg.LLM.Provider = req.LLMProvider
-	}
-	if req.LLMAPIKey != "" {
-		h.cfg.LLM.APIKey = req.LLMAPIKey
-	}
-	if req.LLMModel != "" {
-		h.cfg.LLM.Model = req.LLMModel
-		// Sync to Bedrock config when provider is bedrock
-		if h.cfg.LLM.Provider == "bedrock" {
-			h.cfg.Bedrock.ModelID = req.LLMModel
+	for field, val := range pathFields {
+		if val == "" {
+			continue
+		}
+		if !config.IsSafePathSegment(val) {
+			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "value contains characters not allowed in a path segment (no '/', '\\', '..', or control characters)", map[string]string{
+				"field": field,
+			})
+			return
 		}
 	}
-	if req.LLMEndpoint != "" {
-		h.cfg.LLM.Endpoint = req.LLMEndpoint
+	for _, acct := range req.MemberAccounts {
+		if acct != "" && !config.IsSafePathSegment(acct) {
+			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "member account ID contains characters not allowed in a path segment", map[string]string{
+				"field": "member_accounts",
+			})
+			return
+		}
+	}
+
+	// Apply updates to a copy. The live config is published only after the
+	// candidate validates and persists successfully, so a failed save cannot
+	// leave runtime behavior different from config.json.
+	next := *h.cfg
+	next.TrustedHosts = append([]string(nil), h.cfg.TrustedHosts...)
+	next.S3.MemberAccounts = append([]string(nil), h.cfg.S3.MemberAccounts...)
+	if h.cfg.LLM.PricingOverrides != nil {
+		next.LLM.PricingOverrides = make(map[string]config.PricingOverride, len(h.cfg.LLM.PricingOverrides))
+		for model, pricing := range h.cfg.LLM.PricingOverrides {
+			next.LLM.PricingOverrides[model] = pricing
+		}
+	}
+
+	if req.Bucket != "" {
+		next.S3.Bucket = req.Bucket
+	}
+	if req.Region != "" {
+		next.S3.Region = req.Region
+	}
+	if req.AccountID != "" {
+		next.S3.AccountID = req.AccountID
+	}
+	if req.Mode != "" {
+		next.S3.Mode = req.Mode
+	}
+	if req.AuthMethod != "" {
+		next.Auth.Method = req.AuthMethod
+	}
+	if req.AccessKeyID != "" {
+		next.Auth.AccessKeyID = req.AccessKeyID
+	}
+	if req.SecretAccessKey != "" {
+		next.Auth.SecretAccessKey = req.SecretAccessKey
+	}
+	if req.RoleARN != "" {
+		next.Auth.RoleARN = req.RoleARN
+	}
+	if req.ExternalID != "" {
+		next.Auth.ExternalID = req.ExternalID
+	}
+	if req.SSOProfile != "" {
+		next.Auth.SSOProfile = req.SSOProfile
+	}
+	if req.StartDate != "" {
+		next.S3.StartDate = req.StartDate
+	}
+	if req.EndDate != "" {
+		next.S3.EndDate = req.EndDate
+	}
+	if req.OrgID != nil {
+		next.S3.OrgID = strings.TrimSpace(*req.OrgID)
+	}
+	if req.MemberAccounts != nil {
+		next.S3.MemberAccounts = append([]string(nil), req.MemberAccounts...)
+	}
+	if req.LogRegion != "" {
+		next.S3.LogRegion = req.LogRegion
+	}
+	if req.LLMProvider != "" {
+		next.LLM.Provider = req.LLMProvider
+	}
+	if req.LLMAPIKey != "" {
+		next.LLM.APIKey = req.LLMAPIKey
+	}
+	if req.LLMModel != "" {
+		next.LLM.Model = req.LLMModel
+		// Sync to Bedrock config when provider is bedrock
+		if next.LLM.Provider == "bedrock" {
+			next.Bedrock.ModelID = req.LLMModel
+		}
+	}
+	if req.LLMEndpoint != nil {
+		next.LLM.Endpoint = strings.TrimSpace(*req.LLMEndpoint)
 	}
 	if req.BedrockRegion != "" {
-		h.cfg.Bedrock.Region = req.BedrockRegion
+		next.Bedrock.Region = req.BedrockRegion
+	}
+
+	if err := config.Validate(&next); err != nil {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), nil)
+		return
 	}
 
 	// Persist configuration
-	if err := h.saveFn(h.cfg); err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to save configuration", map[string]string{
-			"reason": err.Error(),
-		})
+	if err := h.saveFn(&next); err != nil {
+		slog.Error("failed to save configuration", "component", "cloudtrail-analyzer", "error", err.Error())
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to save configuration", nil)
 		return
 	}
+	*h.cfg = next
 
 	// Return updated config (with redacted secret)
 	h.GetSettings(w, r)
@@ -270,9 +334,9 @@ func (h *Handler) ValidateBucket(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.ValidateBucket(r.Context(), req.Bucket, req.Region)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Bucket validation failed", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("bucket validation failed", "component", "cloudtrail-analyzer", "bucket", req.Bucket, "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -291,9 +355,9 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 
 	accounts, err := h.service.ListControlTowerAccounts(r.Context(), bucket, region)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "S3_ACCESS_DENIED", "Failed to list accounts", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to list accounts", "component", "cloudtrail-analyzer", "bucket", bucket, "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -306,9 +370,9 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ValidateCredentials(w http.ResponseWriter, r *http.Request) {
 	status, err := h.service.ResolveCredentials(r.Context(), h.cfg)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Credential validation failed", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("credential validation failed", "component", "cloudtrail-analyzer", "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -329,23 +393,83 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "All three fields are required: access_key_id, secret_access_key, session_token", nil)
 		return
 	}
-
-	os.Setenv("AWS_ACCESS_KEY_ID", req.AccessKeyID)
-	os.Setenv("AWS_SECRET_ACCESS_KEY", req.SecretAccessKey)
-	os.Setenv("AWS_SESSION_TOKEN", req.SessionToken)
-
-	// Mark the active method in config but do NOT store the credential values.
-	h.cfg.Auth.Method = "session_credentials"
-	h.cfg.Auth.AccessKeyID = ""
-	h.cfg.Auth.SecretAccessKey = ""
-	h.cfg.Auth.SessionToken = ""
-
-	if err := h.saveFn(h.cfg); err != nil {
-		slog.Warn("failed to persist auth method",
-			"component", "cloudtrail-analyzer",
-			"error", err.Error(),
-		)
+	if !sessionAccessKeyIDPattern.MatchString(req.AccessKeyID) {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR",
+			"access_key_id must be 16-128 uppercase letters or digits", nil)
+		return
 	}
+	if strings.IndexByte(req.SecretAccessKey, 0) >= 0 || strings.IndexByte(req.SessionToken, 0) >= 0 {
+		render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR", "Credential values contain invalid characters", nil)
+		return
+	}
+
+	if _, err := h.validateSessionCredentialsFn(
+		r.Context(), req.AccessKeyID, req.SecretAccessKey, req.SessionToken,
+	); err != nil {
+		slog.Warn("session credentials rejected by STS", "component", "cloudtrail-analyzer", "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusBadRequest, "CREDENTIALS_INVALID",
+			se.Message, nil)
+		return
+	}
+
+	// Session credentials are stored in the process environment so the AWS SDK
+	// credential chain can pick them up (see Service.loadAWSConfig). NOTE on
+	// credential exposure (N23): once these AWS_* vars are set on the process,
+	// a child process spawned via exec.Command inherits them by default
+	// (os/exec copies os.Environ when cmd.Env is nil). The DuckDB and Ollama
+	// subprocesses spawned in the nlquery package do NOT need AWS credentials —
+	// they read local files / a local model server — so those exec sites should
+	// pass a filtered cmd.Env that drops AWS_* to avoid leaking live credentials
+	// into unrelated subprocesses. That scrubbing belongs at the exec.Command
+	// call sites (internal/features/nlquery/{service.go,indexer.go,provider.go}
+	// and internal/startup/validator.go), which are owned elsewhere; flagged for
+	// the orchestrator.
+	type previousEnvValue struct {
+		value string
+		set   bool
+	}
+	previous := make(map[string]previousEnvValue, 3)
+	for _, key := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		value, set := os.LookupEnv(key)
+		previous[key] = previousEnvValue{value: value, set: set}
+	}
+
+	restoreEnvironment := func() {
+		for key, prior := range previous {
+			if prior.set {
+				_ = os.Setenv(key, prior.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	}
+	nextEnvironment := map[string]string{
+		"AWS_ACCESS_KEY_ID":     req.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY": req.SecretAccessKey,
+		"AWS_SESSION_TOKEN":     req.SessionToken,
+	}
+	for key, value := range nextEnvironment {
+		if err := os.Setenv(key, value); err != nil {
+			restoreEnvironment()
+			render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to apply session credentials", nil)
+			return
+		}
+	}
+
+	// Persist a credential-free copy before publishing it to the live config.
+	next := *h.cfg
+	next.Auth.Method = "session_credentials"
+	next.Auth.AccessKeyID = ""
+	next.Auth.SecretAccessKey = ""
+	next.Auth.SessionToken = ""
+	if err := h.saveFn(&next); err != nil {
+		restoreEnvironment()
+		render.Error(w, http.StatusInternalServerError, "INTERNAL_ERROR",
+			"Failed to persist the session credential method", nil)
+		return
+	}
+	*h.cfg = next
 
 	slog.Info("session credentials applied via UI (env-only, not persisted)",
 		"component", "cloudtrail-analyzer",
@@ -357,7 +481,16 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 	// refreshes that initially failed because credentials were not yet applied.
 	h.notifyAuthChanged()
 
-	status, _ := h.service.ResolveCredentials(r.Context(), h.cfg)
+	status := &CredentialStatus{
+		Source:  "session_credentials",
+		Valid:   true,
+		Message: "Session credentials verified with STS",
+		Attempts: []CredentialAttempt{{
+			Source:  "session_credentials",
+			Success: true,
+			Reason:  "STS GetCallerIdentity succeeded",
+		}},
+	}
 
 	render.JSON(w, http.StatusOK, map[string]interface{}{
 		"applied":    true,
@@ -370,9 +503,9 @@ func (h *Handler) ApplySessionCredentials(w http.ResponseWriter, r *http.Request
 func (h *Handler) GetCallerIdentity(w http.ResponseWriter, r *http.Request) {
 	result, err := h.service.GetCallerIdentity(r.Context())
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "STS_ERROR", "Failed to get caller identity", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to get caller identity", "component", "cloudtrail-analyzer", "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -402,9 +535,9 @@ func (h *Handler) DetectStructure(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.DetectBucketStructure(r.Context(), req.Bucket, req.Region)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "S3_ERROR", "Failed to detect bucket structure", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to detect bucket structure", "component", "cloudtrail-analyzer", "bucket", req.Bucket, "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -441,9 +574,9 @@ func (h *Handler) DiscoverRegions(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.DiscoverRegions(r.Context(), req.Bucket, req.Region, req.AccountID, req.OrgID)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "S3_ERROR", "Failed to discover regions", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to discover regions", "component", "cloudtrail-analyzer", "bucket", req.Bucket, "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -466,9 +599,9 @@ func (h *Handler) ListBedrockModels(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.ListBedrockModels(r.Context(), req.Region)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "BEDROCK_ERROR", "Failed to list Bedrock models", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Error("failed to list Bedrock models", "component", "cloudtrail-analyzer", "region", req.Region, "error", err.Error())
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 
@@ -534,9 +667,15 @@ func (h *Handler) VerifyLogs(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.VerifyLogs(r.Context(), &req)
 	if err != nil {
-		render.Error(w, http.StatusInternalServerError, "S3_ERROR", "Failed to verify logs", map[string]string{
-			"reason": err.Error(),
-		})
+		slog.Warn("CloudTrail log verification failed",
+			"component", "cloudtrail-analyzer",
+			"bucket", req.Bucket,
+			"account_id", req.AccountID,
+			"log_region", req.LogRegion,
+			"error", err.Error(),
+		)
+		se := render.ClassifyError(err)
+		render.Error(w, http.StatusInternalServerError, se.Code, se.Message, nil)
 		return
 	}
 

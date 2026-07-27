@@ -34,7 +34,7 @@ export function detectSeedType(input: string): SeedType {
   if (ARN_PREFIX.test(s)) return 'arn'
   if (ACCESS_KEY.test(s)) return 'access_key'
   if (ACCOUNT_ID.test(s)) return 'account'
-  if (IPV4.test(s) && validIPv4Octets(s)) return 'ip'
+  if (IPV4.test(s)) return validIPv4Octets(s) ? 'ip' : 'unknown'
   if (IPV6.test(s)) return 'ip'
   // Strings that look like names default to "user"; users override to "role"
   // in the UI when needed.
@@ -61,5 +61,30 @@ export function seedTypeLabel(t: SeedType): string {
     case 'user': return 'IAM user'
     case 'role': return 'IAM role'
     default: return 'unknown'
+  }
+}
+
+// Scenario APIs use "identity" for a full principal ARN, while the toolbar
+// uses the user-facing "arn" seed type. Keep that protocol translation in one
+// place so recommendation, sorting, and override suggestions stay consistent.
+export function seedTypeMatchesScenarioParam(seedType: SeedType, paramType: string): boolean {
+  if (seedType === 'unknown') return false
+  if (seedType === 'arn') return paramType === 'identity' || paramType === 'arn'
+  return seedType === paramType
+}
+
+export function seedTypeForScenarioParam(paramType: string): SeedType | null {
+  switch (paramType) {
+    case 'identity':
+    case 'arn':
+      return 'arn'
+    case 'access_key':
+    case 'ip':
+    case 'account':
+    case 'user':
+    case 'role':
+      return paramType
+    default:
+      return null
   }
 }

@@ -3,9 +3,9 @@ package prompts
 import (
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"strings"
 
+	"cloudtrail-analyzer/internal/cloudtrailpath"
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
 
@@ -141,12 +141,12 @@ func (h *Handler) buildDataPath() string {
 		region = h.cfg.S3.Region
 	}
 
-	// Mirror S3 structure: {data_dir}/s3/{bucket}/{org_id}/AWSLogs/{org_id}/{account_id}/CloudTrail/{region}/
-	if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-		return filepath.Join(h.cfg.DataDir, "s3", h.cfg.S3.Bucket,
-			h.cfg.S3.OrgID, "AWSLogs", h.cfg.S3.OrgID, h.cfg.S3.AccountID, "CloudTrail", region) + "/"
-	}
-
-	return filepath.Join(h.cfg.DataDir, "s3", h.cfg.S3.Bucket,
-		"AWSLogs", h.cfg.S3.AccountID, "CloudTrail", region) + "/"
+	return cloudtrailpath.LocalQueryRoot(
+		h.cfg.DataDir,
+		h.cfg.S3.Bucket,
+		h.cfg.S3.Mode,
+		h.cfg.S3.OrgID,
+		h.cfg.S3.AccountID,
+		region,
+	)
 }

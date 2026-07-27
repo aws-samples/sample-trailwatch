@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Shield, CheckCircle2, XCircle, Loader2 } from 'lucide-react'
+import { Shield, CheckCircle2, XCircle, Loader2, RefreshCw } from 'lucide-react'
 import { useSettings } from './hooks'
 import { endpoints } from '../../config/api'
+import { readApiError } from '../../comm/apiError'
 
 type AuthMethod = 'imds' | 'session_credentials' | 'sso' | 'static'
 
@@ -28,7 +29,7 @@ const AUTH_METHODS: { value: AuthMethod; labelKey: string; descKey: string; icon
 
 export function CredentialsView() {
   const { t } = useTranslation()
-  const { data: settings, loading: settingsLoading, refetch } = useSettings()
+  const { data: settings, loading: settingsLoading, error: settingsError, refetch } = useSettings()
 
   const [method, setMethod] = useState<AuthMethod>('imds')
   const [accessKeyId, setAccessKeyId] = useState('')
@@ -74,30 +75,26 @@ export function CredentialsView() {
     setValidating(true)
     setResult(null)
     setError(null)
-    // Save the method to make it active
     try {
       const saveRes = await fetch(endpoints.settings, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ auth_method: method }),
       })
-      if (saveRes.ok) {
-        refetch()
+      if (!saveRes.ok) {
+        setError(await readApiError(saveRes, 'Failed to activate credential method'))
+        return
       }
-    } catch {
-      // Continue
-    }
-    // Then validate
-    try {
+      await refetch()
+
       const res = await fetch(endpoints.validateCredentials, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       })
-      const data = await res.json()
       if (!res.ok) {
-        setError(data.message || `HTTP ${res.status}`)
+        setError(await readApiError(res, 'Credential validation failed'))
       } else {
-        setResult(data as CredentialResult)
+        setResult(await res.json() as CredentialResult)
       }
     } catch (e) {
       setError((e as Error).message)
@@ -124,12 +121,11 @@ export function CredentialsView() {
           session_token: sessionToken,
         }),
       })
-      const data = await res.json()
       if (!res.ok) {
-        setError(data.message || `HTTP ${res.status}`)
-        setSaving(false)
+        setError(await readApiError(res, 'Failed to apply session credentials'))
         return
       }
+      const data = await res.json()
       // Show validation result from the response
       if (data.validation) {
         setResult(data.validation as CredentialResult)
@@ -157,18 +153,16 @@ export function CredentialsView() {
         }),
       })
       if (!res.ok) {
-        const data = await res.json().catch(() => ({ message: 'Save failed' }))
-        setError(data.message)
-        setSaving(false)
+        setError(await readApiError(res, 'Failed to save SSO settings'))
         return
       }
     } catch (e) {
       setError((e as Error).message)
-      setSaving(false)
       return
+    } finally {
+      setSaving(false)
     }
-    setSaving(false)
-    activate()
+    await activate()
   }, [ssoProfile, activate])
 
   const saveStaticAndValidate = useCallback(async () => {
@@ -190,18 +184,16 @@ export function CredentialsView() {
         }),
       })
       if (!res.ok) {
-        const data = await res.json().catch(() => ({ message: 'Save failed' }))
-        setError(data.message)
-        setSaving(false)
+        setError(await readApiError(res, 'Failed to save static credentials'))
         return
       }
     } catch (e) {
       setError((e as Error).message)
-      setSaving(false)
       return
+    } finally {
+      setSaving(false)
     }
-    setSaving(false)
-    activate()
+    await activate()
   }, [accessKeyId, secretAccessKey, activate])
 
   if (settingsLoading) {
@@ -212,8 +204,24 @@ export function CredentialsView() {
     )
   }
 
+  if (settingsError || !settings) {
+    return (
+      <div className="flex items-center justify-center h-full p-6">
+        <div role="alert" className="max-w-md w-full p-5 rounded-lg border border-red-200 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 text-center">
+          <XCircle className="w-7 h-7 text-red-500 mx-auto mb-2" />
+          <h2 className="text-sm font-semibold text-red-800 dark:text-red-200">Unable to load settings</h2>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-300">{settingsError || 'The settings response was empty.'}</p>
+          <button type="button" onClick={() => void refetch()}
+            className="mt-4 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/20">
+            <RefreshCw className="w-3.5 h-3.5" /> {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // Determine which method is the persisted/active one
-  const activeMethod = settings?.auth.method || 'imds'
+  const activeMethod = settings.auth.method
 
   return (
     <div className="h-full flex flex-col">

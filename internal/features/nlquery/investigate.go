@@ -2,12 +2,20 @@ package nlquery
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"cloudtrail-analyzer/internal/config"
 	"cloudtrail-analyzer/internal/render"
 )
+
+const investigationTotalColumn = "__investigation_total_rows"
+
+var terminalScenarioLimit = regexp.MustCompile(`(?i)\s+LIMIT\s+[0-9]+\s*;?\s*$`)
 
 type InvestigateHandler struct {
 	cfg *config.Config
@@ -29,7 +37,8 @@ type InvestigateRequest struct {
 // no time_start means "from the beginning of the indexed data".
 type InvestigateFilters struct {
 	// TimeStart and TimeEnd are RFC3339 timestamps or YYYY-MM-DD dates.
-	// Inclusive on both sides. Empty string means unbounded.
+	// Timestamp bounds and selected calendar dates are inclusive. Empty string
+	// means unbounded.
 	TimeStart string `json:"time_start,omitempty"`
 	TimeEnd   string `json:"time_end,omitempty"`
 	// AccountIDs restricts to events whose recipientAccountId or
@@ -48,36 +57,73 @@ func (h *InvestigateHandler) RunScenario(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Fail-closed account validation: if the client sends account_ids, every
+	// value must be a valid 12-digit ID. A non-empty list where all entries are
+	// invalid must not silently become "no filter" (SCOPE-01).
+	if len(req.Filters.AccountIDs) > 0 {
+		var valid []string
+		for _, id := range req.Filters.AccountIDs {
+			id = strings.TrimSpace(id)
+			if isValidAccountID(id) {
+				valid = append(valid, id)
+			}
+		}
+		if len(valid) == 0 {
+			render.Error(w, http.StatusBadRequest, "VALIDATION_ERROR",
+				"account_ids contains no valid 12-digit account IDs")
+			return
+		}
+		req.Filters.AccountIDs = valid
+	}
+
 	dataPath := h.buildDataPath()
 	if dataPath == "" {
 		render.Error(w, http.StatusBadRequest, "no_data", "No CloudTrail data available. Sync logs first via S3 Sync.")
 		return
 	}
 
-	sql := h.buildSQL(req.ScenarioID, req.Param, dataPath, req.Filters)
-	if sql == "" {
+	displaySQL := h.buildSQL(req.ScenarioID, req.Param, dataPath, req.Filters)
+	if displaySQL == "" {
 		render.Error(w, http.StatusNotFound, "unknown_scenario", fmt.Sprintf("Scenario %q not found", req.ScenarioID))
 		return
 	}
 
+	querySQL, tracksTotal := instrumentInvestigationSQL(displaySQL)
 	svc := NewService(h.cfg)
-	cols, rows, err := svc.executeDuckDB(r.Context(), sql)
+	cols, rows, err := svc.executeDuckDB(r.Context(), querySQL)
+	totalRows := len(rows)
+	if err == nil && tracksTotal {
+		var metadataErr error
+		cols, rows, totalRows, metadataErr = extractInvestigationMetadata(cols, rows)
+		if metadataErr != nil {
+			err = metadataErr
+			cols = nil
+			rows = nil
+			totalRows = 0
+		}
+	}
+	returnedRows := len(rows)
 	resp := map[string]interface{}{
-		"scenario_id": req.ScenarioID,
-		"param":       req.Param,
-		"sql":         sql,
-		"columns":     cols,
-		"rows":        rows,
+		"scenario_id":   req.ScenarioID,
+		"param":         req.Param,
+		"sql":           displaySQL,
+		"columns":       cols,
+		"rows":          rows,
+		"total_rows":    totalRows,
+		"returned_rows": returnedRows,
+		"truncated":     totalRows > returnedRows,
 	}
 	if err != nil {
-		hint, detail := classifyDuckDBError(err)
-		resp["error"] = err.Error()
+		safeMsg, hint := render.ClassifyDuckDBError(err)
+		resp["error"] = safeMsg
 		if hint != "" {
 			resp["error_hint"] = hint
 		}
-		if detail != "" {
-			resp["error_detail"] = detail
-		}
+		slog.Warn("investigate scenario query failed",
+			"component", "cloudtrail-analyzer",
+			"scenario", req.ScenarioID,
+			"error", err.Error(),
+		)
 	}
 	render.JSON(w, http.StatusOK, resp)
 }
@@ -111,7 +157,7 @@ var scenarios = []Scenario{
 	// --- Compute Activity ---
 	{ID: "ec2-instances-created", Name: "EC2 Instances Created", Category: "Compute Activity", Description: "All RunInstances events — instance types, who launched, AMI used", ParamType: "none", Severity: "HIGH"},
 	{ID: "describe-vpc-ec2-sg", Name: "VPC/EC2/SG Describe Calls", Category: "Compute Activity", Description: "Reconnaissance — Describe calls to VPC, EC2, EBS, Security Groups", ParamType: "none", Severity: "MEDIUM"},
-	{ID: "large-instances", Name: "Large/Expensive Instances", Category: "Compute Activity", Description: "EC2 instances launched with large instance types (*.xlarge and above)", ParamType: "none", Severity: "HIGH"},
+	{ID: "large-instances", Name: "Successful EC2 Instance Launches", Category: "Compute Activity", Description: "Successful RunInstances calls. This view does not determine instance size or cost.", ParamType: "none", Severity: "HIGH"},
 	// --- Cross-Account ---
 	{ID: "cross-account-all", Name: "Cross-Account Activity", Category: "Cross-Account", Description: "All API calls where source account differs from target account", ParamType: "none", Severity: "HIGH"},
 	{ID: "cross-account-by-account", Name: "Activity from Specific Account", Category: "Cross-Account", Description: "All actions performed by principals from a specific source account", ParamType: "account", ParamLabel: "Source Account ID", Severity: "HIGH"},
@@ -147,7 +193,7 @@ var scenarios = []Scenario{
 
 	// --- Impact (GuardDuty: Impact:IAMUser, Impact:S3) ---
 	{ID: "gd-destructive-actions", Name: "Destructive Actions", Category: "Impact", Description: "Delete* operations on critical resources — EC2, RDS, S3, IAM, CloudFormation", ParamType: "none", Severity: "CRITICAL"},
-	{ID: "gd-s3-public-access", Name: "S3 Bucket Made Public", Category: "Impact", Description: "PutBucketPolicy, PutBucketAcl, PutObjectAcl, DeletePublicAccessBlock — exposing data", ParamType: "none", Severity: "CRITICAL"},
+	{ID: "gd-s3-public-access", Name: "S3 Public-Access Configuration Calls", Category: "Impact", Description: "Bucket policy, ACL, and Public Access Block API calls; inspect request details to determine the resulting access.", ParamType: "none", Severity: "CRITICAL"},
 
 	// --- Persistence (GuardDuty: Persistence:IAMUser) ---
 	{ID: "gd-persistence-mechanisms", Name: "Persistence Mechanisms", Category: "Persistence", Description: "CreateAccessKey, ImportKeyPair, CreateLoginProfile, CreateUser — maintaining access", ParamType: "none", Severity: "HIGH"},
@@ -162,8 +208,8 @@ var scenarios = []Scenario{
 	{ID: "gd-s3-block-public-disabled", Name: "S3 Block Public Access Disabled", Category: "Policy Violation", Description: "DeletePublicAccessBlock or PutPublicAccessBlock with permissive settings", ParamType: "none", Severity: "HIGH"},
 
 	// --- Unauthorized Access (GuardDuty: UnauthorizedAccess:IAMUser) ---
-	{ID: "gd-console-multi-geo", Name: "Console Login from Multiple Geos", Category: "Unauthorized Access", Description: "Same user logging in from multiple IPs — possible credential compromise", ParamType: "none", Severity: "HIGH"},
-	{ID: "gd-instance-cred-exfil", Name: "Instance Credential Exfiltration", Category: "Unauthorized Access", Description: "EC2 instance role credentials used from external IPs — stolen IMDS credentials", ParamType: "none", Severity: "CRITICAL"},
+	{ID: "gd-console-multi-geo", Name: "Console Identity Seen from Multiple IPs", Category: "Unauthorized Access", Description: "Identities with ConsoleLogin events from more than one source IP; no geolocation or compromise determination.", ParamType: "none", Severity: "HIGH"},
+	{ID: "gd-instance-cred-exfil", Name: "Assumed-Role Calls from External Addresses", Category: "Unauthorized Access", Description: "Assumed-role events without invokedBy from addresses outside the query's private/AWS hostname patterns; a lead, not proof of credential theft.", ParamType: "none", Severity: "CRITICAL"},
 
 	// --- PenTest Detection (GuardDuty: PenTest:IAMUser) ---
 	{ID: "gd-pentest-tools", Name: "Penetration Testing Tools", Category: "PenTest Detection", Description: "API calls from Kali Linux, Parrot Linux, Pentoo, or known pentest user agents", ParamType: "none", Severity: "HIGH"},
@@ -179,9 +225,9 @@ var scenarios = []Scenario{
 // matching the pre-toolbar behavior.
 //
 // Filter semantics:
-//   - TimeStart / TimeEnd: r.eventTime BETWEEN start AND end. Stored as
-//     ISO-8601 strings inside CloudTrail records, so a string comparison
-//     against YYYY-MM-DD or RFC3339 inputs works correctly.
+//   - TimeStart: inclusive. TimeEnd timestamps: inclusive. A date-only
+//     TimeEnd includes that full UTC calendar day by using an exclusive
+//     next-midnight boundary.
 //   - AccountIDs: matches if EITHER recipientAccountId OR
 //     userIdentity.accountId is in the list. We match both because the
 //     "account that owns the event" depends on the event type (cross-account
@@ -195,10 +241,15 @@ func buildFilteredEventsExpr(rawRead string, f InvestigateFilters) string {
 
 	var conds []string
 	if ts := strings.TrimSpace(f.TimeStart); ts != "" {
-		conds = append(conds, fmt.Sprintf("r.eventTime >= '%s'", strings.ReplaceAll(ts, "'", "''")))
+		conds = append(conds, fmt.Sprintf("r.eventTime >= %s", quoteSQLLiteral(ts)))
 	}
 	if te := strings.TrimSpace(f.TimeEnd); te != "" {
-		conds = append(conds, fmt.Sprintf("r.eventTime <= '%s'", strings.ReplaceAll(te, "'", "''")))
+		if endDate, err := time.Parse("2006-01-02", te); err == nil {
+			nextMidnightUTC := endDate.AddDate(0, 0, 1).Format("2006-01-02") + "T00:00:00Z"
+			conds = append(conds, fmt.Sprintf("r.eventTime < %s", quoteSQLLiteral(nextMidnightUTC)))
+		} else {
+			conds = append(conds, fmt.Sprintf("r.eventTime <= %s", quoteSQLLiteral(te)))
+		}
 	}
 	if len(f.AccountIDs) > 0 {
 		var quoted []string
@@ -207,7 +258,7 @@ func buildFilteredEventsExpr(rawRead string, f InvestigateFilters) string {
 			if !isValidAccountID(id) {
 				continue
 			}
-			quoted = append(quoted, "'"+id+"'")
+			quoted = append(quoted, quoteSQLLiteral(id))
 		}
 		if len(quoted) > 0 {
 			list := strings.Join(quoted, ", ")
@@ -220,6 +271,71 @@ func buildFilteredEventsExpr(rawRead string, f InvestigateFilters) string {
 		return base
 	}
 	return fmt.Sprintf("(SELECT * FROM %s WHERE %s)", base, strings.Join(conds, " AND "))
+}
+
+// instrumentInvestigationSQL adds an internal window count to trusted,
+// hard-limited scenario queries. COUNT(*) OVER () is evaluated after
+// WHERE/GROUP BY/HAVING but before LIMIT, so it reports the number of matching
+// rows without requiring a second scan. The original query remains the SQL
+// shown to users.
+func instrumentInvestigationSQL(sql string) (string, bool) {
+	if !terminalScenarioLimit.MatchString(sql) {
+		return sql, false
+	}
+
+	trimmed := strings.TrimLeft(sql, " \t\r\n")
+	leadingWhitespace := sql[:len(sql)-len(trimmed)]
+	const selectKeyword = "SELECT"
+	if len(trimmed) <= len(selectKeyword) ||
+		!strings.EqualFold(trimmed[:len(selectKeyword)], selectKeyword) ||
+		(trimmed[len(selectKeyword)] != ' ' && trimmed[len(selectKeyword)] != '\t' && trimmed[len(selectKeyword)] != '\n') {
+		return sql, false
+	}
+
+	return leadingWhitespace +
+		trimmed[:len(selectKeyword)] +
+		" COUNT(*) OVER () AS " + investigationTotalColumn + "," +
+		trimmed[len(selectKeyword):], true
+}
+
+// extractInvestigationMetadata removes the internal count column before a
+// scenario result is returned to the browser.
+func extractInvestigationMetadata(columns []string, rows [][]interface{}) ([]string, [][]interface{}, int, error) {
+	if len(columns) == 0 || columns[0] != investigationTotalColumn {
+		return nil, nil, 0, fmt.Errorf("investigation result is missing total-row metadata")
+	}
+
+	visibleColumns := append([]string(nil), columns[1:]...)
+	if len(rows) == 0 {
+		return visibleColumns, [][]interface{}{}, 0, nil
+	}
+
+	totalRows := -1
+	visibleRows := make([][]interface{}, len(rows))
+	for i, row := range rows {
+		if len(row) == 0 {
+			return nil, nil, 0, fmt.Errorf("investigation result row %d is missing total-row metadata", i)
+		}
+		rawTotal, ok := row[0].(string)
+		if !ok {
+			return nil, nil, 0, fmt.Errorf("investigation result row %d has invalid total-row metadata", i)
+		}
+		parsedTotal, err := strconv.Atoi(rawTotal)
+		if err != nil || parsedTotal < 0 {
+			return nil, nil, 0, fmt.Errorf("investigation result row %d has invalid total-row metadata %q", i, rawTotal)
+		}
+		if totalRows == -1 {
+			totalRows = parsedTotal
+		} else if parsedTotal != totalRows {
+			return nil, nil, 0, fmt.Errorf("investigation result contains inconsistent total-row metadata")
+		}
+		visibleRows[i] = append([]interface{}(nil), row[1:]...)
+	}
+	if totalRows < len(visibleRows) {
+		return nil, nil, 0, fmt.Errorf("investigation total-row metadata is smaller than the returned row count")
+	}
+
+	return visibleColumns, visibleRows, totalRows, nil
 }
 
 // isValidAccountID is the same shape check used in the accounts handler —
@@ -243,9 +359,19 @@ func (h *InvestigateHandler) buildSQL(scenarioID, param, dataPath string, filter
 	// scenario consumes it via `FROM %s` so toolbar context (time window +
 	// account scope) is applied uniformly without each scenario's SQL string
 	// having to know about it.
-	rawRead := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=16777216, auto_detect=true, union_by_name=true)`, dataPath)
+	//
+	// dataPath is assembled from config-derived values (S3 bucket, org_id,
+	// account_id, region) in buildDataPath. Settings accept those with only an
+	// emptiness check, so a single quote in any of them would break out of the
+	// read_json('...') literal and bypass the read-only allowlist. Escape the
+	// final path string before it goes inside the literal (H6). The param is
+	// escaped the same way for consistency with the path.
+	rawRead := fmt.Sprintf(`read_json('%s**/*.json', maximum_object_size=%d, auto_detect=true, union_by_name=true)`, escapeSQLLiteral(dataPath), maxObjectSize)
 	events := buildFilteredEventsExpr(rawRead, filters)
-	safeParam := strings.ReplaceAll(param, "'", "''")
+	if scope := memberAccountScope(h.cfg); scope != "" {
+		events = fmt.Sprintf("(SELECT r FROM %s WHERE%s)", events, strings.TrimPrefix(scope, " AND"))
+	}
+	safeParam := escapeSQLLiteral(param)
 
 	switch scenarioID {
 	case "iam-write-ops":
@@ -376,29 +502,5 @@ func (h *InvestigateHandler) buildSQL(scenarioID, param, dataPath string, filter
 }
 
 func (h *InvestigateHandler) buildDataPath() string {
-	if h.cfg.S3.Bucket == "" {
-		return ""
-	}
-
-	if len(h.cfg.S3.MemberAccounts) > 1 {
-		if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-			return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/",
-				h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.OrgID, h.cfg.S3.OrgID)
-		}
-		return fmt.Sprintf("%s/s3/%s/AWSLogs/", h.cfg.DataDir, h.cfg.S3.Bucket)
-	}
-
-	region := h.cfg.S3.LogRegion
-	if region == "" {
-		region = h.cfg.S3.Region
-	}
-
-	if h.cfg.S3.Mode == "control_tower" && h.cfg.S3.OrgID != "" {
-		return fmt.Sprintf("%s/s3/%s/%s/AWSLogs/%s/%s/CloudTrail/%s/",
-			h.cfg.DataDir, h.cfg.S3.Bucket,
-			h.cfg.S3.OrgID, h.cfg.S3.OrgID, h.cfg.S3.AccountID, region)
-	}
-
-	return fmt.Sprintf("%s/s3/%s/AWSLogs/%s/CloudTrail/%s/",
-		h.cfg.DataDir, h.cfg.S3.Bucket, h.cfg.S3.AccountID, region)
+	return localQueryRoot(h.cfg)
 }

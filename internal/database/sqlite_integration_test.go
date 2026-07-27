@@ -2,15 +2,11 @@ package database
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 // TestRealMigration tests the actual 001_initial.sql migration from the project.
 func TestRealMigration(t *testing.T) {
-	// Find the project root by looking for go.mod
-	projectRoot := findProjectRoot(t)
-
 	tmpDir := t.TempDir()
 
 	db, err := NewDB(tmpDir)
@@ -19,13 +15,13 @@ func TestRealMigration(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Change to project root so RunMigrations finds the real migrations/ folder
+	// Embedded migrations must work regardless of the process working directory.
 	origDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getting working directory: %v", err)
 	}
-	if err := os.Chdir(projectRoot); err != nil {
-		t.Fatalf("changing to project root: %v", err)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("changing to unrelated directory: %v", err)
 	}
 	defer os.Chdir(origDir)
 
@@ -71,23 +67,12 @@ func TestRealMigration(t *testing.T) {
 	if chatID != 1 {
 		t.Fatalf("expected autoincrement id 1, got %d", chatID)
 	}
-}
 
-func findProjectRoot(t *testing.T) string {
-	t.Helper()
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getting working directory: %v", err)
+	var applied int
+	if err := db.Conn.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&applied); err != nil {
+		t.Fatal(err)
 	}
-
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatal("could not find project root (no go.mod found)")
-		}
-		dir = parent
+	if applied != 3 {
+		t.Fatalf("expected 3 embedded migrations, got %d", applied)
 	}
 }

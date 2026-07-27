@@ -8,7 +8,13 @@ export interface ApiErrorBody {
   details?: unknown
 }
 
-export async function readApiError(res: Response, fallback = 'Request failed'): Promise<string> {
+export interface ParsedApiError {
+  code?: string
+  message: string
+  details?: unknown
+}
+
+export async function readApiErrorDetails(res: Response, fallback = 'Request failed'): Promise<ParsedApiError> {
   // Drain body text first so we can recover from non-JSON responses (HTML 404s,
   // proxy errors, empty bodies). One-shot read — Response body can only be
   // consumed once.
@@ -16,18 +22,37 @@ export async function readApiError(res: Response, fallback = 'Request failed'): 
   try {
     text = await res.text()
   } catch {
-    return `${fallback} (HTTP ${res.status})`
+    return { message: `${fallback} (HTTP ${res.status})` }
   }
 
-  if (!text) return `${fallback} (HTTP ${res.status})`
+  if (!text) return { message: `${fallback} (HTTP ${res.status})` }
 
   try {
     const body = JSON.parse(text) as ApiErrorBody
-    if (body && typeof body.message === 'string' && body.message) return body.message
+    // Backend errors (render.Error) carry a user-safe { code, message }. The
+    // message is already redacted server-side (no data-dir / account-id / ARN),
+    // so surface it as-is. This covers the Host-validation 403 (code
+    // "UNTRUSTED_HOST") and every other structured error cleanly.
+    if (body && typeof body.message === 'string' && body.message) {
+      return {
+        code: typeof body.code === 'string' ? body.code : undefined,
+        message: body.message,
+        details: body.details,
+      }
+    }
+    // Structured error with a code but no message (rare): surface the code +
+    // status rather than dumping raw JSON at the user.
+    if (body && typeof body.code === 'string' && body.code) {
+      return { code: body.code, message: `${fallback} (HTTP ${res.status}, ${body.code})`, details: body.details }
+    }
   } catch {
     // not JSON — fall through to text body
   }
   // Non-JSON: include first 200 chars of the body so the user can see what came back.
   const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text
-  return `${fallback} (HTTP ${res.status}): ${snippet}`
+  return { message: `${fallback} (HTTP ${res.status}): ${snippet}` }
+}
+
+export async function readApiError(res: Response, fallback = 'Request failed'): Promise<string> {
+  return (await readApiErrorDetails(res, fallback)).message
 }
