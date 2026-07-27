@@ -32,7 +32,7 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Claude Code
+# AI assistant workspace (local only)
 .claude/
 CLAUDE.md
 *.csv
