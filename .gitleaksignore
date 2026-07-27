@@ -1,1 +1,2 @@
-# Empty - no false positives to suppress in this repository
+# Fictional test AKIA used in seed-type detection unit test
+c75942bd2cabe623aafcd21cf71f4c6c7f0b0f5c:web/src/features/query/seedDetection.test.ts:aws-access-token:12
