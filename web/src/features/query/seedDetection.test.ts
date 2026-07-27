@@ -9,7 +9,7 @@ import {
 describe('detectSeedType', () => {
   it.each([
     ['arn:aws:iam::123456789012:role/Example', 'arn'],
-    ['AKIA1234567890ABCDEF', 'access_key'],
+    ['AKIA1234567890ABCDEF', 'access_key'], // nosemgrep: detected-aws-access-key-id-value, aws-access-token
     ['123456789012', 'account'],
     ['192.0.2.10', 'ip'],
     ['2001:db8::1', 'ip'],
